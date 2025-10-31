@@ -1,6 +1,6 @@
 """
 Break & Re-Test Scalp Strategy Scanner
-Scans 5-min intraday data for AAPL, AMZN, META, MSFT, NVDA, TSLA, SPOT, UBER
+Scans 5-min intraday data for configured tickers
 Detects break and re-test long/short setups using:
 - Key levels (premarket high, opening range)
 - Breakout candle (strong body, above-average volume)
@@ -8,36 +8,70 @@ Detects break and re-test long/short setups using:
 - Ignition candle (strong body, breaks re-test high/low, volume increases)
 - Entry, stop, target logic
 """
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import time
+
 import argparse
-import os
 import json
+import os
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+import yfinance as yf
 
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_DELAY = 1.0  # seconds
 
-TICKERS = ["AAPL", "AMZN", "META", "MSFT", "NVDA", "TSLA", "SPOT", "UBER"]
-TIMEFRAME = "5m"
-LOOKBACK = "2d"  # 2 days to get premarket and today's session
-SESSION_START = "09:30"  # 6:30am PST = 09:30am EST
-SESSION_END = "16:00"
-MARKET_OPEN_MINUTES = 90  # Run detection for first 90 min after open
+
+# Load configuration
+def load_config():
+    """Load configuration from config.json"""
+    config_path = Path(__file__).parent / "config.json"
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            return json.load(f)
+    else:
+        # Default config if file doesn't exist
+        return {
+            "tickers": ["AAPL", "AMZN", "META", "MSFT", "NVDA", "TSLA", "SPOT", "UBER"],
+            "timeframe_5m": "5m",
+            "lookback": "2d",
+            "session_start": "09:30",
+            "session_end": "16:00",
+            "market_open_minutes": 90,
+        }
+
+
+CONFIG = load_config()
+TICKERS = CONFIG["tickers"]
+TIMEFRAME = CONFIG["timeframe_5m"]
+LOOKBACK = CONFIG["lookback"]
+SESSION_START = CONFIG["session_start"]
+SESSION_END = CONFIG["session_end"]
+MARKET_OPEN_MINUTES = CONFIG["market_open_minutes"]
+
 
 # --- Helper Functions ---
-def get_intraday_data(ticker, retries=DEFAULT_RETRIES, retry_delay=DEFAULT_RETRY_DELAY, timeframe=TIMEFRAME, lookback=LOOKBACK):
-    """Download intraday data with simple retry/backoff. Returns a DataFrame (may be empty).
+def get_intraday_data(
+    ticker,
+    retries=DEFAULT_RETRIES,
+    retry_delay=DEFAULT_RETRY_DELAY,
+    timeframe=TIMEFRAME,
+    lookback=LOOKBACK,
+):
+    """Download intraday data with simple retry/backoff.
 
-    Always returns a DataFrame (possibly empty) instead of raising so callers can handle missing data.
+    Returns a DataFrame (may be empty).
+    Always returns a DataFrame (possibly empty) instead of raising so
+    callers can handle missing data.
     """
     attempt = 0
     last_exc = None
     while attempt < retries:
         try:
-            df = yf.download(ticker, period=lookback, interval=timeframe, progress=False, auto_adjust=True)
+            df = yf.download(
+                ticker, period=lookback, interval=timeframe, progress=False, auto_adjust=True
+            )
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df = df.reset_index()
@@ -56,12 +90,14 @@ def get_intraday_data(ticker, retries=DEFAULT_RETRIES, retry_delay=DEFAULT_RETRY
     print(f"{ticker}: failed to download data after {retries} attempts. Last error: {last_exc}")
     return pd.DataFrame()
 
+
 def find_premarket_high(df):
     # Premarket: before 09:30
     premarket = df[df["Datetime"].dt.strftime("%H:%M") < SESSION_START]
     if len(premarket) == 0:
         return None
     return premarket["High"].max()
+
 
 def find_first_candle_range(df):
     # Find first 5-min candle after market open (09:30)
@@ -71,13 +107,24 @@ def find_first_candle_range(df):
     first_candle = session.iloc[0]
     return first_candle["High"], first_candle["Low"]
 
+
 def is_strong_body(row):
     body = abs(row["Close"] - row["Open"])
     range_ = row["High"] - row["Low"]
     return body >= 0.6 * range_  # strong body: >=60% of range
 
-def scan_ticker(ticker, timeframe=TIMEFRAME, lookback=LOOKBACK, retries=DEFAULT_RETRIES, retry_delay=DEFAULT_RETRY_DELAY, market_open_minutes=MARKET_OPEN_MINUTES):
-    df = get_intraday_data(ticker, retries=retries, retry_delay=retry_delay, timeframe=timeframe, lookback=lookback)
+
+def scan_ticker(
+    ticker,
+    timeframe=TIMEFRAME,
+    lookback=LOOKBACK,
+    retries=DEFAULT_RETRIES,
+    retry_delay=DEFAULT_RETRY_DELAY,
+    market_open_minutes=MARKET_OPEN_MINUTES,
+):
+    df = get_intraday_data(
+        ticker, retries=retries, retry_delay=retry_delay, timeframe=timeframe, lookback=lookback
+    )
     if df is None or df.empty:
         print(f"{ticker}: No data returned (empty). Skipping.")
         return [], pd.DataFrame()
@@ -106,77 +153,91 @@ def scan_ticker(ticker, timeframe=TIMEFRAME, lookback=LOOKBACK, retries=DEFAULT_
     lvl_high = or_high
     lvl_low = or_low
     # --- 1. Breakout Detection ---
-    for i in range(1, len(scan_df)-2):
+    for i in range(1, len(scan_df) - 2):
         row = scan_df.iloc[i]
-        prev = scan_df.iloc[i-1]
+        prev = scan_df.iloc[i - 1]
         # Breakout up: breaks opening range high
         breakout_up = (
-            prev["High"] <= lvl_high and
-            row["High"] > lvl_high and
-            is_strong_body(row) and
-            row["Volume"] > row["vol_ma"] * 1.2 and
-            row["Close"] > lvl_high
+            prev["High"] <= lvl_high
+            and row["High"] > lvl_high
+            and is_strong_body(row)
+            and row["Volume"] > row["vol_ma"] * 1.2
+            and row["Close"] > lvl_high
         )
         # Breakout down: breaks opening range low
         breakout_down = (
-            prev["Low"] >= lvl_low and
-            row["Low"] < lvl_low and
-            is_strong_body(row) and
-            row["Volume"] > row["vol_ma"] * 1.2 and
-            row["Close"] < lvl_low
+            prev["Low"] >= lvl_low
+            and row["Low"] < lvl_low
+            and is_strong_body(row)
+            and row["Volume"] > row["vol_ma"] * 1.2
+            and row["Close"] < lvl_low
         )
         if breakout_up or breakout_down:
             # --- 2. Re-Test Detection ---
-            re_test_idx = i+1
+            re_test_idx = i + 1
             if re_test_idx >= len(scan_df):
                 continue
             re_test = scan_df.iloc[re_test_idx]
             # Price returns to level
-            returns_to_level = (
-                (breakout_up and abs(re_test["Low"] - lvl_high) < 0.1) or
-                (breakout_down and abs(re_test["High"] - lvl_low) < 0.1)
+            returns_to_level = (breakout_up and abs(re_test["Low"] - lvl_high) < 0.1) or (
+                breakout_down and abs(re_test["High"] - lvl_low) < 0.1
             )
             # Tight candle, lower volume
-            tight_candle = (re_test["High"] - re_test["Low"] < 0.5 * (row["High"] - row["Low"]))
+            tight_candle = re_test["High"] - re_test["Low"] < 0.5 * (row["High"] - row["Low"])
             lower_vol = re_test["Volume"] < row["Volume"]
             if returns_to_level and tight_candle and lower_vol:
                 # --- 3. Ignition Candle ---
-                ign_idx = i+2
+                ign_idx = i + 2
                 if ign_idx >= len(scan_df):
                     continue
                 ign = scan_df.iloc[ign_idx]
                 # Strong body, breaks re-test high/low, volume increases
                 ignition = (
-                    is_strong_body(ign) and
-                    (
-                        (breakout_up and ign["High"] > re_test["High"]) or
-                        (breakout_down and ign["Low"] < re_test["Low"])
-                    ) and
-                    ign["Volume"] > re_test["Volume"]
+                    is_strong_body(ign)
+                    and (
+                        (breakout_up and ign["High"] > re_test["High"])
+                        or (breakout_down and ign["Low"] < re_test["Low"])
+                    )
+                    and ign["Volume"] > re_test["Volume"]
                 )
                 if ignition:
                     # --- 4. Entry, Stop, Target ---
                     entry = ign["High"] if breakout_up else ign["Low"]
                     stop = re_test["Low"] - 0.05 if breakout_up else re_test["High"] + 0.05
                     risk = abs(entry - stop)
-                    target = entry + 2*risk if breakout_up else entry - 2*risk
-                    signals.append({
-                        "ticker": ticker,
-                        "datetime": ign["Datetime"],
-                        "direction": "long" if breakout_up else "short",
-                        "level": lvl_high if breakout_up else lvl_low,
-                        "entry": entry,
-                        "stop": stop,
-                        "target": target,
-                        "risk": risk,
-                        "vol_breakout": row["Volume"],
-                        "vol_retest": re_test["Volume"],
-                        "vol_ignition": ign["Volume"]
-                    })
+                    target = entry + 2 * risk if breakout_up else entry - 2 * risk
+                    signals.append(
+                        {
+                            "ticker": ticker,
+                            "datetime": ign["Datetime"],
+                            "direction": "long" if breakout_up else "short",
+                            "level": lvl_high if breakout_up else lvl_low,
+                            "entry": entry,
+                            "stop": stop,
+                            "target": target,
+                            "risk": risk,
+                            "vol_breakout": row["Volume"],
+                            "vol_retest": re_test["Volume"],
+                            "vol_ignition": ign["Volume"],
+                        }
+                    )
     # --- Print Results ---
     if signals:
         for sig in signals:
-            print(f"{sig['ticker']} {sig['datetime']} {sig['direction'].upper()} | Level: {sig['level']:.2f} Entry: {sig['entry']:.2f} Stop: {sig['stop']:.2f} Target: {sig['target']:.2f} Vol(Break): {sig['vol_breakout']} Vol(Retest): {sig['vol_retest']} Vol(Ign): {sig['vol_ignition']}")
+            direction = sig["direction"].upper()
+            level = sig["level"]
+            entry = sig["entry"]
+            stop = sig["stop"]
+            target = sig["target"]
+            vol_break = sig["vol_breakout"]
+            vol_retest = sig["vol_retest"]
+            vol_ign = sig["vol_ignition"]
+            print(
+                f"{sig['ticker']} {sig['datetime']} {direction} | "
+                f"Level: {level:.2f} Entry: {entry:.2f} Stop: {stop:.2f} "
+                f"Target: {target:.2f} Vol(Break): {vol_break} "
+                f"Vol(Retest): {vol_retest} Vol(Ign): {vol_ign}"
+            )
     else:
         print(f"{ticker}: No setups found.")
 
@@ -214,65 +275,67 @@ def scan_dataframe(df, market_open_minutes=MARKET_OPEN_MINUTES):
     signals = []
     lvl_high = or_high
     lvl_low = or_low
-    for i in range(1, len(scan_df)-2):
+    for i in range(1, len(scan_df) - 2):
         row = scan_df.iloc[i]
-        prev = scan_df.iloc[i-1]
+        prev = scan_df.iloc[i - 1]
         breakout_up = (
-            prev["High"] <= lvl_high and
-            row["High"] > lvl_high and
-            is_strong_body(row) and
-            row["Volume"] > row["vol_ma"] * 1.2 and
-            row["Close"] > lvl_high
+            prev["High"] <= lvl_high
+            and row["High"] > lvl_high
+            and is_strong_body(row)
+            and row["Volume"] > row["vol_ma"] * 1.2
+            and row["Close"] > lvl_high
         )
         breakout_down = (
-            prev["Low"] >= lvl_low and
-            row["Low"] < lvl_low and
-            is_strong_body(row) and
-            row["Volume"] > row["vol_ma"] * 1.2 and
-            row["Close"] < lvl_low
+            prev["Low"] >= lvl_low
+            and row["Low"] < lvl_low
+            and is_strong_body(row)
+            and row["Volume"] > row["vol_ma"] * 1.2
+            and row["Close"] < lvl_low
         )
         if breakout_up or breakout_down:
-            re_test_idx = i+1
+            re_test_idx = i + 1
             if re_test_idx >= len(scan_df):
                 continue
             re_test = scan_df.iloc[re_test_idx]
-            returns_to_level = (
-                (breakout_up and abs(re_test["Low"] - lvl_high) < 0.1) or
-                (breakout_down and abs(re_test["High"] - lvl_low) < 0.1)
+            returns_to_level = (breakout_up and abs(re_test["Low"] - lvl_high) < 0.1) or (
+                breakout_down and abs(re_test["High"] - lvl_low) < 0.1
             )
-            tight_candle = (re_test["High"] - re_test["Low"] < 0.5 * (row["High"] - row["Low"]))
+            tight_candle = re_test["High"] - re_test["Low"] < 0.5 * (row["High"] - row["Low"])
             lower_vol = re_test["Volume"] < row["Volume"]
             if returns_to_level and tight_candle and lower_vol:
-                ign_idx = i+2
+                ign_idx = i + 2
                 if ign_idx >= len(scan_df):
                     continue
                 ign = scan_df.iloc[ign_idx]
                 ignition = (
-                    is_strong_body(ign) and
-                    (
-                        (breakout_up and ign["High"] > re_test["High"]) or
-                        (breakout_down and ign["Low"] < re_test["Low"]) 
-                    ) and
-                    ign["Volume"] > re_test["Volume"]
+                    is_strong_body(ign)
+                    and (
+                        (breakout_up and ign["High"] > re_test["High"])
+                        or (breakout_down and ign["Low"] < re_test["Low"])
+                    )
+                    and ign["Volume"] > re_test["Volume"]
                 )
                 if ignition:
                     entry = ign["High"] if breakout_up else ign["Low"]
                     stop = re_test["Low"] - 0.05 if breakout_up else re_test["High"] + 0.05
                     risk = abs(entry - stop)
-                    target = entry + 2*risk if breakout_up else entry - 2*risk
-                    signals.append({
-                        "direction": "long" if breakout_up else "short",
-                        "entry": entry,
-                        "stop": stop,
-                        "target": target,
-                        "risk": risk,
-                        "vol_breakout": row["Volume"],
-                        "vol_retest": re_test["Volume"],
-                        "vol_ignition": ign["Volume"],
-                        "datetime": ign["Datetime"],
-                        "level": lvl_high if breakout_up else lvl_low,
-                    })
+                    target = entry + 2 * risk if breakout_up else entry - 2 * risk
+                    signals.append(
+                        {
+                            "direction": "long" if breakout_up else "short",
+                            "entry": entry,
+                            "stop": stop,
+                            "target": target,
+                            "risk": risk,
+                            "vol_breakout": row["Volume"],
+                            "vol_retest": re_test["Volume"],
+                            "vol_ignition": ign["Volume"],
+                            "datetime": ign["Datetime"],
+                            "level": lvl_high if breakout_up else lvl_low,
+                        }
+                    )
     return signals, scan_df
+
 
 def _parse_tickers(s: str):
     return [t.strip().upper() for t in s.split(",")] if s else TICKERS
@@ -280,7 +343,11 @@ def _parse_tickers(s: str):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="5-min Break & Re-Test Scalp Strategy Scanner (CLI)")
-    p.add_argument("--tickers", default=",".join(TICKERS), help="Comma-separated tickers to scan (default: common list)")
+    p.add_argument(
+        "--tickers",
+        default=",".join(TICKERS),
+        help="Comma-separated tickers to scan (default: common list)",
+    )
     p.add_argument("--timeframe", default=TIMEFRAME)
     p.add_argument("--lookback", default=LOOKBACK)
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
@@ -292,7 +359,14 @@ if __name__ == "__main__":
     print("\n=== 5-Min Break & Re-Test Scalp Strategy Scanner (CLI) ===\n")
     for ticker in tickers:
         try:
-            signals, scan_df = scan_ticker(ticker, timeframe=args.timeframe, lookback=args.lookback, retries=args.retries, retry_delay=args.retry_delay, market_open_minutes=args.open_minutes)
+            signals, scan_df = scan_ticker(
+                ticker,
+                timeframe=args.timeframe,
+                lookback=args.lookback,
+                retries=args.retries,
+                retry_delay=args.retry_delay,
+                market_open_minutes=args.open_minutes,
+            )
             # Default behavior: save scan CSV and signals JSON into logs/ with timestamp
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             # Ensure both data/ and logs/ exist. CSVs go to data/, JSON signals remain in logs/
