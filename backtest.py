@@ -323,7 +323,6 @@ class BacktestEngine:
             # Use first 5-minute candle as opening range
             or_high = session_df_5m.iloc[0]["High"]
             or_low = session_df_5m.iloc[0]["Low"]
-            or_time = session_df_5m.iloc[0]["Datetime"]
 
             # Scan the first 90 minutes of 5-minute data for breakouts (18 bars)
             start_time = session_df_5m["Datetime"].iloc[0]
@@ -481,13 +480,9 @@ class BacktestEngine:
             if shares == 0:
                 continue
 
-            position_value = shares * entry_price
-
             # Simple simulation: assume target or stop is hit
             # In reality, you'd need to track price action after signal
             # For now, use a 50/50 random outcome weighted by risk/reward
-            risk = abs(entry_price - stop_price)
-            reward = abs(target_price - entry_price)
 
             # Simulate outcome (simplified - assumes 60% hit target based on 2:1 R:R)
             import random
@@ -593,13 +588,16 @@ Examples:
   python backtest.py --symbols AAPL MSFT --start 2025-10-01 --end 2025-10-31
 
   # Custom capital and save results
-  python backtest.py --start 2025-10-01 --end 2025-10-31 --initial-capital 50000 --output results.json
+  python backtest.py --start 2025-10-01 --end 2025-10-31 \
+      --initial-capital 50000 --output results.json
 
 Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         """,
     )
     parser.add_argument(
-        "--symbols", nargs="+", help=f"Stock symbols to backtest (default: all from config.json)"
+        "--symbols",
+        nargs="+",
+        help=f"Stock symbols to backtest (default: all from config.json)",
     )
     parser.add_argument("--start", required=True, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", required=True, help="End date (YYYY-MM-DD)")

@@ -7,7 +7,8 @@ Usage:
     python3 break-and-retest/visualize_results.py --demo --demo-scenario long
     python3 break-and-retest/visualize_results.py --show-test
 
-This will run the scanner (first 90m) and plot detected signals with entry/stop/target and opening range.
+This will run the scanner (first 90m) and plot detected signals with
+entry/stop/target and opening range.
 """
 
 import argparse
@@ -34,8 +35,14 @@ def create_chart(
         print(
             f"[create_chart] rows={len(df)} index_min={df.index.min()} index_max={df.index.max()}"
         )
+        o_min, o_max = df["Open"].min(), df["Open"].max()
+        h_min, h_max = df["High"].min(), df["High"].max()
+        l_min, l_max = df["Low"].min(), df["Low"].max()
+        c_min, c_max = df["Close"].min(), df["Close"].max()
         print(
-            f"[create_chart] Open min/max={df['Open'].min()}/{df['Open'].max()} High min/max={df['High'].min()}/{df['High'].max()} Low min/max={df['Low'].min()}/{df['Low'].max()} Close min/max={df['Close'].min()}/{df['Close'].max()}"
+            f"[create_chart] Open min/max={o_min}/{o_max} "
+            f"High min/max={h_min}/{h_max} Low min/max={l_min}/{l_max} "
+            f"Close min/max={c_min}/{c_max}"
         )
     except Exception:
         # Best-effort logging — don't fail the plot if something odd is present.
@@ -458,9 +465,11 @@ def main():
                 minute_key = None
                 if m:
                     datetime_str = m.group(1)  # e.g. 20251031_101818
-                    minute_key = datetime_str[:13]  # e.g. 20251031_1018 (to the minute)
+                    # e.g. 20251031_1018 (to the minute)
+                    minute_key = datetime_str[:13]
 
-                # Collect all test files that share the same minute key (or fall back to all test files)
+                # Collect all test files that share the same minute key
+                # (or fall back to all test files)
                 matched = []
                 all_test_files = []
                 for entry in os.scandir("logs"):
@@ -472,12 +481,14 @@ def main():
                     if minute_key and minute_key in entry.name:
                         matched.append(entry.path)
 
-                # If we found a minute-group, use it; otherwise fall back to all test files
+                # If we found a minute-group, use it; otherwise fall back to all
                 files_to_show = matched if matched else all_test_files
 
                 if not files_to_show:
                     print(
-                        "No test output HTML files found in logs/ directory. Run 'pytest test_break_and_retest_strategy.py' to generate them."
+                        "No test output HTML files found in logs/ directory. "
+                        "Run 'pytest test_break_and_retest_strategy.py' "
+                        "to generate them."
                     )
                     return
 
@@ -504,14 +515,17 @@ def main():
                     for f in files_to_show:
                         if f != latest_in_group:
                             try:
-                                webbrowser.open_new_tab(f"file://{os.path.abspath(f)}")
+                                path = os.path.abspath(f)
+                                webbrowser.open_new_tab(f"file://{path}")
                             except Exception:
                                 pass
             except Exception as e:
                 print(f"Error while locating or opening test outputs: {e}")
         else:
             print(
-                "No test output HTML files found in logs/ directory. Run 'pytest test_break_and_retest_strategy.py' to generate them."
+                "No test output HTML files found in logs/ directory. "
+                "Run 'pytest test_break_and_retest_strategy.py' to "
+                "generate them."
             )
 
     # Demo mode

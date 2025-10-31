@@ -96,8 +96,6 @@ from break_and_retest_strategy import scan_ticker as orig_scan_ticker
 
 def scan_ticker_test(df):
     # Match main script: restrict to first 90 min after open
-    SESSION_START = "09:30"
-    MARKET_OPEN_MINUTES = 90
     # Use exact detection loop from main script
     scan_df = df.copy()
     if len(scan_df) < 10:

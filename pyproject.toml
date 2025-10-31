@@ -3,8 +3,8 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
-# Allow prints; ignore long lines for now; allow placeholder-less f-strings
-ignore = ["T201", "E501", "F541", "F841"]
+# Allow prints and placeholder-less f-strings
+ignore = ["T201", "F541"]
 
 [tool.ruff.lint.isort]
 known-third-party = ["plotly", "pandas", "numpy", "yfinance"]

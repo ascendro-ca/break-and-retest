@@ -59,9 +59,11 @@ def get_intraday_data(
     timeframe=TIMEFRAME,
     lookback=LOOKBACK,
 ):
-    """Download intraday data with simple retry/backoff. Returns a DataFrame (may be empty).
+    """Download intraday data with simple retry/backoff.
 
-    Always returns a DataFrame (possibly empty) instead of raising so callers can handle missing data.
+    Returns a DataFrame (may be empty).
+    Always returns a DataFrame (possibly empty) instead of raising so
+    callers can handle missing data.
     """
     attempt = 0
     last_exc = None
@@ -222,8 +224,19 @@ def scan_ticker(
     # --- Print Results ---
     if signals:
         for sig in signals:
+            direction = sig["direction"].upper()
+            level = sig["level"]
+            entry = sig["entry"]
+            stop = sig["stop"]
+            target = sig["target"]
+            vol_break = sig["vol_breakout"]
+            vol_retest = sig["vol_retest"]
+            vol_ign = sig["vol_ignition"]
             print(
-                f"{sig['ticker']} {sig['datetime']} {sig['direction'].upper()} | Level: {sig['level']:.2f} Entry: {sig['entry']:.2f} Stop: {sig['stop']:.2f} Target: {sig['target']:.2f} Vol(Break): {sig['vol_breakout']} Vol(Retest): {sig['vol_retest']} Vol(Ign): {sig['vol_ignition']}"
+                f"{sig['ticker']} {sig['datetime']} {direction} | "
+                f"Level: {level:.2f} Entry: {entry:.2f} Stop: {stop:.2f} "
+                f"Target: {target:.2f} Vol(Break): {vol_break} "
+                f"Vol(Retest): {vol_retest} Vol(Ign): {vol_ign}"
             )
     else:
         print(f"{ticker}: No setups found.")
