@@ -52,6 +52,9 @@ cache/
 backtest_results/
 *.json
 
+# Allow checked-in configuration
+!config.json
+
 # Lock files
 *.lock
 
