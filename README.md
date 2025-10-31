@@ -110,7 +110,7 @@ The backtesting engine allows you to test the Break & Re-Test strategy on histor
 
 ### Features
 - **Data Caching**: Downloads and caches OHLCV data organized by symbol and date
-- **Multiple Symbols**: Backtest across multiple stocks simultaneously  
+- **Multiple Symbols**: Backtest across multiple stocks simultaneously
 - **Configurable Parameters**: Adjust initial capital, position sizing, and date ranges
 - **Performance Metrics**: Win rate, P&L, trade statistics per symbol and overall
 
