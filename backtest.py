@@ -18,6 +18,7 @@ import pandas as pd
 import yfinance as yf
 
 from break_and_retest_strategy import is_strong_body
+from signal_grader import generate_signal_report
 
 
 def load_config():
@@ -268,7 +269,9 @@ class BacktestEngine:
         self.closed_trades = []
         self.equity_curve = []
 
-    def _scan_continuous_data(self, df_5m: pd.DataFrame, df_1m: pd.DataFrame) -> List[Dict]:
+    def _scan_continuous_data(
+        self, symbol: str, df_5m: pd.DataFrame, df_1m: pd.DataFrame
+    ) -> List[Dict]:
         """
         Scan data using multi-timeframe approach:
         - Use 5-minute candles to identify opening range and breakouts
@@ -416,19 +419,65 @@ class BacktestEngine:
                                 risk = abs(entry - stop)
                                 target = entry + 2 * risk if breakout_up else entry - 2 * risk
 
+                                # Calculate grading metadata
+                                breakout_body_pct = abs(row_5m["Close"] - row_5m["Open"]) / (
+                                    row_5m["High"] - row_5m["Low"]
+                                )
+                                breakout_vol_ratio = row_5m["Volume"] / row_5m["vol_ma"]
+                                retest_vol_ratio = retest_1m["Volume"] / row_5m["Volume"]
+                                ignition_body_pct = abs(ign_1m["Close"] - ign_1m["Open"]) / (
+                                    ign_1m["High"] - ign_1m["Low"]
+                                )
+                                ignition_vol_ratio = ign_1m["Volume"] / row_5m["Volume"]
+
+                                # Calculate distance to target achieved by ignition
+                                if breakout_up:
+                                    distance_to_target = (ign_1m["High"] - entry) / (target - entry)
+                                else:
+                                    distance_to_target = (entry - ign_1m["Low"]) / (entry - target)
+
                                 all_signals.append(
                                     {
+                                        "ticker": symbol,
                                         "direction": "long" if breakout_up else "short",
                                         "entry": entry,
                                         "stop": stop,
                                         "target": target,
                                         "risk": risk,
+                                        "level": breakout_level,
+                                        "datetime": ign_1m["Datetime"],
+                                        "breakout_time_5m": breakout_time,
                                         "vol_breakout_5m": row_5m["Volume"],
                                         "vol_retest_1m": retest_1m["Volume"],
                                         "vol_ignition_1m": ign_1m["Volume"],
-                                        "datetime": ign_1m["Datetime"],
-                                        "breakout_time_5m": breakout_time,
-                                        "level": breakout_level,
+                                        # Grading metadata
+                                        "breakout_candle": {
+                                            "Open": row_5m["Open"],
+                                            "High": row_5m["High"],
+                                            "Low": row_5m["Low"],
+                                            "Close": row_5m["Close"],
+                                            "Volume": row_5m["Volume"],
+                                        },
+                                        "retest_candle": {
+                                            "Open": retest_1m["Open"],
+                                            "High": retest_1m["High"],
+                                            "Low": retest_1m["Low"],
+                                            "Close": retest_1m["Close"],
+                                            "Volume": retest_1m["Volume"],
+                                        },
+                                        "ignition_candle": {
+                                            "Open": ign_1m["Open"],
+                                            "High": ign_1m["High"],
+                                            "Low": ign_1m["Low"],
+                                            "Close": ign_1m["Close"],
+                                            "Volume": ign_1m["Volume"],
+                                        },
+                                        "breakout_body_pct": breakout_body_pct,
+                                        "breakout_vol_ratio": breakout_vol_ratio,
+                                        "retest_vol_ratio": retest_vol_ratio,
+                                        "ignition_body_pct": ignition_body_pct,
+                                        "ignition_vol_ratio": ignition_vol_ratio,
+                                        "distance_to_target": distance_to_target,
                                     }
                                 )
 
@@ -450,7 +499,7 @@ class BacktestEngine:
             Dictionary with backtest results
         """
         # Get signals using multi-timeframe scanning approach
-        signals = self._scan_continuous_data(df_5m, df_1m)
+        signals = self._scan_continuous_data(symbol, df_5m, df_1m)
 
         if not signals:
             return {
@@ -517,6 +566,12 @@ class BacktestEngine:
                     "outcome": "win" if hit_target else "loss",
                 }
             )
+
+            # Generate and print Scarface Rules report for this signal
+            report = generate_signal_report(sig)
+            print("\n" + "=" * 70)
+            print(report)
+            print("=" * 70 + "\n")
 
         # Calculate statistics
         total_trades = len(trades)
