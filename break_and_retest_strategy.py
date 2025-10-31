@@ -1,6 +1,6 @@
 """
 Break & Re-Test Scalp Strategy Scanner
-Scans 5-min intraday data for AAPL, AMZN, META, MSFT, NVDA, TSLA, SPOT, UBER
+Scans 5-min intraday data for configured tickers
 Detects break and re-test long/short setups using:
 - Key levels (premarket high, opening range)
 - Breakout candle (strong body, above-average volume)
@@ -16,16 +16,36 @@ import time
 import argparse
 import os
 import json
+from pathlib import Path
 
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_DELAY = 1.0  # seconds
 
-TICKERS = ["AAPL", "AMZN", "META", "MSFT", "NVDA", "TSLA", "SPOT", "UBER"]
-TIMEFRAME = "5m"
-LOOKBACK = "2d"  # 2 days to get premarket and today's session
-SESSION_START = "09:30"  # 6:30am PST = 09:30am EST
-SESSION_END = "16:00"
-MARKET_OPEN_MINUTES = 90  # Run detection for first 90 min after open
+# Load configuration
+def load_config():
+    """Load configuration from config.json"""
+    config_path = Path(__file__).parent / "config.json"
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    else:
+        # Default config if file doesn't exist
+        return {
+            "tickers": ["AAPL", "AMZN", "META", "MSFT", "NVDA", "TSLA", "SPOT", "UBER"],
+            "timeframe_5m": "5m",
+            "lookback": "2d",
+            "session_start": "09:30",
+            "session_end": "16:00",
+            "market_open_minutes": 90
+        }
+
+CONFIG = load_config()
+TICKERS = CONFIG["tickers"]
+TIMEFRAME = CONFIG["timeframe_5m"]
+LOOKBACK = CONFIG["lookback"]
+SESSION_START = CONFIG["session_start"]
+SESSION_END = CONFIG["session_end"]
+MARKET_OPEN_MINUTES = CONFIG["market_open_minutes"]
 
 # --- Helper Functions ---
 def get_intraday_data(ticker, retries=DEFAULT_RETRIES, retry_delay=DEFAULT_RETRY_DELAY, timeframe=TIMEFRAME, lookback=LOOKBACK):

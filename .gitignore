@@ -47,6 +47,11 @@ data/*.csv
 *.html
 *.png
 
+# Backtesting
+cache/
+backtest_results/
+*.json
+
 # Lock files
 *.lock
 
