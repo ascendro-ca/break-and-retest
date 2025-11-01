@@ -37,7 +37,11 @@ test-functional:
 	pytest test_functional.py -v --tb=short
 
 coverage:
+	pytest -v --cov=. --cov-report=term-missing:skip-covered --cov-report=html --cov-fail-under=80 --ignore=test_functional.py
 
+.PHONY: coverage-all
+coverage-all:
+	pytest -v --cov=. --cov-report=term-missing:skip-covered --cov-report=html --cov-fail-under=80
 qa: format lint test
 
 qa-full: format lint test test-functional

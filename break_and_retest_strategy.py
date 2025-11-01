@@ -19,7 +19,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-from break_and_retest_detection import scan_for_setups
+from break_and_retest_detection_mt import scan_for_setups
 from signal_grader import (
     calculate_overall_grade,
     generate_signal_report,
@@ -28,6 +28,7 @@ from signal_grader import (
     grade_retest,
     grade_risk_reward,
 )
+from time_utils import get_display_timezone
 
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_DELAY = 1.0  # seconds
@@ -59,6 +60,11 @@ LOOKBACK = CONFIG["lookback"]
 SESSION_START = CONFIG["session_start"]
 SESSION_END = CONFIG["session_end"]
 MARKET_OPEN_MINUTES = CONFIG["market_open_minutes"]
+RETEST_VOL_GATE = CONFIG.get("retest_volume_gate_ratio", 0.20)
+BREAKOUT_A_UW_MAX = CONFIG.get("breakout_A_upper_wick_max", 0.15)
+BREAKOUT_B_BODY_MAX = CONFIG.get("breakout_B_body_max", 0.65)
+RETEST_B_EPSILON = CONFIG.get("retest_B_level_epsilon_pct", 0.10)
+RETEST_B_SOFT = CONFIG.get("retest_B_structure_soft", True)
 
 
 # --- Helper Functions ---
@@ -159,8 +165,8 @@ def scan_ticker(
         ticker, retries=retries, retry_delay=retry_delay, timeframe="1m", lookback=lookback
     )
     if df_1m is None or df_1m.empty:
-        print(f"{ticker}: No 1m data returned. Falling back to 5m-only mode.")
-        df_1m = None
+        print(f"{ticker}: No 1m data returned. Skipping (multi-timeframe required).")
+        return [], df_5m
 
     # Use first 5-min candle after market open as range
     or_high, or_low = find_first_candle_range(df_5m)
@@ -187,6 +193,13 @@ def scan_ticker(
     # Compute rolling volume mean for breakout detection
     scan_df_5m["vol_ma"] = scan_df_5m["Volume"].rolling(window=10, min_periods=1).mean()
 
+    # Calculate VWAP for trend filtering
+    scan_df_5m["typical_price"] = (
+        scan_df_5m["High"] + scan_df_5m["Low"] + scan_df_5m["Close"]
+    ) / 3
+    scan_df_5m["tp_volume"] = scan_df_5m["typical_price"] * scan_df_5m["Volume"]
+    scan_df_5m["vwap"] = scan_df_5m["tp_volume"].cumsum() / scan_df_5m["Volume"].cumsum()
+
     # Also filter 1m data to same session window if available
     session_df_1m = None
     if df_1m is not None:
@@ -194,14 +207,13 @@ def scan_ticker(
             (df_1m["Datetime"] >= start_time) & (df_1m["Datetime"] < end_time)
         ].copy()
 
-    # Use shared detection module to find setups
+    # Use shared detection module to find setups (multi-timeframe only)
     setups = scan_for_setups(
         df_5m=scan_df_5m,
         df_1m=session_df_1m,
         or_high=or_high,
         or_low=or_low,
         vol_threshold=1.0,  # Match backtest volume threshold
-        use_multitimeframe=True,
     )
 
     signals = []
@@ -251,8 +263,20 @@ def scan_ticker(
 
         # Grade each component
         breakout_grade, breakout_desc = grade_breakout_candle(
-            breakout_body_pct, breakout_vol_ratio, level
+            {
+                "Open": breakout_candle["Open"],
+                "High": breakout_candle["High"],
+                "Low": breakout_candle["Low"],
+                "Close": breakout_candle["Close"],
+            },
+            breakout_vol_ratio,
+            breakout_body_pct,
+            level,
+            direction,
+            a_upper_wick_max=BREAKOUT_A_UW_MAX,
+            b_body_max=BREAKOUT_B_BODY_MAX,
         )
+        breakout_tier = "A" if breakout_grade == "✅" else ("B" if breakout_grade == "⚠️" else "C")
         retest_candle_dict = {
             "Open": retest_candle["Open"],
             "High": retest_candle["High"],
@@ -260,7 +284,14 @@ def scan_ticker(
             "Close": retest_candle["Close"],
         }
         retest_grade, retest_desc = grade_retest(
-            retest_candle_dict, retest_vol_ratio, level, direction
+            retest_candle_dict,
+            retest_vol_ratio,
+            level,
+            direction,
+            retest_volume_a_max_ratio=0.30,
+            retest_volume_b_max_ratio=0.60,
+            b_level_epsilon_pct=RETEST_B_EPSILON,
+            b_structure_soft=RETEST_B_SOFT,
         )
         rr_grade, rr_desc = grade_risk_reward(rr_ratio)
         market_grade, market_desc = grade_market_context("slightly_red")
@@ -287,6 +318,8 @@ def scan_ticker(
             "vol_breakout": breakout_candle["Volume"],
             "vol_retest": retest_candle["Volume"],
             "vol_ignition": ignition_candle["Volume"],
+            "breakout_tier": breakout_tier,
+            "vwap": setup.get("vwap"),  # VWAP at breakout time
             # Grading metrics
             "breakout_body_pct": breakout_body_pct,
             "breakout_vol_ratio": breakout_vol_ratio,
@@ -323,7 +356,15 @@ def scan_ticker(
     if signals:
         for sig in signals:
             # Generate and print Scarface Rules report for this signal
-            report = generate_signal_report(sig)
+            report = generate_signal_report(
+                sig,
+                retest_volume_a_max_ratio=0.30,
+                retest_volume_b_max_ratio=0.60,
+                a_upper_wick_max=BREAKOUT_A_UW_MAX,
+                b_body_max=BREAKOUT_B_BODY_MAX,
+                b_level_epsilon_pct=RETEST_B_EPSILON,
+                b_structure_soft=RETEST_B_SOFT,
+            )
             print(report)
             print()  # Blank line between signals
     else:
@@ -382,17 +423,16 @@ def scan_dataframe(df_5m, df_1m=None, market_open_minutes=MARKET_OPEN_MINUTES):
             (df_1m["Datetime"] >= start_time) & (df_1m["Datetime"] < end_time)
         ].copy()
 
-    # Use shared detection module
-    use_multitimeframe = df_1m is not None
-    vol_threshold = 1.0 if use_multitimeframe else 1.2  # Match backtest when multi-timeframe
-
+    # Use shared detection module (requires 1m data)
+    if df_1m is None:
+        return [], scan_df_5m
+    vol_threshold = 1.0
     setups = scan_for_setups(
         df_5m=scan_df_5m,
         df_1m=session_df_1m,
         or_high=or_high,
         or_low=or_low,
         vol_threshold=vol_threshold,
-        use_multitimeframe=use_multitimeframe,
     )
 
     signals = []
@@ -441,8 +481,20 @@ def scan_dataframe(df_5m, df_1m=None, market_open_minutes=MARKET_OPEN_MINUTES):
 
         # Grade each component
         breakout_grade, breakout_desc = grade_breakout_candle(
-            breakout_body_pct, breakout_vol_ratio, level
+            {
+                "Open": breakout_candle["Open"],
+                "High": breakout_candle["High"],
+                "Low": breakout_candle["Low"],
+                "Close": breakout_candle["Close"],
+            },
+            breakout_vol_ratio,
+            breakout_body_pct,
+            level,
+            direction,
+            a_upper_wick_max=BREAKOUT_A_UW_MAX,
+            b_body_max=BREAKOUT_B_BODY_MAX,
         )
+        breakout_tier = "A" if breakout_grade == "✅" else ("B" if breakout_grade == "⚠️" else "C")
         retest_candle_dict = {
             "Open": retest_candle["Open"],
             "High": retest_candle["High"],
@@ -450,7 +502,13 @@ def scan_dataframe(df_5m, df_1m=None, market_open_minutes=MARKET_OPEN_MINUTES):
             "Close": retest_candle["Close"],
         }
         retest_grade, retest_desc = grade_retest(
-            retest_candle_dict, retest_vol_ratio, level, direction
+            retest_candle_dict,
+            retest_vol_ratio,
+            level,
+            direction,
+            retest_vol_threshold=RETEST_VOL_GATE,
+            b_level_epsilon_pct=RETEST_B_EPSILON,
+            b_structure_soft=RETEST_B_SOFT,
         )
         rr_grade, rr_desc = grade_risk_reward(rr_ratio)
         market_grade, market_desc = grade_market_context("slightly_red")
@@ -477,6 +535,7 @@ def scan_dataframe(df_5m, df_1m=None, market_open_minutes=MARKET_OPEN_MINUTES):
                 "vol_ignition": ignition_candle["Volume"],
                 "datetime": ignition_candle["Datetime"],
                 "level": level,
+                "breakout_tier": breakout_tier,
                 # Grading metrics
                 "breakout_body_pct": breakout_body_pct,
                 "breakout_vol_ratio": breakout_vol_ratio,
@@ -536,8 +595,12 @@ if __name__ == "__main__":
     )
     args = p.parse_args()
 
+    # Resolve display timezone and show it once for clarity
+    display_tz, tz_label = get_display_timezone(Path(__file__).parent)
+
     tickers = _parse_tickers(args.tickers)
     print("\n=== 5-Min Break & Re-Test Scalp Strategy Scanner (CLI) ===\n")
+    print(f"Timezone: {tz_label}\n")
 
     # Define grade hierarchy for filtering
     grade_order = {"A": 3, "B": 2, "C": 1}

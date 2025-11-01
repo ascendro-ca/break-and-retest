@@ -8,6 +8,8 @@ from signal_grader import (
     calculate_overall_grade,
     generate_signal_report,
     grade_breakout_candle,
+    grade_continuation,
+    grade_ignition,
     grade_market_context,
     grade_retest,
     grade_risk_reward,
@@ -41,7 +43,7 @@ def test_grade_breakout_candle_weak():
 def test_grade_retest_long_perfect():
     """Test perfect long retest grading"""
     retest_candle = {"Open": 100, "High": 101, "Low": 99, "Close": 100.5}
-    retest_vol_ratio = 0.3
+    retest_vol_ratio = 0.10  # Light volume (< 15% threshold)
     level = 100.0
     direction = "long"
 
@@ -51,16 +53,92 @@ def test_grade_retest_long_perfect():
     assert "rejection" in desc.lower()
 
 
+def test_grade_retest_high_volume_rejected():
+    """Test retest with volume too high gets rejected"""
+    retest_candle = {"Open": 100, "High": 101, "Low": 99, "Close": 100.5}
+    retest_vol_ratio = 0.65  # Too high (> 60% threshold)
+    level = 100.0
+    direction = "long"
+
+    grade, desc = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+
+    assert grade == "❌"
+    assert "too high" in desc.lower()
+
+
+def test_grade_retest_volume_boundary_a():
+    """Retest volume at 30% still eligible for A if structure is A-quality."""
+    retest_candle = {"Open": 100, "High": 101, "Low": 99.9, "Close": 100.9}
+    retest_vol_ratio = 0.30  # boundary A
+    level = 100.0
+    direction = "long"
+
+    grade, _ = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+
+    assert grade in ["✅", "⚠️"]  # structure dependent but not rejected by volume
+
+
+def test_grade_retest_volume_boundary_b():
+    """Retest volume at 60% is eligible for B, but not A."""
+    retest_candle = {"Open": 100, "High": 101, "Low": 99.8, "Close": 100.6}
+    retest_vol_ratio = 0.60  # boundary B
+    level = 100.0
+    direction = "long"
+
+    grade, _ = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+
+    assert grade in ["⚠️", "❌"]  # cannot be A at this volume
+
+
 def test_grade_retest_short_weak():
     """Test weak short retest grading"""
     retest_candle = {"Open": 100, "High": 101, "Low": 99, "Close": 101}
-    retest_vol_ratio = 0.8
+    retest_vol_ratio = 0.10  # Light volume
     level = 100.0
     direction = "short"
 
     grade, desc = grade_retest(retest_candle, retest_vol_ratio, level, direction)
 
     assert grade in ["❌", "⚠️"]
+
+
+def test_grade_retest_short_perfect():
+    """Test perfect short retest grading (A-grade)."""
+    # Resistance level 100.0; wick should touch/pierce above, close near low with strong body
+    retest_candle = {"Open": 100.2, "High": 100.05, "Low": 99.5, "Close": 99.53}
+    retest_vol_ratio = 0.10
+    level = 100.0
+    direction = "short"
+
+    grade, desc = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+
+    assert grade == "✅"
+    assert "A-grade" in desc or "A-grade" in desc
+
+
+def test_grade_retest_short_b_boundary():
+    """Short B-grade retest at volume boundary (60%)."""
+    retest_candle = {"Open": 100.2, "High": 100.4, "Low": 99.7, "Close": 99.9}
+    retest_vol_ratio = 0.60
+    level = 100.0
+    direction = "short"
+
+    grade, _ = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+
+    assert grade in ["⚠️", "❌"]
+
+
+def test_grade_retest_short_inverted_hammer_alt():
+    """Short A-grade via inverted-hammer alternative path."""
+    # Design candle with long upper wick, small lower wick, and close below level
+    retest_candle = {"Open": 100.0, "High": 100.8, "Low": 99.6, "Close": 99.7}
+    retest_vol_ratio = 0.10
+    level = 100.0
+    direction = "short"
+
+    grade, desc = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+
+    assert grade == "✅"
 
 
 def test_grade_risk_reward_excellent():
@@ -77,6 +155,83 @@ def test_grade_risk_reward_poor():
 
     assert grade == "❌"
     assert "1.0:1" in desc
+
+
+def test_grade_continuation_volume_too_high():
+    """Test continuation/ignition with volume too high gets rejected"""
+    ignition_candle = {"Open": 100, "High": 102, "Low": 100, "Close": 101.5}
+    ignition_vol_ratio = 0.25  # Too high (> 20% threshold)
+    distance_to_target = 0.5
+    body_pct = 0.75
+
+    grade, desc = grade_continuation(
+        ignition_candle, ignition_vol_ratio, distance_to_target, body_pct
+    )
+
+    assert grade == "❌"
+    assert "too high" in desc.lower()
+
+
+def test_grade_continuation_perfect():
+    """Test perfect continuation grading"""
+    ignition_candle = {"Open": 100, "High": 102, "Low": 100, "Close": 101.5}
+    ignition_vol_ratio = 0.15  # Light volume (< 20% threshold)
+    distance_to_target = 0.5
+    body_pct = 0.75
+
+    grade, desc = grade_continuation(
+        ignition_candle, ignition_vol_ratio, distance_to_target, body_pct
+    )
+
+    assert grade == "✅"
+    assert "50%" in desc
+
+
+def test_grade_ignition_a_long():
+    candle = {"Open": 100, "High": 101.2, "Low": 99.9, "Close": 101.1, "Volume": 5000}
+    retest_extreme = 101.0
+    session_avg = 3000
+    retest_vol = 2500
+    grade, msg = grade_ignition(
+        candle,
+        direction="long",
+        retest_extreme=retest_extreme,
+        session_avg_vol_1m=session_avg,
+        retest_vol_1m=retest_vol,
+    )
+    assert grade == "🟢"
+    assert "Ignition A" in msg
+
+
+def test_grade_ignition_b_short():
+    candle = {"Open": 100, "High": 100.2, "Low": 98.9, "Close": 99.2, "Volume": 2600}
+    retest_extreme = 99.5
+    session_avg = 2000
+    retest_vol = 2000
+    grade, _ = grade_ignition(
+        candle,
+        direction="short",
+        retest_extreme=retest_extreme,
+        session_avg_vol_1m=session_avg,
+        retest_vol_1m=retest_vol,
+    )
+    assert grade in ["🟡", "🟢"]  # allow A if surge qualifies
+
+
+def test_grade_ignition_c_when_no_break():
+    candle = {"Open": 100, "High": 100.5, "Low": 99.7, "Close": 100.1, "Volume": 1000}
+    retest_extreme = 101.0  # not broken
+    session_avg = 3000
+    retest_vol = 2500
+    grade, msg = grade_ignition(
+        candle,
+        direction="long",
+        retest_extreme=retest_extreme,
+        session_avg_vol_1m=session_avg,
+        retest_vol_1m=retest_vol,
+    )
+    assert grade == "🔴"
+    assert "Ignition C" in msg
 
 
 def test_grade_market_context():

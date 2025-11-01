@@ -114,7 +114,7 @@ def sample_ohlcv_data_1m():
             "Datetime": times[31],
             "Open": 102.5,
             "High": 102.6,
-            "Low": 102.1,
+            "Low": 102.0,  # touch OR high (102.0) to satisfy strict retest requirement
             "Close": 102.3,
             "Volume": 4000,
         }

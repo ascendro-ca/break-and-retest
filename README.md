@@ -2,6 +2,11 @@
 
 Small scanner that looks for a 5-minute "break and re-test" scalp setup on a list of tickers.
 
+## Strategy docs
+- `STRATEGY_SPEC.md` — What the strategy is (rules and criteria)
+- `STRATEGY_DESIGN.md` — Why the rules exist (rationale and trade-offs)
+- `STRATEGY_IMPLEMENTATION.md` — How to implement (formulas, thresholds, pseudocode)
+
 ## Features
 - Uses the first 5-minute candle after market open as the opening range
 - Detects breakout (strong body + above-average volume)

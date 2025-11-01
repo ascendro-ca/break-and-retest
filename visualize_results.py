@@ -15,19 +15,33 @@ import argparse
 import os
 import webbrowser
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from break_and_retest_strategy import scan_dataframe, scan_ticker
+from time_utils import get_display_timezone
 
 
 def create_chart(
     df: pd.DataFrame, signals: list, output_file: str = None, title: str = "Break & Re-Test"
 ):
+    # Resolve display timezone and label from central config
+    display_tz, tz_label = get_display_timezone(Path(__file__).parent)
+
     df = df.copy()
     df["Datetime"] = pd.to_datetime(df["Datetime"])
+    # Ensure timezone-aware and convert to display timezone for consistent chart labeling
+    try:
+        if getattr(df["Datetime"].dtype, "tz", None) is None:
+            # Assume source timestamps are UTC if naive
+            df["Datetime"] = df["Datetime"].dt.tz_localize("UTC")
+        df["Datetime"] = df["Datetime"].dt.tz_convert(display_tz)
+    except Exception:
+        # Best-effort: leave as-is if conversion fails
+        pass
     df.set_index("Datetime", inplace=True)
 
     # Debug info: surface basic df + OHLC stats so tests and CI can show what's being plotted.
@@ -92,6 +106,13 @@ def create_chart(
         target = sig.get("target")
         direction = sig.get("direction")
         dt = pd.to_datetime(sig.get("datetime"))
+        try:
+            if getattr(dt, "tzinfo", None) is None:
+                dt = dt.tz_localize("UTC")
+            dt = dt.tz_convert(display_tz)
+        except Exception:
+            # If anything goes wrong, keep original value
+            pass
         color = "green" if direction == "long" else "red"
         # Entry line
         fig.add_hline(y=entry, line_color=color, line_width=2, row=1, col=1)
@@ -115,7 +136,7 @@ def create_chart(
     vol_range = [0, vol_max * 1.05]
 
     fig.update_layout(
-        title=title,
+        title=f"{title} (Timezone: {tz_label})",
         xaxis_rangeslider_visible=False,
         height=700,
         yaxis=dict(range=y_range),

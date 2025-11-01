@@ -16,8 +16,9 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 import yfinance as yf
+from zoneinfo import ZoneInfo
 
-from break_and_retest_detection import scan_for_setups
+from break_and_retest_detection_mt import scan_for_setups
 from signal_grader import (
     calculate_overall_grade,
     generate_signal_report,
@@ -27,6 +28,7 @@ from signal_grader import (
     grade_retest,
     grade_risk_reward,
 )
+from time_utils import get_display_timezone
 
 
 def load_config():
@@ -42,6 +44,11 @@ def load_config():
 
 CONFIG = load_config()
 DEFAULT_TICKERS = CONFIG["tickers"]
+RETEST_VOL_GATE = CONFIG.get("retest_volume_gate_ratio", 0.20)
+BREAKOUT_A_UW_MAX = CONFIG.get("breakout_A_upper_wick_max", 0.15)
+BREAKOUT_B_BODY_MAX = CONFIG.get("breakout_B_body_max", 0.65)
+RETEST_B_EPSILON = CONFIG.get("retest_B_level_epsilon_pct", 0.10)
+RETEST_B_SOFT = CONFIG.get("retest_B_structure_soft", True)
 
 
 class DataCache:
@@ -261,6 +268,10 @@ class BacktestEngine:
         max_positions: int = 3,
         scan_window_minutes: int = 180,
         min_grade: Optional[str] = None,
+        breakout_tier_filter: Optional[str] = None,
+        display_tzinfo=None,
+        tz_label: str = "UTC",
+        retest_vol_threshold: float = 0.15,
     ):
         """
         Initialize backtest engine
@@ -281,6 +292,12 @@ class BacktestEngine:
         self.equity_curve = []
         # Optional minimum grade filter (A+, A, B, C)
         self.min_grade = min_grade
+        # Optional breakout tier filter (A, B, or C)
+        self.breakout_tier_filter = breakout_tier_filter
+        # Reporting timezone for printing
+        self.display_tz = display_tzinfo
+        self.tz_label = tz_label
+        self.retest_vol_threshold = retest_vol_threshold
 
     def _scan_continuous_data(
         self, symbol: str, df_5m: pd.DataFrame, df_1m: pd.DataFrame
@@ -304,9 +321,9 @@ class BacktestEngine:
         """
         all_signals = []
 
-        # Calculate 20-bar volume MA on 5-minute data
+        # Calculate 10-bar volume MA on 5-minute data (for breakout volume ratio)
         df_5m = df_5m.copy()
-        df_5m["vol_ma"] = df_5m["Volume"].rolling(window=20, min_periods=1).mean()
+        df_5m["vol_ma"] = df_5m["Volume"].rolling(window=10, min_periods=1).mean()
         df_5m["Date"] = df_5m["Datetime"].dt.date
 
         # Prepare 1-minute data
@@ -326,6 +343,16 @@ class BacktestEngine:
 
             if len(session_df_5m) < 10:
                 continue
+
+            # Calculate VWAP for the session
+            session_df_5m = session_df_5m.copy()
+            session_df_5m["typical_price"] = (
+                session_df_5m["High"] + session_df_5m["Low"] + session_df_5m["Close"]
+            ) / 3
+            session_df_5m["tp_volume"] = session_df_5m["typical_price"] * session_df_5m["Volume"]
+            session_df_5m["vwap"] = (
+                session_df_5m["tp_volume"].cumsum() / session_df_5m["Volume"].cumsum()
+            )
 
             # Check if we have 1-minute data for this day
             has_1m_data = day in available_1m_dates
@@ -357,15 +384,17 @@ class BacktestEngine:
             if len(scan_df_5m) < 10:
                 continue
 
-            # Use shared detection module to find setups
-            # Use multi-timeframe only if we have 1m data for this day
+            # Require 1m data; skip day if missing
+            if not has_1m_data:
+                continue
+
+            # Use shared detection module to find setups (multi-timeframe only)
             setups = scan_for_setups(
                 df_5m=scan_df_5m,
-                df_1m=session_df_1m if has_1m_data else None,
+                df_1m=session_df_1m,
                 or_high=or_high,
                 or_low=or_low,
                 vol_threshold=1.0,  # Backtest uses relaxed 1.0x threshold
-                use_multitimeframe=has_1m_data,
             )
 
             for setup in setups:
@@ -415,6 +444,7 @@ class BacktestEngine:
                         "vol_breakout_5m": breakout_candle["Volume"],
                         "vol_retest_1m": retest_candle["Volume"],
                         "vol_ignition_1m": ignition_candle["Volume"],
+                        "vwap": setup.get("vwap"),  # VWAP at breakout time
                         # Grading metadata
                         "breakout_candle": {
                             "Open": breakout_candle["Open"],
@@ -485,12 +515,20 @@ class BacktestEngine:
                 sig.get("breakout_candle", {}),
                 sig.get("breakout_vol_ratio", 0.0),
                 sig.get("breakout_body_pct", 0.0),
+                sig.get("level", None),
+                sig.get("direction", None),
+                a_upper_wick_max=BREAKOUT_A_UW_MAX,
+                b_body_max=BREAKOUT_B_BODY_MAX,
             )
             retest_grade, retest_desc = grade_retest(
                 sig.get("retest_candle", {}),
                 sig.get("retest_vol_ratio", 0.0),
                 sig.get("level", 0.0),
                 sig.get("direction", "long"),
+                retest_volume_a_max_ratio=0.30,
+                retest_volume_b_max_ratio=0.60,
+                b_level_epsilon_pct=RETEST_B_EPSILON,
+                b_structure_soft=RETEST_B_SOFT,
             )
             continuation_grade, continuation_desc = grade_continuation(
                 sig.get("ignition_candle", {}),
@@ -513,6 +551,9 @@ class BacktestEngine:
             sig["overall_grade"] = overall
             sig["component_grades"] = grades
             sig["rr_ratio"] = rr_ratio
+            sig["breakout_tier"] = (
+                "A" if breakout_grade == "✅" else ("B" if breakout_grade == "⚠️" else "C")
+            )
             return sig
 
         graded_signals = [compute_grades(dict(sig)) for sig in signals]
@@ -525,14 +566,21 @@ class BacktestEngine:
                 s for s in graded_signals if order.get(s.get("overall_grade", "C"), 0) >= threshold
             ]
 
+        # Apply breakout tier filter if specified
+        if self.breakout_tier_filter:
+            graded_signals = [
+                s for s in graded_signals if s.get("breakout_tier") == self.breakout_tier_filter
+            ]
+
         trades = []
 
         for sig in graded_signals:
-            # Simulate trade execution
+            # Track real price movement after signal
             entry_price = sig["entry"]
             stop_price = sig["stop"]
             target_price = sig["target"]
             direction = sig["direction"]
+            entry_datetime = pd.to_datetime(sig["datetime"])
 
             # Calculate position size
             risk_per_trade = self.cash * self.position_size_pct
@@ -542,29 +590,127 @@ class BacktestEngine:
             if shares == 0:
                 continue
 
-            # Simple simulation: assume target or stop is hit
-            # In reality, you'd need to track price action after signal
-            # For now, use a 50/50 random outcome weighted by risk/reward
+            # Get price bars after entry to track if stop or target hit
+            future_bars = df_1m[df_1m["Datetime"] > entry_datetime].copy()
+            # Ensure time-ascending order
+            if not future_bars.empty:
+                future_bars = future_bars.sort_values("Datetime")
 
-            # Simulate outcome (simplified - assumes 60% hit target based on 2:1 R:R)
-            import random
+            if future_bars.empty:
+                # No data after signal - skip this trade
+                continue
 
-            hit_target = random.random() < 0.6
+            # Track which level was hit first (stop or target)
+            exit_price = None
+            exit_time = None
+            outcome = None
 
-            if hit_target:
-                exit_price = target_price
-                pnl = (
-                    (exit_price - entry_price) * shares
-                    if direction == "long"
-                    else (entry_price - exit_price) * shares
+            # Continuation (ignition) diagnostics captured at the first 1m bar after entry
+            continuation_diag = {
+                "continuation_grade": None,
+                "continuation_desc": None,
+                "ignition_vol_ratio": None,
+                "ignition_body_pct": None,
+                "distance_to_target": None,
+                "ignition_time": None,
+            }
+
+            # Compute continuation metrics from the first bar after entry (post-entry info)
+            if not future_bars.empty:
+                ignition_bar = future_bars.iloc[0]
+                ignition_open = float(ignition_bar.get("Open", float("nan")))
+                ignition_high = float(ignition_bar.get("High", float("nan")))
+                ignition_low = float(ignition_bar.get("Low", float("nan")))
+                ignition_close = float(ignition_bar.get("Close", float("nan")))
+                ignition_vol = float(ignition_bar.get("Volume", 0.0))
+
+                # Body percent: |close-open| / (high-low)
+                range_ = max(ignition_high - ignition_low, 0.0)
+                ignition_body_pct = (
+                    abs(ignition_close - ignition_open) / range_ if range_ > 0 else 0.0
                 )
-            else:
-                exit_price = stop_price
-                pnl = (
-                    (exit_price - entry_price) * shares
-                    if direction == "long"
-                    else (entry_price - exit_price) * shares
+
+                # Volume ratio vs breakout 5m volume (if available on signal)
+                breakout_vol = sig.get("vol_breakout_5m")
+                try:
+                    breakout_vol_f = float(breakout_vol) if breakout_vol is not None else 0.0
+                except Exception:
+                    breakout_vol_f = 0.0
+                ignition_vol_ratio = ignition_vol / breakout_vol_f if breakout_vol_f > 0 else 0.0
+
+                # Distance to target progress at ignition close
+                if direction == "long":
+                    denom = target_price - entry_price
+                    progress = (ignition_close - entry_price) / denom if denom != 0 else 0.0
+                else:
+                    denom = entry_price - target_price
+                    progress = (entry_price - ignition_close) / denom if denom != 0 else 0.0
+                # Clamp between 0 and 1 for reporting
+                distance_to_target = max(0.0, min(1.0, float(progress)))
+
+                # Grade continuation (post-entry analysis only)
+                cont_grade, cont_desc = grade_continuation(
+                    {
+                        "Open": ignition_open,
+                        "High": ignition_high,
+                        "Low": ignition_low,
+                        "Close": ignition_close,
+                        "Volume": ignition_vol,
+                    },
+                    ignition_vol_ratio,
+                    distance_to_target,
+                    ignition_body_pct,
                 )
+
+                continuation_diag.update(
+                    {
+                        "continuation_grade": cont_grade,
+                        "continuation_desc": cont_desc,
+                        "ignition_vol_ratio": ignition_vol_ratio,
+                        "ignition_body_pct": ignition_body_pct,
+                        "distance_to_target": distance_to_target,
+                        # store timestamp for timezone-aware printing later
+                        "ignition_time": ignition_bar.get("Datetime"),
+                    }
+                )
+
+            for idx, bar in future_bars.iterrows():
+                if direction == "long":
+                    # Check if stop hit (price went below stop)
+                    if bar["Low"] <= stop_price:
+                        exit_price = stop_price
+                        exit_time = bar["Datetime"]
+                        outcome = "loss"
+                        break
+                    # Check if target hit (price went above target)
+                    if bar["High"] >= target_price:
+                        exit_price = target_price
+                        exit_time = bar["Datetime"]
+                        outcome = "win"
+                        break
+                else:  # short
+                    # Check if stop hit (price went above stop)
+                    if bar["High"] >= stop_price:
+                        exit_price = stop_price
+                        exit_time = bar["Datetime"]
+                        outcome = "loss"
+                        break
+                    # Check if target hit (price went below target)
+                    if bar["Low"] <= target_price:
+                        exit_price = target_price
+                        exit_time = bar["Datetime"]
+                        outcome = "win"
+                        break
+
+            # If neither stop nor target was hit, skip this trade
+            if exit_price is None:
+                continue
+
+            # Calculate P&L
+            if direction == "long":
+                pnl = (exit_price - entry_price) * shares
+            else:  # short
+                pnl = (entry_price - exit_price) * shares
 
             trades.append(
                 {
@@ -572,18 +718,49 @@ class BacktestEngine:
                     "direction": direction,
                     "entry": entry_price,
                     "exit": exit_price,
+                    "exit_time": str(exit_time),
                     "stop": stop_price,
                     "target": target_price,
                     "shares": shares,
                     "pnl": pnl,
-                    "outcome": "win" if hit_target else "loss",
+                    "outcome": outcome,
+                    # Continuation diagnostics (post-entry informational only)
+                    **{k: v for k, v in continuation_diag.items() if v is not None},
                 }
             )
 
             # Generate and print Scarface Rules report for this signal
-            report = generate_signal_report(sig)
+            report = generate_signal_report(
+                sig,
+                retest_volume_a_max_ratio=0.30,
+                retest_volume_b_max_ratio=0.60,
+                a_upper_wick_max=BREAKOUT_A_UW_MAX,
+                b_body_max=BREAKOUT_B_BODY_MAX,
+                b_level_epsilon_pct=RETEST_B_EPSILON,
+                b_structure_soft=RETEST_B_SOFT,
+            )
             print("\n" + "=" * 70)
             print(report)
+            # Print continuation diagnostics at exit for information purposes
+            if continuation_diag["continuation_grade"] is not None:
+                # Format ignition time in reporting timezone
+                ign_ts = continuation_diag["ignition_time"]
+                try:
+                    ign_ts = pd.to_datetime(ign_ts)
+                    if getattr(ign_ts, "tzinfo", None) is None:
+                        ign_ts = ign_ts.tz_localize("UTC")
+                    ign_ts_local = ign_ts.tz_convert(self.display_tz)
+                    ign_ts_str = ign_ts_local.strftime("%Y-%m-%d %H:%M:%S ") + self.tz_label
+                except Exception:
+                    ign_ts_str = str(ign_ts)
+                info_line = (
+                    f"Continuation (post-entry): {continuation_diag['continuation_desc']} "
+                    f"{continuation_diag['continuation_grade']} | "
+                    f"progress={continuation_diag['distance_to_target']:.0%}, "
+                    f"ign_vol_ratio={continuation_diag['ignition_vol_ratio']:.2f} at "
+                    f"{ign_ts_str}"
+                )
+                print(info_line)
             print("=" * 70 + "\n")
 
         # Calculate statistics
@@ -643,6 +820,128 @@ def format_results(results: List[Dict]) -> str:
     return "\n".join(output)
 
 
+def generate_markdown_trade_summary(
+    results: List[Dict], tzinfo=None, tz_label: str = "UTC", one_per_day: bool = False
+) -> str:
+    """Generate a Markdown summary of trades across all symbols.
+
+    Rules:
+    - Order trades by entry datetime ascending
+    - If one_per_day is True: only one trade per calendar day (in display timezone). If multiple,
+      keep the earliest entry for that day.
+    - If one_per_day is False: include all trades (no daily grouping).
+    """
+    # Resolve reporting timezone
+    if tzinfo is None:
+        tzinfo = ZoneInfo("UTC")
+        tz_label = "UTC"
+
+    # Flatten all trades with symbol
+    all_trades = []
+    for res in results:
+        symbol = res.get("symbol")
+        for t in res.get("trades", []) or []:
+            # Parse entry datetime
+            try:
+                entry_dt = pd.to_datetime(t.get("datetime"))
+                if getattr(entry_dt, "tzinfo", None) is None:
+                    entry_dt = entry_dt.tz_localize("UTC")
+                entry_dt_local = entry_dt.tz_convert(tzinfo)
+            except Exception:
+                entry_dt_local = None
+
+            if entry_dt_local is None:
+                continue
+
+            all_trades.append({"symbol": symbol, **t, "_entry_dt": entry_dt_local})
+
+    if not all_trades:
+        return "\n_No trades to summarize._\n"
+
+    # Sort by entry datetime asc
+    all_trades.sort(key=lambda x: x["_entry_dt"])
+
+    # Optionally keep only one per day in specified timezone – earliest already due to sorting
+    trades_for_summary = all_trades
+    if one_per_day:
+        seen_days = set()
+        unique_daily_trades = []
+        for tr in all_trades:
+            day_key = tr["_entry_dt"].date()
+            if day_key in seen_days:
+                continue
+            seen_days.add(day_key)
+            unique_daily_trades.append(tr)
+        trades_for_summary = unique_daily_trades
+
+    # Build Markdown
+    lines = []
+    if one_per_day:
+        lines.append("\n## Trade summary (one per day, earliest entry)\n")
+    else:
+        lines.append("\n## Trade summary (all entries)\n")
+    lines.append(f"_Timezone: {tz_label}_\n")
+    lines.append(
+        f"| Date ({tz_label}) | Time | Symbol | Dir | Entry | Stop | Target | Exit | Outcome | "
+        "P&L | Shares |"
+    )
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|")
+
+    total = 0
+    winners = 0
+    total_pnl = 0.0
+
+    for tr in trades_for_summary:
+        total += 1
+        if tr.get("outcome") == "win":
+            winners += 1
+        pnl = float(tr.get("pnl", 0.0))
+        total_pnl += pnl
+
+        dt = tr["_entry_dt"].strftime("%Y-%m-%d")
+        tm = tr["_entry_dt"].strftime("%H:%M:%S")
+        sym = tr.get("symbol", "?")
+        dirn = tr.get("direction", "?")
+
+        def f(x):
+            try:
+                return f"{float(x):.2f}"
+            except Exception:
+                return str(x)
+
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    dt,
+                    tm,
+                    sym,
+                    dirn,
+                    f(tr.get("entry")),
+                    f(tr.get("stop")),
+                    f(tr.get("target")),
+                    f(tr.get("exit")),
+                    tr.get("outcome", ""),
+                    f(tr.get("pnl")),
+                    str(tr.get("shares", "")),
+                ]
+            )
+            + " |"
+        )
+
+    win_rate = (winners / total) if total > 0 else 0.0
+    lines.append("")
+    if one_per_day:
+        lines.append(f"- Total days/trades: {total}")
+    else:
+        lines.append(f"- Total trades: {total}")
+    lines.append(f"- Winners: {winners}")
+    lines.append(f"- Win rate: {win_rate:.1%}")
+    lines.append(f"- Total P&L: ${total_pnl:.2f}")
+
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Backtest Break & Re-Test strategy",
@@ -687,11 +986,26 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         help="Only include signals with this minimum grade or better",
     )
     parser.add_argument(
+        "--breakout-tier",
+        choices=["A", "B", "C"],
+        help="Only include signals with this specific breakout tier (filters after grade)",
+    )
+    parser.add_argument(
         "--last-days",
         type=int,
         help=(
             "Convenience: set start/end to cover the last N calendar days "
             "(overrides --start/--end)"
+        ),
+    )
+    parser.add_argument(
+        "--one-per-day",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, the Markdown trade summary groups to one trade per calendar day "
+            "(earliest entry). "
+            "Default: disabled (all trades listed)."
         ),
     )
 
@@ -724,10 +1038,17 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     if args.force_refresh:
         cache.clear_cache()
 
+    # Resolve display timezone from central config
+    display_tz, tz_label = get_display_timezone(Path(__file__).parent)
+
     engine = BacktestEngine(
         initial_capital=args.initial_capital,
         position_size_pct=args.position_size,
         min_grade=args.min_grade,
+        breakout_tier_filter=args.breakout_tier,
+        display_tzinfo=display_tz,
+        tz_label=tz_label,
+        retest_vol_threshold=RETEST_VOL_GATE,
     )
 
     results = []
@@ -786,6 +1107,12 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     # Display results
     print(format_results(results))
 
+    # Print Markdown trade summary (controlled by --one-per-day flag; default: all entries)
+    md_summary = generate_markdown_trade_summary(
+        results, tzinfo=display_tz, tz_label=tz_label, one_per_day=args.one_per_day
+    )
+    print(md_summary)
+
     # Save results if output file specified
     if args.output:
         # Create backtest_results directory if it doesn't exist
@@ -798,6 +1125,13 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         with open(output_path, "w") as f:
             json.dump(results, f, indent=2, default=str)
         print(f"Results saved to {output_path}")
+
+        # Also save Markdown summary next to JSON
+        md_path = output_path.with_suffix("")
+        md_path = md_path.with_name(md_path.name + "_summary.md")
+        with open(md_path, "w") as f:
+            f.write(md_summary + "\n")
+        print(f"Summary saved to {md_path}")
 
 
 if __name__ == "__main__":
