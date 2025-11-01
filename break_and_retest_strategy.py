@@ -34,23 +34,71 @@ DEFAULT_RETRIES = 3
 DEFAULT_RETRY_DELAY = 1.0  # seconds
 
 
+def _derive_tickers_from_cache(cache_dir: Path) -> list[str]:
+    """Derive ticker list from cache subdirectories.
+
+    Returns a sorted unique list of directory names (uppercased) that look like tickers.
+    """
+    tickers: set[str] = set()
+    try:
+        if cache_dir.exists():
+            for child in cache_dir.iterdir():
+                if child.is_dir():
+                    name = child.name.strip().upper()
+                    # Basic sanity filter: letters/numbers only, length 1-5
+                    if 1 <= len(name) <= 6 and name.replace("-", "").isalnum():
+                        tickers.add(name)
+    except Exception:
+        # Be resilient; fall back to defaults if anything goes wrong
+        pass
+    return sorted(tickers)
+
+
 # Load configuration
 def load_config():
-    """Load configuration from config.json"""
+    """Load configuration from config.json.
+
+    If no config.json or if the tickers list is missing/empty, derive tickers from the
+    cache/ directory and persist back to config.json.
+    """
     config_path = Path(__file__).parent / "config.json"
+    default_config = {
+        "tickers": ["AAPL", "AMZN", "META", "MSFT", "NVDA", "TSLA", "SPOT", "UBER"],
+        "timeframe_5m": "5m",
+        "lookback": "2d",
+        "session_start": "09:30",
+        "session_end": "16:00",
+        "market_open_minutes": 90,
+    }
+
+    config = default_config.copy()
+
     if config_path.exists():
-        with open(config_path, "r") as f:
-            return json.load(f)
-    else:
-        # Default config if file doesn't exist
-        return {
-            "tickers": ["AAPL", "AMZN", "META", "MSFT", "NVDA", "TSLA", "SPOT", "UBER"],
-            "timeframe_5m": "5m",
-            "lookback": "2d",
-            "session_start": "09:30",
-            "session_end": "16:00",
-            "market_open_minutes": 90,
-        }
+        try:
+            with open(config_path, "r") as f:
+                on_disk = json.load(f)
+            if isinstance(on_disk, dict):
+                # Shallow merge to preserve any new defaults when missing on disk
+                config.update(on_disk)
+        except Exception:
+            # If parsing fails, proceed with defaults and rebuild below if needed
+            pass
+
+    # If tickers missing/empty, derive from cache and write back to disk
+    if not config.get("tickers"):
+        cache_dir = Path(__file__).parent / "cache"
+        derived = _derive_tickers_from_cache(cache_dir)
+        if derived:
+            config["tickers"] = derived
+        # Persist the updated config (creating file if missing)
+        try:
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2)
+        except Exception:
+            # Non-fatal; continue with in-memory config
+            pass
+
+    return config
 
 
 CONFIG = load_config()
