@@ -17,8 +17,16 @@ from typing import Dict, List, Optional
 import pandas as pd
 import yfinance as yf
 
-from break_and_retest_strategy import is_strong_body
-from signal_grader import generate_signal_report
+from break_and_retest_detection import scan_for_setups
+from signal_grader import (
+    calculate_overall_grade,
+    generate_signal_report,
+    grade_breakout_candle,
+    grade_continuation,
+    grade_market_context,
+    grade_retest,
+    grade_risk_reward,
+)
 
 
 def load_config():
@@ -42,6 +50,15 @@ class DataCache:
     def __init__(self, cache_dir: str = "cache"):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
+
+    def clear_cache(self):
+        """Clear all cached data"""
+        import shutil
+
+        if self.cache_dir.exists():
+            shutil.rmtree(self.cache_dir)
+            self.cache_dir.mkdir(exist_ok=True)
+            print(f"Cache cleared: {self.cache_dir}")
 
     def _get_cache_path(self, symbol: str, date: str, interval: str) -> Path:
         """Generate cache file path for a symbol and date"""
@@ -68,7 +85,6 @@ class DataCache:
         start_date: str,
         end_date: str,
         interval: str = "5m",
-        force_refresh: bool = False,
     ) -> pd.DataFrame:
         """
         Download OHLCV data for a symbol and date range, using cache when available
@@ -78,7 +94,6 @@ class DataCache:
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
             interval: Data interval (1m, 5m, 15m, 1h, 1d)
-            force_refresh: If True, ignore cache and re-download
 
         Returns:
             DataFrame with OHLCV data
@@ -91,7 +106,7 @@ class DataCache:
 
         # For 1-minute data, yfinance only allows 7 days at a time
         if interval == "1m":
-            return self._download_1m_data(symbol, start, end, force_refresh)
+            return self._download_1m_data(symbol, start, end)
 
         # Download day by day for intraday data (yfinance limitation)
         current = start
@@ -99,12 +114,11 @@ class DataCache:
             date_str = current.strftime("%Y-%m-%d")
 
             # Check cache first
-            if not force_refresh:
-                cached_df = self.get_cached_data(symbol, date_str, interval)
-                if cached_df is not None and not cached_df.empty:
-                    all_data.append(cached_df)
-                    current += timedelta(days=1)
-                    continue
+            cached_df = self.get_cached_data(symbol, date_str, interval)
+            if cached_df is not None and not cached_df.empty:
+                all_data.append(cached_df)
+                current += timedelta(days=1)
+                continue
 
             # Download from yfinance
             try:
@@ -155,9 +169,7 @@ class DataCache:
         else:
             return pd.DataFrame()
 
-    def _download_1m_data(
-        self, symbol: str, start: datetime, end: datetime, force_refresh: bool = False
-    ) -> pd.DataFrame:
+    def _download_1m_data(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
         """
         Download 1-minute data. yfinance only allows 7 days at a time for 1m data.
 
@@ -165,7 +177,6 @@ class DataCache:
             symbol: Stock ticker symbol
             start: Start datetime
             end: End datetime
-            force_refresh: If True, ignore cache and re-download
 
         Returns:
             DataFrame with 1-minute OHLCV data
@@ -181,12 +192,11 @@ class DataCache:
             chunk_start_date = current.strftime("%Y-%m-%d")
 
             # Try cache first
-            if not force_refresh:
-                cached_df = self.get_cached_data(symbol, chunk_start_date, "1m")
-                if cached_df is not None and not cached_df.empty:
-                    all_data.append(cached_df)
-                    current = chunk_end
-                    continue
+            cached_df = self.get_cached_data(symbol, chunk_start_date, "1m")
+            if cached_df is not None and not cached_df.empty:
+                all_data.append(cached_df)
+                current = chunk_end
+                continue
 
             # Download from yfinance
             try:
@@ -250,6 +260,7 @@ class BacktestEngine:
         position_size_pct: float = 0.1,
         max_positions: int = 3,
         scan_window_minutes: int = 180,
+        min_grade: Optional[str] = None,
     ):
         """
         Initialize backtest engine
@@ -268,6 +279,8 @@ class BacktestEngine:
         self.positions = []
         self.closed_trades = []
         self.equity_curve = []
+        # Optional minimum grade filter (A+, A, B, C)
+        self.min_grade = min_grade
 
     def _scan_continuous_data(
         self, symbol: str, df_5m: pd.DataFrame, df_1m: pd.DataFrame
@@ -299,6 +312,7 @@ class BacktestEngine:
         # Prepare 1-minute data
         df_1m = df_1m.copy()
         df_1m["Date"] = df_1m["Datetime"].dt.date
+        available_1m_dates = set(df_1m["Date"].unique())
 
         trading_days = df_5m["Date"].unique()
 
@@ -313,15 +327,21 @@ class BacktestEngine:
             if len(session_df_5m) < 10:
                 continue
 
-            # Get 1-minute data for this day
-            day_df_1m = df_1m[df_1m["Date"] == day].copy()
-            session_df_1m = day_df_1m[
-                (day_df_1m["Datetime"].dt.strftime("%H:%M") >= "09:30")
-                & (day_df_1m["Datetime"].dt.strftime("%H:%M") < "16:00")
-            ]
+            # Check if we have 1-minute data for this day
+            has_1m_data = day in available_1m_dates
 
-            if len(session_df_1m) < 50:
-                continue
+            # Get 1-minute data for this day (if available)
+            if has_1m_data:
+                day_df_1m = df_1m[df_1m["Date"] == day].copy()
+                session_df_1m = day_df_1m[
+                    (day_df_1m["Datetime"].dt.strftime("%H:%M") >= "09:30")
+                    & (day_df_1m["Datetime"].dt.strftime("%H:%M") < "16:00")
+                ]
+
+                if len(session_df_1m) < 50:
+                    has_1m_data = False  # Not enough 1m data, fall back to 5m only
+            else:
+                session_df_1m = pd.DataFrame()
 
             # Use first 5-minute candle as opening range
             or_high = session_df_5m.iloc[0]["High"]
@@ -337,152 +357,94 @@ class BacktestEngine:
             if len(scan_df_5m) < 10:
                 continue
 
-            # Look for breakouts on 5-minute timeframe
-            for i in range(1, len(scan_df_5m)):
-                row_5m = scan_df_5m.iloc[i]
-                prev_5m = scan_df_5m.iloc[i - 1]
+            # Use shared detection module to find setups
+            # Use multi-timeframe only if we have 1m data for this day
+            setups = scan_for_setups(
+                df_5m=scan_df_5m,
+                df_1m=session_df_1m if has_1m_data else None,
+                or_high=or_high,
+                or_low=or_low,
+                vol_threshold=1.0,  # Backtest uses relaxed 1.0x threshold
+                use_multitimeframe=has_1m_data,
+            )
 
-                breakout_up = (
-                    prev_5m["High"] <= or_high
-                    and row_5m["High"] > or_high
-                    and is_strong_body(row_5m)
-                    and row_5m["Volume"] > row_5m["vol_ma"] * 1.0
-                    and row_5m["Close"] > or_high
+            for setup in setups:
+                breakout_candle = setup["breakout"]["candle"]
+                retest_candle = setup["retest"]
+                ignition_candle = setup["ignition"]
+                direction = setup["direction"]
+                level = setup["level"]
+                breakout_time = setup["breakout"]["time"]
+
+                breakout_up = direction == "long"
+
+                # Calculate entry, stop, target
+                entry = ignition_candle["High"] if breakout_up else ignition_candle["Low"]
+                stop = retest_candle["Low"] - 0.05 if breakout_up else retest_candle["High"] + 0.05
+                risk = abs(entry - stop)
+                target = entry + 2 * risk if breakout_up else entry - 2 * risk
+
+                # Calculate grading metadata
+                breakout_body_pct = abs(breakout_candle["Close"] - breakout_candle["Open"]) / (
+                    breakout_candle["High"] - breakout_candle["Low"]
                 )
-                breakout_down = (
-                    prev_5m["Low"] >= or_low
-                    and row_5m["Low"] < or_low
-                    and is_strong_body(row_5m)
-                    and row_5m["Volume"] > row_5m["vol_ma"] * 1.0
-                    and row_5m["Close"] < or_low
+                breakout_vol_ratio = breakout_candle["Volume"] / breakout_candle["vol_ma"]
+                retest_vol_ratio = retest_candle["Volume"] / breakout_candle["Volume"]
+                ignition_body_pct = abs(ignition_candle["Close"] - ignition_candle["Open"]) / (
+                    ignition_candle["High"] - ignition_candle["Low"]
                 )
+                ignition_vol_ratio = ignition_candle["Volume"] / breakout_candle["Volume"]
 
-                if breakout_up or breakout_down:
-                    # Breakout detected on 5-minute! Now switch to 1-minute for retest/ignition
-                    breakout_time = row_5m["Datetime"]
-                    breakout_level = or_high if breakout_up else or_low
+                # Calculate distance to target achieved by ignition
+                if breakout_up:
+                    distance_to_target = (ignition_candle["High"] - entry) / (target - entry)
+                else:
+                    distance_to_target = (entry - ignition_candle["Low"]) / (entry - target)
 
-                    # Get 1-minute candles starting from the breakout candle time
-                    # Look ahead up to 30 minutes for retest + ignition pattern
-                    retest_window_end = breakout_time + timedelta(minutes=30)
-                    df_1m_window = session_df_1m[
-                        (session_df_1m["Datetime"] > breakout_time)
-                        & (session_df_1m["Datetime"] <= retest_window_end)
-                    ].copy()
-
-                    if len(df_1m_window) < 3:
-                        continue
-
-                    # Look for retest + ignition pattern on 1-minute timeframe
-                    for j in range(len(df_1m_window) - 1):
-                        retest_1m = df_1m_window.iloc[j]
-
-                        # Check if this candle retests the level
-                        returns_to_level = (
-                            breakout_up and abs(retest_1m["Low"] - breakout_level) < 0.5
-                        ) or (breakout_down and abs(retest_1m["High"] - breakout_level) < 0.5)
-
-                        # Check if it's a tight candle (smaller range than 5m breakout)
-                        tight_candle = retest_1m["High"] - retest_1m["Low"] < 0.75 * (
-                            row_5m["High"] - row_5m["Low"]
-                        )
-
-                        # Volume should be lower than breakout (compare 1m to 5m average)
-                        lower_vol = (
-                            retest_1m["Volume"] < (row_5m["Volume"] / 5) * 1.5
-                        )  # 5m vol / 5 bars, with 1.5x tolerance
-
-                        if returns_to_level and tight_candle and lower_vol:
-                            # Found retest! Now look for ignition on next 1-minute candle
-                            if j + 1 >= len(df_1m_window):
-                                break
-
-                            ign_1m = df_1m_window.iloc[j + 1]
-
-                            # Ignition: strong body, breaks above/below retest, volume increases
-                            ignition = (
-                                is_strong_body(ign_1m)
-                                and (
-                                    (breakout_up and ign_1m["High"] > retest_1m["High"])
-                                    or (breakout_down and ign_1m["Low"] < retest_1m["Low"])
-                                )
-                                and ign_1m["Volume"] > retest_1m["Volume"]
-                            )
-
-                            if ignition:
-                                entry = ign_1m["High"] if breakout_up else ign_1m["Low"]
-                                stop = (
-                                    retest_1m["Low"] - 0.05
-                                    if breakout_up
-                                    else retest_1m["High"] + 0.05
-                                )
-                                risk = abs(entry - stop)
-                                target = entry + 2 * risk if breakout_up else entry - 2 * risk
-
-                                # Calculate grading metadata
-                                breakout_body_pct = abs(row_5m["Close"] - row_5m["Open"]) / (
-                                    row_5m["High"] - row_5m["Low"]
-                                )
-                                breakout_vol_ratio = row_5m["Volume"] / row_5m["vol_ma"]
-                                retest_vol_ratio = retest_1m["Volume"] / row_5m["Volume"]
-                                ignition_body_pct = abs(ign_1m["Close"] - ign_1m["Open"]) / (
-                                    ign_1m["High"] - ign_1m["Low"]
-                                )
-                                ignition_vol_ratio = ign_1m["Volume"] / row_5m["Volume"]
-
-                                # Calculate distance to target achieved by ignition
-                                if breakout_up:
-                                    distance_to_target = (ign_1m["High"] - entry) / (target - entry)
-                                else:
-                                    distance_to_target = (entry - ign_1m["Low"]) / (entry - target)
-
-                                all_signals.append(
-                                    {
-                                        "ticker": symbol,
-                                        "direction": "long" if breakout_up else "short",
-                                        "entry": entry,
-                                        "stop": stop,
-                                        "target": target,
-                                        "risk": risk,
-                                        "level": breakout_level,
-                                        "datetime": ign_1m["Datetime"],
-                                        "breakout_time_5m": breakout_time,
-                                        "vol_breakout_5m": row_5m["Volume"],
-                                        "vol_retest_1m": retest_1m["Volume"],
-                                        "vol_ignition_1m": ign_1m["Volume"],
-                                        # Grading metadata
-                                        "breakout_candle": {
-                                            "Open": row_5m["Open"],
-                                            "High": row_5m["High"],
-                                            "Low": row_5m["Low"],
-                                            "Close": row_5m["Close"],
-                                            "Volume": row_5m["Volume"],
-                                        },
-                                        "retest_candle": {
-                                            "Open": retest_1m["Open"],
-                                            "High": retest_1m["High"],
-                                            "Low": retest_1m["Low"],
-                                            "Close": retest_1m["Close"],
-                                            "Volume": retest_1m["Volume"],
-                                        },
-                                        "ignition_candle": {
-                                            "Open": ign_1m["Open"],
-                                            "High": ign_1m["High"],
-                                            "Low": ign_1m["Low"],
-                                            "Close": ign_1m["Close"],
-                                            "Volume": ign_1m["Volume"],
-                                        },
-                                        "breakout_body_pct": breakout_body_pct,
-                                        "breakout_vol_ratio": breakout_vol_ratio,
-                                        "retest_vol_ratio": retest_vol_ratio,
-                                        "ignition_body_pct": ignition_body_pct,
-                                        "ignition_vol_ratio": ignition_vol_ratio,
-                                        "distance_to_target": distance_to_target,
-                                    }
-                                )
-
-                                # Only take first signal per breakout
-                                break
+                all_signals.append(
+                    {
+                        "ticker": symbol,
+                        "direction": direction,
+                        "entry": entry,
+                        "stop": stop,
+                        "target": target,
+                        "risk": risk,
+                        "level": level,
+                        "datetime": ignition_candle["Datetime"],
+                        "breakout_time_5m": breakout_time,
+                        "vol_breakout_5m": breakout_candle["Volume"],
+                        "vol_retest_1m": retest_candle["Volume"],
+                        "vol_ignition_1m": ignition_candle["Volume"],
+                        # Grading metadata
+                        "breakout_candle": {
+                            "Open": breakout_candle["Open"],
+                            "High": breakout_candle["High"],
+                            "Low": breakout_candle["Low"],
+                            "Close": breakout_candle["Close"],
+                            "Volume": breakout_candle["Volume"],
+                        },
+                        "retest_candle": {
+                            "Open": retest_candle["Open"],
+                            "High": retest_candle["High"],
+                            "Low": retest_candle["Low"],
+                            "Close": retest_candle["Close"],
+                            "Volume": retest_candle["Volume"],
+                        },
+                        "ignition_candle": {
+                            "Open": ignition_candle["Open"],
+                            "High": ignition_candle["High"],
+                            "Low": ignition_candle["Low"],
+                            "Close": ignition_candle["Close"],
+                            "Volume": ignition_candle["Volume"],
+                        },
+                        "breakout_body_pct": breakout_body_pct,
+                        "breakout_vol_ratio": breakout_vol_ratio,
+                        "retest_vol_ratio": retest_vol_ratio,
+                        "ignition_body_pct": ignition_body_pct,
+                        "ignition_vol_ratio": ignition_vol_ratio,
+                        "distance_to_target": distance_to_target,
+                    }
+                )
 
         return all_signals
 
@@ -512,9 +474,60 @@ class BacktestEngine:
                 "signals": [],
             }
 
+        # Compute grades for each signal and optionally filter by min_grade
+        def compute_grades(sig: Dict) -> Dict:
+            entry = sig["entry"]
+            stop = sig["stop"]
+            target = sig["target"]
+            rr_ratio = abs(target - entry) / abs(entry - stop) if entry != stop else 0.0
+
+            breakout_grade, breakout_desc = grade_breakout_candle(
+                sig.get("breakout_candle", {}),
+                sig.get("breakout_vol_ratio", 0.0),
+                sig.get("breakout_body_pct", 0.0),
+            )
+            retest_grade, retest_desc = grade_retest(
+                sig.get("retest_candle", {}),
+                sig.get("retest_vol_ratio", 0.0),
+                sig.get("level", 0.0),
+                sig.get("direction", "long"),
+            )
+            continuation_grade, continuation_desc = grade_continuation(
+                sig.get("ignition_candle", {}),
+                sig.get("ignition_vol_ratio", 0.0),
+                sig.get("distance_to_target", 0.0),
+                sig.get("ignition_body_pct", 0.0),
+            )
+            rr_grade, rr_desc = grade_risk_reward(rr_ratio)
+            market_grade, market_desc = grade_market_context("slightly_red")
+
+            grades = {
+                "breakout": breakout_grade,
+                "retest": retest_grade,
+                "continuation": continuation_grade,
+                "rr": rr_grade,
+                "market": market_grade,
+            }
+            overall = calculate_overall_grade(grades)
+            # Attach fields to signal
+            sig["overall_grade"] = overall
+            sig["component_grades"] = grades
+            sig["rr_ratio"] = rr_ratio
+            return sig
+
+        graded_signals = [compute_grades(dict(sig)) for sig in signals]
+
+        # Apply min_grade filter if provided
+        if self.min_grade:
+            order = {"C": 0, "B": 1, "A": 2, "A+": 3}
+            threshold = order.get(self.min_grade, 0)
+            graded_signals = [
+                s for s in graded_signals if order.get(s.get("overall_grade", "C"), 0) >= threshold
+            ]
+
         trades = []
 
-        for sig in signals:
+        for sig in graded_signals:
             # Simulate trade execution
             entry_price = sig["entry"]
             stop_price = sig["stop"]
@@ -587,7 +600,7 @@ class BacktestEngine:
             "losing_trades": losing_trades,
             "total_pnl": total_pnl,
             "win_rate": win_rate,
-            "signals": signals,
+            "signals": graded_signals,
             "trades": trades,
         }
 
@@ -654,10 +667,10 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         nargs="+",
         help=f"Stock symbols to backtest (default: all from config.json)",
     )
-    parser.add_argument("--start", required=True, help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end", required=True, help="End date (YYYY-MM-DD)")
+    parser.add_argument("--start", required=False, default=None, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", required=False, default=None, help="End date (YYYY-MM-DD)")
     parser.add_argument(
-        "--initial-capital", type=float, default=10000, help="Initial capital (default: 10000)"
+        "--initial-capital", type=float, default=7500, help="Initial capital (default: 7500)"
     )
     parser.add_argument(
         "--position-size",
@@ -668,21 +681,53 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     parser.add_argument("--cache-dir", default="cache", help="Cache directory (default: cache)")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh cached data")
     parser.add_argument("--output", help="Output JSON file for results")
+    parser.add_argument(
+        "--min-grade",
+        choices=["A+", "A", "B", "C"],
+        help="Only include signals with this minimum grade or better",
+    )
+    parser.add_argument(
+        "--last-days",
+        type=int,
+        help=(
+            "Convenience: set start/end to cover the last N calendar days "
+            "(overrides --start/--end)"
+        ),
+    )
 
     args = parser.parse_args()
 
     # Use default tickers from config if not specified
     symbols = args.symbols if args.symbols else DEFAULT_TICKERS
 
+    # Determine date range
+    start_date = args.start
+    end_date = args.end
+    if args.last_days and args.last_days > 0:
+        end_date = datetime.utcnow().strftime("%Y-%m-%d")
+        start_dt = datetime.utcnow() - timedelta(days=args.last_days)
+        start_date = start_dt.strftime("%Y-%m-%d")
+
+    # Validate date range
+    if not start_date or not end_date:
+        parser.error("Either provide --start and --end, or use --last-days N")
+
     print(f"Backtesting symbols: {', '.join(symbols)}")
-    print(f"Date range: {args.start} to {args.end}")
+    print(f"Date range: {start_date} to {end_date}")
     print(f"Initial capital: ${args.initial_capital:,.2f}")
     print()
 
     # Initialize components
     cache = DataCache(args.cache_dir)
+
+    # Clear cache if force refresh is requested
+    if args.force_refresh:
+        cache.clear_cache()
+
     engine = BacktestEngine(
-        initial_capital=args.initial_capital, position_size_pct=args.position_size
+        initial_capital=args.initial_capital,
+        position_size_pct=args.position_size,
+        min_grade=args.min_grade,
     )
 
     results = []
@@ -697,10 +742,9 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         print("Downloading 5-minute data...")
         df_5m = cache.download_data(
             symbol=symbol,
-            start_date=args.start,
-            end_date=args.end,
+            start_date=start_date,
+            end_date=end_date,
             interval="5m",
-            force_refresh=args.force_refresh,
         )
 
         if df_5m.empty:
@@ -709,14 +753,24 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
 
         print(f"Loaded {len(df_5m)} 5-minute bars for {symbol}")
 
-        # Download/load 1-minute data
+        # Download/load 1-minute data (limited to last 30 days due to Yahoo Finance constraint)
         print("Downloading 1-minute data...")
+        # Calculate the actual 1m data window (last 30 days max)
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        start_1m_dt = max(
+            datetime.strptime(start_date, "%Y-%m-%d"),
+            end_dt - timedelta(days=29),  # 30 days including end date
+        )
+        start_1m_date = start_1m_dt.strftime("%Y-%m-%d")
+
+        if start_1m_date != start_date:
+            print(f"Note: 1m data limited to last 30 days ({start_1m_date} to {end_date})")
+
         df_1m = cache.download_data(
             symbol=symbol,
-            start_date=args.start,
-            end_date=args.end,
+            start_date=start_1m_date,
+            end_date=end_date,
             interval="1m",
-            force_refresh=args.force_refresh,
         )
 
         if df_1m.empty:
@@ -734,9 +788,16 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
 
     # Save results if output file specified
     if args.output:
-        with open(args.output, "w") as f:
+        # Create backtest_results directory if it doesn't exist
+        results_dir = Path("backtest_results")
+        results_dir.mkdir(exist_ok=True)
+
+        # Construct output path in backtest_results directory
+        output_path = results_dir / args.output
+
+        with open(output_path, "w") as f:
             json.dump(results, f, indent=2, default=str)
-        print(f"Results saved to {args.output}")
+        print(f"Results saved to {output_path}")
 
 
 if __name__ == "__main__":

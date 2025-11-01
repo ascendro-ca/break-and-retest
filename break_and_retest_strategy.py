@@ -19,6 +19,16 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
+from break_and_retest_detection import scan_for_setups
+from signal_grader import (
+    calculate_overall_grade,
+    generate_signal_report,
+    grade_breakout_candle,
+    grade_market_context,
+    grade_retest,
+    grade_risk_reward,
+)
+
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_DELAY = 1.0  # seconds
 
@@ -108,12 +118,6 @@ def find_first_candle_range(df):
     return first_candle["High"], first_candle["Low"]
 
 
-def is_strong_body(row):
-    body = abs(row["Close"] - row["Open"])
-    range_ = row["High"] - row["Low"]
-    return body >= 0.6 * range_  # strong body: >=60% of range
-
-
 def scan_ticker(
     ticker,
     timeframe=TIMEFRAME,
@@ -122,219 +126,390 @@ def scan_ticker(
     retry_delay=DEFAULT_RETRY_DELAY,
     market_open_minutes=MARKET_OPEN_MINUTES,
 ):
-    df = get_intraday_data(
-        ticker, retries=retries, retry_delay=retry_delay, timeframe=timeframe, lookback=lookback
+    """
+    Scan ticker for break and retest setups using multi-timeframe analysis.
+
+    Uses 5-minute timeframe for breakout detection and 1-minute timeframe
+    for retest/ignition detection (matching backtest behavior).
+
+    Args:
+        ticker: Stock ticker symbol
+        timeframe: Not used (kept for backward compatibility)
+        lookback: Lookback period for data fetching
+        retries: Number of retry attempts for data fetching
+        retry_delay: Delay between retries
+        market_open_minutes: Minutes after market open to scan
+
+    Returns:
+        (signals, scan_df_5m) tuple
+    """
+    # Fetch 5-minute data for breakout detection
+    df_5m = get_intraday_data(
+        ticker, retries=retries, retry_delay=retry_delay, timeframe="5m", lookback=lookback
     )
-    if df is None or df.empty:
-        print(f"{ticker}: No data returned (empty). Skipping.")
+    if df_5m is None or df_5m.empty:
+        print(f"{ticker}: No 5m data returned (empty). Skipping.")
         return [], pd.DataFrame()
-    if len(df) < 20:
-        print(f"{ticker}: Not enough data for scan.")
-        return [], df
+    if len(df_5m) < 20:
+        print(f"{ticker}: Not enough 5m data for scan.")
+        return [], df_5m
+
+    # Fetch 1-minute data for retest/ignition detection
+    df_1m = get_intraday_data(
+        ticker, retries=retries, retry_delay=retry_delay, timeframe="1m", lookback=lookback
+    )
+    if df_1m is None or df_1m.empty:
+        print(f"{ticker}: No 1m data returned. Falling back to 5m-only mode.")
+        df_1m = None
+
     # Use first 5-min candle after market open as range
-    or_high, or_low = find_first_candle_range(df)
+    or_high, or_low = find_first_candle_range(df_5m)
     if or_high is None or or_low is None:
         print(f"{ticker}: No opening range found.")
-        return [], df
-    # Restrict detection to first 90 min after open
-    session = df[df["Datetime"].dt.strftime("%H:%M") >= SESSION_START]
-    if len(session) == 0:
+        return [], df_5m
+
+    # Restrict detection to first N minutes after open
+    session_5m = df_5m[df_5m["Datetime"].dt.strftime("%H:%M") >= SESSION_START]
+    if len(session_5m) == 0:
         print(f"{ticker}: No session data.")
-        return [], df
-    start_time = session["Datetime"].iloc[0]
-    end_time = start_time + timedelta(minutes=MARKET_OPEN_MINUTES)
-    scan_df = session[(session["Datetime"] >= start_time) & (session["Datetime"] < end_time)].copy()
-    if len(scan_df) < 10:
+        return [], df_5m
+
+    start_time = session_5m["Datetime"].iloc[0]
+    end_time = start_time + timedelta(minutes=market_open_minutes)
+    scan_df_5m = session_5m[
+        (session_5m["Datetime"] >= start_time) & (session_5m["Datetime"] < end_time)
+    ].copy()
+
+    if len(scan_df_5m) < 10:
         print(f"{ticker}: Not enough data in first {market_open_minutes} min.")
-        return [], scan_df
-    # Compute rolling volume mean for above-average checks
-    scan_df["vol_ma"] = scan_df["Volume"].rolling(window=10, min_periods=1).mean()
+        return [], scan_df_5m
+
+    # Compute rolling volume mean for breakout detection
+    scan_df_5m["vol_ma"] = scan_df_5m["Volume"].rolling(window=10, min_periods=1).mean()
+
+    # Also filter 1m data to same session window if available
+    session_df_1m = None
+    if df_1m is not None:
+        session_df_1m = df_1m[
+            (df_1m["Datetime"] >= start_time) & (df_1m["Datetime"] < end_time)
+        ].copy()
+
+    # Use shared detection module to find setups
+    setups = scan_for_setups(
+        df_5m=scan_df_5m,
+        df_1m=session_df_1m,
+        or_high=or_high,
+        or_low=or_low,
+        vol_threshold=1.0,  # Match backtest volume threshold
+        use_multitimeframe=True,
+    )
+
     signals = []
-    lvl_high = or_high
-    lvl_low = or_low
-    # --- 1. Breakout Detection ---
-    for i in range(1, len(scan_df) - 2):
-        row = scan_df.iloc[i]
-        prev = scan_df.iloc[i - 1]
-        # Breakout up: breaks opening range high
-        breakout_up = (
-            prev["High"] <= lvl_high
-            and row["High"] > lvl_high
-            and is_strong_body(row)
-            and row["Volume"] > row["vol_ma"] * 1.2
-            and row["Close"] > lvl_high
+    for setup in setups:
+        breakout_candle = setup["breakout"]["candle"]
+        retest_candle = setup["retest"]
+        ignition_candle = setup["ignition"]
+        direction = setup["direction"]
+        level = setup["level"]
+
+        breakout_up = direction == "long"
+
+        # Calculate entry, stop, target
+        entry = ignition_candle["High"] if breakout_up else ignition_candle["Low"]
+        stop = retest_candle["Low"] - 0.05 if breakout_up else retest_candle["High"] + 0.05
+        risk = abs(entry - stop)
+        target = entry + 2 * risk if breakout_up else entry - 2 * risk
+
+        # Calculate grading metrics
+        breakout_body = abs(breakout_candle["Close"] - breakout_candle["Open"])
+        breakout_range = breakout_candle["High"] - breakout_candle["Low"]
+        breakout_body_pct = breakout_body / breakout_range if breakout_range > 0 else 0
+        breakout_vol_ratio = (
+            breakout_candle["Volume"] / breakout_candle["vol_ma"]
+            if breakout_candle["vol_ma"] > 0
+            else 1.0
         )
-        # Breakout down: breaks opening range low
-        breakout_down = (
-            prev["Low"] >= lvl_low
-            and row["Low"] < lvl_low
-            and is_strong_body(row)
-            and row["Volume"] > row["vol_ma"] * 1.2
-            and row["Close"] < lvl_low
+
+        # For multi-timeframe, compare 1m retest volume to 5m breakout volume
+        retest_vol_ratio = (
+            retest_candle["Volume"] / breakout_candle["Volume"]
+            if breakout_candle["Volume"] > 0
+            else 1.0
         )
-        if breakout_up or breakout_down:
-            # --- 2. Re-Test Detection ---
-            re_test_idx = i + 1
-            if re_test_idx >= len(scan_df):
-                continue
-            re_test = scan_df.iloc[re_test_idx]
-            # Price returns to level
-            returns_to_level = (breakout_up and abs(re_test["Low"] - lvl_high) < 0.1) or (
-                breakout_down and abs(re_test["High"] - lvl_low) < 0.1
-            )
-            # Tight candle, lower volume
-            tight_candle = re_test["High"] - re_test["Low"] < 0.5 * (row["High"] - row["Low"])
-            lower_vol = re_test["Volume"] < row["Volume"]
-            if returns_to_level and tight_candle and lower_vol:
-                # --- 3. Ignition Candle ---
-                ign_idx = i + 2
-                if ign_idx >= len(scan_df):
-                    continue
-                ign = scan_df.iloc[ign_idx]
-                # Strong body, breaks re-test high/low, volume increases
-                ignition = (
-                    is_strong_body(ign)
-                    and (
-                        (breakout_up and ign["High"] > re_test["High"])
-                        or (breakout_down and ign["Low"] < re_test["Low"])
-                    )
-                    and ign["Volume"] > re_test["Volume"]
-                )
-                if ignition:
-                    # --- 4. Entry, Stop, Target ---
-                    entry = ign["High"] if breakout_up else ign["Low"]
-                    stop = re_test["Low"] - 0.05 if breakout_up else re_test["High"] + 0.05
-                    risk = abs(entry - stop)
-                    target = entry + 2 * risk if breakout_up else entry - 2 * risk
-                    signals.append(
-                        {
-                            "ticker": ticker,
-                            "datetime": ign["Datetime"],
-                            "direction": "long" if breakout_up else "short",
-                            "level": lvl_high if breakout_up else lvl_low,
-                            "entry": entry,
-                            "stop": stop,
-                            "target": target,
-                            "risk": risk,
-                            "vol_breakout": row["Volume"],
-                            "vol_retest": re_test["Volume"],
-                            "vol_ignition": ign["Volume"],
-                        }
-                    )
-    # --- Print Results ---
+
+        ignition_body = abs(ignition_candle["Close"] - ignition_candle["Open"])
+        ignition_range = ignition_candle["High"] - ignition_candle["Low"]
+        ignition_body_pct = ignition_body / ignition_range if ignition_range > 0 else 0
+        ignition_vol_ratio = (
+            ignition_candle["Volume"] / retest_candle["Volume"]
+            if retest_candle["Volume"] > 0
+            else 1.0
+        )
+
+        rr_ratio = abs(target - entry) / risk if risk > 0 else 0
+        distance_to_target = 0.0  # Placeholder for live scanner
+
+        # Grade each component
+        breakout_grade, breakout_desc = grade_breakout_candle(
+            breakout_body_pct, breakout_vol_ratio, level
+        )
+        retest_candle_dict = {
+            "Open": retest_candle["Open"],
+            "High": retest_candle["High"],
+            "Low": retest_candle["Low"],
+            "Close": retest_candle["Close"],
+        }
+        retest_grade, retest_desc = grade_retest(
+            retest_candle_dict, retest_vol_ratio, level, direction
+        )
+        rr_grade, rr_desc = grade_risk_reward(rr_ratio)
+        market_grade, market_desc = grade_market_context("slightly_red")
+
+        # Calculate overall grade (4 components: breakout, retest, RR, market)
+        # Note: continuation excluded as it requires post-entry data
+        grades = {
+            "breakout": breakout_grade,
+            "retest": retest_grade,
+            "risk_reward": rr_grade,
+            "market": market_grade,
+        }
+        overall_grade = calculate_overall_grade(grades)
+
+        signal = {
+            "ticker": ticker,
+            "datetime": ignition_candle["Datetime"],
+            "direction": direction,
+            "level": level,
+            "entry": entry,
+            "stop": stop,
+            "target": target,
+            "risk": risk,
+            "vol_breakout": breakout_candle["Volume"],
+            "vol_retest": retest_candle["Volume"],
+            "vol_ignition": ignition_candle["Volume"],
+            # Grading metrics
+            "breakout_body_pct": breakout_body_pct,
+            "breakout_vol_ratio": breakout_vol_ratio,
+            "retest_vol_ratio": retest_vol_ratio,
+            "ignition_vol_ratio": ignition_vol_ratio,
+            "ignition_body_pct": ignition_body_pct,
+            "distance_to_target": distance_to_target,
+            # Candle data for report generation
+            "breakout_candle": {
+                "Open": breakout_candle["Open"],
+                "High": breakout_candle["High"],
+                "Low": breakout_candle["Low"],
+                "Close": breakout_candle["Close"],
+            },
+            "retest_candle": {
+                "Open": retest_candle["Open"],
+                "High": retest_candle["High"],
+                "Low": retest_candle["Low"],
+                "Close": retest_candle["Close"],
+            },
+            "ignition_candle": {
+                "Open": ignition_candle["Open"],
+                "High": ignition_candle["High"],
+                "Low": ignition_candle["Low"],
+                "Close": ignition_candle["Close"],
+            },
+            # Grades
+            "grades": grades,
+            "overall_grade": overall_grade,
+        }
+        signals.append(signal)
+
+    # Print Results
     if signals:
         for sig in signals:
-            direction = sig["direction"].upper()
-            level = sig["level"]
-            entry = sig["entry"]
-            stop = sig["stop"]
-            target = sig["target"]
-            vol_break = sig["vol_breakout"]
-            vol_retest = sig["vol_retest"]
-            vol_ign = sig["vol_ignition"]
-            print(
-                f"{sig['ticker']} {sig['datetime']} {direction} | "
-                f"Level: {level:.2f} Entry: {entry:.2f} Stop: {stop:.2f} "
-                f"Target: {target:.2f} Vol(Break): {vol_break} "
-                f"Vol(Retest): {vol_retest} Vol(Ign): {vol_ign}"
-            )
+            # Generate and print Scarface Rules report for this signal
+            report = generate_signal_report(sig)
+            print(report)
+            print()  # Blank line between signals
     else:
         print(f"{ticker}: No setups found.")
 
-    # Return signals and the scan dataframe for downstream use (visualization, backtesting)
-    return signals, scan_df
+    # Return signals and the scan dataframe for downstream use
+    return signals, scan_df_5m
 
 
-def scan_dataframe(df, market_open_minutes=MARKET_OPEN_MINUTES):
-    """Scan a pre-loaded intraday DataFrame (same detection logic as scan_ticker).
-
-    Expects a DataFrame with columns: Datetime, Open, High, Low, Close, Volume.
-    Returns (signals, scan_df) where scan_df is the restricted first-N-minutes session slice.
+def scan_dataframe(df_5m, df_1m=None, market_open_minutes=MARKET_OPEN_MINUTES):
     """
-    if df is None or df.empty:
+    Scan pre-loaded intraday DataFrames for break and retest setups.
+
+    Args:
+        df_5m: DataFrame with 5-minute candles (Datetime, OHLCV)
+        df_1m: Optional DataFrame with 1-minute candles for multi-timeframe analysis
+        market_open_minutes: Minutes after market open to scan
+
+    Returns:
+        (signals, scan_df_5m) tuple where scan_df_5m is the restricted session slice
+    """
+    if df_5m is None or df_5m.empty:
         return [], pd.DataFrame()
+
     # Ensure Datetime is datetime
-    df = df.copy()
-    df["Datetime"] = pd.to_datetime(df["Datetime"])
+    df_5m = df_5m.copy()
+    df_5m["Datetime"] = pd.to_datetime(df_5m["Datetime"])
+
     # Use first 5-min candle after market open as range
-    session = df[df["Datetime"].dt.strftime("%H:%M") >= SESSION_START]
+    session = df_5m[df_5m["Datetime"].dt.strftime("%H:%M") >= SESSION_START]
     if len(session) == 0:
         return [], pd.DataFrame()
-    or_high, or_low = None, None
+
     first = session.iloc[0]
     or_high, or_low = first.get("High"), first.get("Low")
     if or_high is None or or_low is None:
         return [], pd.DataFrame()
+
     start_time = session["Datetime"].iloc[0]
     end_time = start_time + timedelta(minutes=market_open_minutes)
-    scan_df = session[(session["Datetime"] >= start_time) & (session["Datetime"] < end_time)].copy()
-    if len(scan_df) < 1:
-        return [], scan_df
-    scan_df["vol_ma"] = scan_df["Volume"].rolling(window=10, min_periods=1).mean()
+    scan_df_5m = session[
+        (session["Datetime"] >= start_time) & (session["Datetime"] < end_time)
+    ].copy()
+
+    if len(scan_df_5m) < 1:
+        return [], scan_df_5m
+
+    scan_df_5m["vol_ma"] = scan_df_5m["Volume"].rolling(window=10, min_periods=1).mean()
+
+    # Filter 1m data to same session window if available
+    session_df_1m = None
+    if df_1m is not None:
+        df_1m = df_1m.copy()
+        df_1m["Datetime"] = pd.to_datetime(df_1m["Datetime"])
+        session_df_1m = df_1m[
+            (df_1m["Datetime"] >= start_time) & (df_1m["Datetime"] < end_time)
+        ].copy()
+
+    # Use shared detection module
+    use_multitimeframe = df_1m is not None
+    vol_threshold = 1.0 if use_multitimeframe else 1.2  # Match backtest when multi-timeframe
+
+    setups = scan_for_setups(
+        df_5m=scan_df_5m,
+        df_1m=session_df_1m,
+        or_high=or_high,
+        or_low=or_low,
+        vol_threshold=vol_threshold,
+        use_multitimeframe=use_multitimeframe,
+    )
 
     signals = []
-    lvl_high = or_high
-    lvl_low = or_low
-    for i in range(1, len(scan_df) - 2):
-        row = scan_df.iloc[i]
-        prev = scan_df.iloc[i - 1]
-        breakout_up = (
-            prev["High"] <= lvl_high
-            and row["High"] > lvl_high
-            and is_strong_body(row)
-            and row["Volume"] > row["vol_ma"] * 1.2
-            and row["Close"] > lvl_high
+    for setup in setups:
+        breakout_candle = setup["breakout"]["candle"]
+        retest_candle = setup["retest"]
+        ignition_candle = setup["ignition"]
+        direction = setup["direction"]
+        level = setup["level"]
+
+        breakout_up = direction == "long"
+
+        # Calculate entry, stop, target
+        entry = ignition_candle["High"] if breakout_up else ignition_candle["Low"]
+        stop = retest_candle["Low"] - 0.05 if breakout_up else retest_candle["High"] + 0.05
+        risk = abs(entry - stop)
+        target = entry + 2 * risk if breakout_up else entry - 2 * risk
+
+        # Calculate grading metrics
+        breakout_body = abs(breakout_candle["Close"] - breakout_candle["Open"])
+        breakout_range = breakout_candle["High"] - breakout_candle["Low"]
+        breakout_body_pct = breakout_body / breakout_range if breakout_range > 0 else 0
+        breakout_vol_ratio = (
+            breakout_candle["Volume"] / breakout_candle["vol_ma"]
+            if breakout_candle["vol_ma"] > 0
+            else 1.0
         )
-        breakout_down = (
-            prev["Low"] >= lvl_low
-            and row["Low"] < lvl_low
-            and is_strong_body(row)
-            and row["Volume"] > row["vol_ma"] * 1.2
-            and row["Close"] < lvl_low
+
+        retest_vol_ratio = (
+            retest_candle["Volume"] / breakout_candle["Volume"]
+            if breakout_candle["Volume"] > 0
+            else 1.0
         )
-        if breakout_up or breakout_down:
-            re_test_idx = i + 1
-            if re_test_idx >= len(scan_df):
-                continue
-            re_test = scan_df.iloc[re_test_idx]
-            returns_to_level = (breakout_up and abs(re_test["Low"] - lvl_high) < 0.1) or (
-                breakout_down and abs(re_test["High"] - lvl_low) < 0.1
-            )
-            tight_candle = re_test["High"] - re_test["Low"] < 0.5 * (row["High"] - row["Low"])
-            lower_vol = re_test["Volume"] < row["Volume"]
-            if returns_to_level and tight_candle and lower_vol:
-                ign_idx = i + 2
-                if ign_idx >= len(scan_df):
-                    continue
-                ign = scan_df.iloc[ign_idx]
-                ignition = (
-                    is_strong_body(ign)
-                    and (
-                        (breakout_up and ign["High"] > re_test["High"])
-                        or (breakout_down and ign["Low"] < re_test["Low"])
-                    )
-                    and ign["Volume"] > re_test["Volume"]
-                )
-                if ignition:
-                    entry = ign["High"] if breakout_up else ign["Low"]
-                    stop = re_test["Low"] - 0.05 if breakout_up else re_test["High"] + 0.05
-                    risk = abs(entry - stop)
-                    target = entry + 2 * risk if breakout_up else entry - 2 * risk
-                    signals.append(
-                        {
-                            "direction": "long" if breakout_up else "short",
-                            "entry": entry,
-                            "stop": stop,
-                            "target": target,
-                            "risk": risk,
-                            "vol_breakout": row["Volume"],
-                            "vol_retest": re_test["Volume"],
-                            "vol_ignition": ign["Volume"],
-                            "datetime": ign["Datetime"],
-                            "level": lvl_high if breakout_up else lvl_low,
-                        }
-                    )
-    return signals, scan_df
+
+        ignition_body = abs(ignition_candle["Close"] - ignition_candle["Open"])
+        ignition_range = ignition_candle["High"] - ignition_candle["Low"]
+        ignition_body_pct = ignition_body / ignition_range if ignition_range > 0 else 0
+        ignition_vol_ratio = (
+            ignition_candle["Volume"] / retest_candle["Volume"]
+            if retest_candle["Volume"] > 0
+            else 1.0
+        )
+
+        rr_ratio = abs(target - entry) / risk if risk > 0 else 0
+        distance_to_target = 0.0  # Placeholder for live scanner
+
+        # Grade each component
+        breakout_grade, breakout_desc = grade_breakout_candle(
+            breakout_body_pct, breakout_vol_ratio, level
+        )
+        retest_candle_dict = {
+            "Open": retest_candle["Open"],
+            "High": retest_candle["High"],
+            "Low": retest_candle["Low"],
+            "Close": retest_candle["Close"],
+        }
+        retest_grade, retest_desc = grade_retest(
+            retest_candle_dict, retest_vol_ratio, level, direction
+        )
+        rr_grade, rr_desc = grade_risk_reward(rr_ratio)
+        market_grade, market_desc = grade_market_context("slightly_red")
+
+        # Calculate overall grade (4 components: breakout, retest, RR, market)
+        # Note: continuation excluded as it requires post-entry data
+        grades = {
+            "breakout": breakout_grade,
+            "retest": retest_grade,
+            "risk_reward": rr_grade,
+            "market": market_grade,
+        }
+        overall_grade = calculate_overall_grade(grades)
+
+        signals.append(
+            {
+                "direction": direction,
+                "entry": entry,
+                "stop": stop,
+                "target": target,
+                "risk": risk,
+                "vol_breakout": breakout_candle["Volume"],
+                "vol_retest": retest_candle["Volume"],
+                "vol_ignition": ignition_candle["Volume"],
+                "datetime": ignition_candle["Datetime"],
+                "level": level,
+                # Grading metrics
+                "breakout_body_pct": breakout_body_pct,
+                "breakout_vol_ratio": breakout_vol_ratio,
+                "retest_vol_ratio": retest_vol_ratio,
+                "ignition_vol_ratio": ignition_vol_ratio,
+                "ignition_body_pct": ignition_body_pct,
+                "distance_to_target": distance_to_target,
+                # Candle data
+                "breakout_candle": {
+                    "Open": breakout_candle["Open"],
+                    "High": breakout_candle["High"],
+                    "Low": breakout_candle["Low"],
+                    "Close": breakout_candle["Close"],
+                },
+                "retest_candle": {
+                    "Open": retest_candle["Open"],
+                    "High": retest_candle["High"],
+                    "Low": retest_candle["Low"],
+                    "Close": retest_candle["Close"],
+                },
+                "ignition_candle": {
+                    "Open": ignition_candle["Open"],
+                    "High": ignition_candle["High"],
+                    "Low": ignition_candle["Low"],
+                    "Close": ignition_candle["Close"],
+                },
+                # Grades
+                "grades": grades,
+                "overall_grade": overall_grade,
+            }
+        )
+
+    return signals, scan_df_5m
 
 
 def _parse_tickers(s: str):
@@ -353,10 +528,21 @@ if __name__ == "__main__":
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     p.add_argument("--retry-delay", type=float, default=DEFAULT_RETRY_DELAY)
     p.add_argument("--open-minutes", type=int, default=MARKET_OPEN_MINUTES)
+    p.add_argument(
+        "--min-grade",
+        type=str,
+        choices=["A", "B", "C"],
+        help="Minimum grade filter (A, B, or C). Only show signals with this grade or higher.",
+    )
     args = p.parse_args()
 
     tickers = _parse_tickers(args.tickers)
     print("\n=== 5-Min Break & Re-Test Scalp Strategy Scanner (CLI) ===\n")
+
+    # Define grade hierarchy for filtering
+    grade_order = {"A": 3, "B": 2, "C": 1}
+    min_grade_value = grade_order.get(args.min_grade, 0) if args.min_grade else 0
+
     for ticker in tickers:
         try:
             signals, scan_df = scan_ticker(
@@ -367,6 +553,23 @@ if __name__ == "__main__":
                 retry_delay=args.retry_delay,
                 market_open_minutes=args.open_minutes,
             )
+
+            # Apply grade filter if specified
+            if args.min_grade and signals:
+                filtered_signals = []
+                for sig in signals:
+                    sig_grade = sig.get("overall_grade", "C")
+                    sig_grade_value = grade_order.get(sig_grade, 0)
+                    if sig_grade_value >= min_grade_value:
+                        filtered_signals.append(sig)
+
+                # Replace signals with filtered list
+                signals = filtered_signals
+
+                if not signals:
+                    print(f"{ticker}: No signals found matching grade {args.min_grade}+ filter.")
+                    continue
+
             # Default behavior: save scan CSV and signals JSON into logs/ with timestamp
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             # Ensure both data/ and logs/ exist. CSVs go to data/, JSON signals remain in logs/
@@ -389,8 +592,3 @@ if __name__ == "__main__":
                     print(f"{ticker}: Failed to save signals: {e}")
         except Exception as e:
             print(f"{ticker}: Unexpected error during scan: {e}")
-
-if __name__ == "__main__":
-    print("\n=== 5-Min Break & Re-Test Scalp Strategy Scanner ===\n")
-    for ticker in TICKERS:
-        scan_ticker(ticker)

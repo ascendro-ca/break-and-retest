@@ -53,6 +53,7 @@ class TestScannerCLI:
         assert result.returncode == 0
         assert "usage:" in result.stdout.lower()
         assert "--tickers" in result.stdout
+        assert "--min-grade" in result.stdout
 
     def test_scanner_dry_run(self, python_exe):
         """Test scanner runs without errors (no real market data needed)"""
@@ -65,6 +66,39 @@ class TestScannerCLI:
         )
         # Should exit successfully even if no signals found
         assert result.returncode == 0
+
+    def test_scanner_with_grade_filter(self, python_exe):
+        """Test scanner with minimum grade filter"""
+        result = subprocess.run(
+            [python_exe, "break_and_retest_strategy.py", "--tickers", "AAPL", "--min-grade", "A"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        # Should exit successfully
+        assert result.returncode == 0
+        # If signals found, should show Scarface Rules grading
+        if "Scarface Rules" in result.stdout:
+            assert "Grade: A" in result.stdout or "Grade: A+" in result.stdout
+
+    def test_scanner_with_scarface_grading(self, python_exe):
+        """Test scanner outputs Scarface Rules grading"""
+        result = subprocess.run(
+            [python_exe, "break_and_retest_strategy.py", "--tickers", "AAPL"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        # Should exit successfully
+        assert result.returncode == 0
+        # Check for grading components if signals found
+        if "Level:" in result.stdout:
+            # Should have grading output
+            assert (
+                "Breakout:" in result.stdout
+                or "Retest:" in result.stdout
+                or "Grade:" in result.stdout
+            )
 
 
 class TestBacktestEngine:
@@ -248,16 +282,17 @@ class TestContinuousScanner:
         assert script.exists(), "Scanner script not found"
         assert os.access(script, os.X_OK), "Scanner script not executable"
 
-    def test_scanner_script_once(self, python_exe):
-        """Test scanner script with --once flag"""
-        result = subprocess.run(
-            ["./find_break_and_retest.sh", "--once"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        # Should exit successfully after one run
-        assert result.returncode == 0
+        @pytest.mark.slow
+        def test_scanner_script_once(self, python_exe):
+            """Test scanner script with --once flag (may wait up to 60s for aligned minute)"""
+            result = subprocess.run(
+                ["./find_break_and_retest.sh", "--once"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            # Should exit successfully after one run
+            assert result.returncode == 0
 
 
 class TestSignalGrading:

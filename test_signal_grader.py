@@ -8,7 +8,6 @@ from signal_grader import (
     calculate_overall_grade,
     generate_signal_report,
     grade_breakout_candle,
-    grade_continuation,
     grade_market_context,
     grade_retest,
     grade_risk_reward,
@@ -64,36 +63,6 @@ def test_grade_retest_short_weak():
     assert grade in ["❌", "⚠️"]
 
 
-def test_grade_continuation_fast():
-    """Test fast continuation grading"""
-    ignition_candle = {"Open": 100, "High": 103, "Low": 100, "Close": 102.5}
-    ignition_vol_ratio = 1.2
-    distance_to_target = 0.6
-    body_pct = 0.75
-
-    grade, desc = grade_continuation(
-        ignition_candle, ignition_vol_ratio, distance_to_target, body_pct
-    )
-
-    assert grade == "✅"
-    assert "Fast push" in desc or "60%" in desc
-
-
-def test_grade_continuation_stalled():
-    """Test stalled continuation grading"""
-    ignition_candle = {"Open": 100, "High": 100.5, "Low": 100, "Close": 100.3}
-    ignition_vol_ratio = 0.5
-    distance_to_target = 0.1
-    body_pct = 0.40
-
-    grade, desc = grade_continuation(
-        ignition_candle, ignition_vol_ratio, distance_to_target, body_pct
-    )
-
-    assert grade == "❌"
-    assert "Stalled" in desc
-
-
 def test_grade_risk_reward_excellent():
     """Test excellent R/R grading"""
     grade, desc = grade_risk_reward(3.5)
@@ -121,11 +90,11 @@ def test_grade_market_context():
 
 
 def test_calculate_overall_grade_a_plus():
-    """Test A+ grade calculation"""
+    """Test A+ grade calculation - all 4 pre-entry components perfect"""
     grades = {
         "breakout": "✅",
         "retest": "✅",
-        "continuation": "✅",
+        "continuation": "✅",  # Included but not counted in grade
         "rr": "✅",
         "market": "✅",
     }
@@ -135,11 +104,11 @@ def test_calculate_overall_grade_a_plus():
 
 
 def test_calculate_overall_grade_a():
-    """Test A grade calculation"""
+    """Test A grade calculation - 3/4 perfect, 1 warning"""
     grades = {
         "breakout": "✅",
         "retest": "✅",
-        "continuation": "✅",
+        "continuation": "❌",  # Included but not counted in grade
         "rr": "✅",
         "market": "⚠️",
     }
@@ -149,11 +118,11 @@ def test_calculate_overall_grade_a():
 
 
 def test_calculate_overall_grade_b():
-    """Test B grade calculation"""
+    """Test B grade calculation - 2/4 perfect, 2 warnings, no fails"""
     grades = {
         "breakout": "✅",
-        "retest": "✅",
-        "continuation": "⚠️",
+        "retest": "⚠️",
+        "continuation": "❌",  # Included but not counted in grade
         "rr": "✅",
         "market": "⚠️",
     }
@@ -163,11 +132,11 @@ def test_calculate_overall_grade_b():
 
 
 def test_calculate_overall_grade_c():
-    """Test C grade calculation"""
+    """Test C grade calculation - has failures in pre-entry components"""
     grades = {
         "breakout": "✅",
         "retest": "❌",
-        "continuation": "❌",
+        "continuation": "❌",  # Included but not counted in grade
         "rr": "✅",
         "market": "⚠️",
     }

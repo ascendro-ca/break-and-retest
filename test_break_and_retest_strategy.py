@@ -11,7 +11,8 @@ project_root = str(Path(__file__).parent.absolute())
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from break_and_retest_strategy import is_strong_body, scan_ticker
+from break_and_retest_detection import is_strong_body
+from break_and_retest_strategy import scan_ticker
 from visualize_results import create_chart
 
 

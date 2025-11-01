@@ -174,31 +174,37 @@ def calculate_overall_grade(grades: Dict[str, str]) -> str:
     """
     Calculate overall signal grade based on component grades.
 
+    Note: Grades only pre-entry components (breakout, retest, RR, market).
+    Continuation is excluded since it requires knowing the trade outcome.
+
     Args:
         grades: Dict of component grades (✅/⚠️/❌)
+                Should contain: breakout, retest, rr, market (4 components)
 
     Returns:
         Overall grade: A+, A, B, or C
     """
-    perfect = sum(1 for g in grades.values() if g == "✅")
-    warning = sum(1 for g in grades.values() if g == "⚠️")
-    fail = sum(1 for g in grades.values() if g == "❌")
+    # Count only the pre-entry components (exclude continuation if present)
+    grading_components = {k: v for k, v in grades.items() if k != "continuation"}
 
-    total = len(grades)
+    perfect = sum(1 for g in grading_components.values() if g == "✅")
+    fail = sum(1 for g in grading_components.values() if g == "❌")
 
-    # A+: All perfect
+    total = len(grading_components)
+
+    # A+: All perfect (4/4 ✅)
     if perfect == total:
         return "A+"
 
-    # A: Mostly perfect, max 1 warning
+    # A: 3/4 perfect, no fails (1 warning OK)
     if perfect >= total - 1 and fail == 0:
         return "A"
 
-    # B: Some warnings, no fails
-    if fail == 0 and warning <= 2:
+    # B: 2/4 perfect, no fails (2 warnings OK)
+    if fail == 0 and perfect >= 2:
         return "B"
 
-    # C: Has failures or too many warnings
+    # C: Has failures or less than 2 perfect
     return "C"
 
 
