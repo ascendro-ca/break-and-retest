@@ -123,7 +123,8 @@ def detect_retest_and_ignition_1m(
             ignition = (
                 is_strong_body(ign)
                 and (
-                    (breakout_up and ign["High"] > ret["High"]) or (not breakout_up and ign["Low"] < ret["Low"])  # noqa: E501
+                    (breakout_up and ign["High"] > ret["High"])
+                    or (not breakout_up and ign["Low"] < ret["Low"])  # noqa: E501
                 )
                 and ign["Volume"] > ret["Volume"]
             )

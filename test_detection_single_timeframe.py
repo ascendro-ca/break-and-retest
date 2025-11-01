@@ -24,16 +24,70 @@ def test_detect_retest_and_ignition_5m_happy_path():
     rows = []
     times = pd.date_range("2025-10-31 09:30", periods=6, freq="5min")
     # OR candle
-    rows.append({"Datetime": times[0], "Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": 10000})
+    rows.append(
+        {
+            "Datetime": times[0],
+            "Open": 100.0,
+            "High": 101.0,
+            "Low": 99.0,
+            "Close": 100.5,
+            "Volume": 10000,
+        }
+    )
     # Breakout candle (strong body up)
-    rows.append({"Datetime": times[1], "Open": 100.6, "High": 102.0, "Low": 100.6, "Close": 101.9, "Volume": 25000})
+    rows.append(
+        {
+            "Datetime": times[1],
+            "Open": 100.6,
+            "High": 102.0,
+            "Low": 100.6,
+            "Close": 101.9,
+            "Volume": 25000,
+        }
+    )
     # Retest tight candle lower vol, touches or below level 101.0
-    rows.append({"Datetime": times[2], "Open": 101.6, "High": 101.6, "Low": 100.95, "Close": 101.3, "Volume": 12000})
+    rows.append(
+        {
+            "Datetime": times[2],
+            "Open": 101.6,
+            "High": 101.6,
+            "Low": 100.95,
+            "Close": 101.3,
+            "Volume": 12000,
+        }
+    )
     # Ignition strong body, breaks retest high and higher volume
-    rows.append({"Datetime": times[3], "Open": 101.2, "High": 102.2, "Low": 101.1, "Close": 102.0, "Volume": 20000})
+    rows.append(
+        {
+            "Datetime": times[3],
+            "Open": 101.2,
+            "High": 102.2,
+            "Low": 101.1,
+            "Close": 102.0,
+            "Volume": 20000,
+        }
+    )
     # Padding
-    rows.append({"Datetime": times[4], "Open": 102.0, "High": 102.2, "Low": 101.8, "Close": 102.1, "Volume": 15000})
-    rows.append({"Datetime": times[5], "Open": 102.1, "High": 102.3, "Low": 102.0, "Close": 102.2, "Volume": 14000})
+    rows.append(
+        {
+            "Datetime": times[4],
+            "Open": 102.0,
+            "High": 102.2,
+            "Low": 101.8,
+            "Close": 102.1,
+            "Volume": 15000,
+        }
+    )
+    rows.append(
+        {
+            "Datetime": times[5],
+            "Open": 102.1,
+            "High": 102.3,
+            "Low": 102.0,
+            "Close": 102.2,
+            "Volume": 14000,
+        }
+    )
 
     df5 = pd.DataFrame(rows)
 
@@ -59,10 +113,46 @@ def test_detect_retest_and_ignition_5m_no_retest():
     # Breakout followed by non-touch retest should return None
     rows = []
     times = pd.date_range("2025-10-31 09:30", periods=4, freq="5min")
-    rows.append({"Datetime": times[0], "Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": 10000})
-    rows.append({"Datetime": times[1], "Open": 100.6, "High": 102.0, "Low": 100.6, "Close": 101.9, "Volume": 25000})
-    rows.append({"Datetime": times[2], "Open": 101.7, "High": 101.8, "Low": 101.2, "Close": 101.3, "Volume": 12000})  # no touch
-    rows.append({"Datetime": times[3], "Open": 101.3, "High": 102.2, "Low": 101.1, "Close": 102.0, "Volume": 20000})
+    rows.append(
+        {
+            "Datetime": times[0],
+            "Open": 100.0,
+            "High": 101.0,
+            "Low": 99.0,
+            "Close": 100.5,
+            "Volume": 10000,
+        }
+    )
+    rows.append(
+        {
+            "Datetime": times[1],
+            "Open": 100.6,
+            "High": 102.0,
+            "Low": 100.6,
+            "Close": 101.9,
+            "Volume": 25000,
+        }
+    )
+    rows.append(
+        {
+            "Datetime": times[2],
+            "Open": 101.7,
+            "High": 101.8,
+            "Low": 101.2,
+            "Close": 101.3,
+            "Volume": 12000,
+        }
+    )  # no touch
+    rows.append(
+        {
+            "Datetime": times[3],
+            "Open": 101.3,
+            "High": 102.2,
+            "Low": 101.1,
+            "Close": 102.0,
+            "Volume": 20000,
+        }
+    )
 
     df5 = pd.DataFrame(rows)
     breakout_idx = 1

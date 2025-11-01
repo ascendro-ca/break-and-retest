@@ -23,6 +23,21 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True, scope="module")
+def chdir_to_project_dir():
+    """Ensure tests run from the project directory so relative paths resolve.
+
+    Many functional tests assume execution from the `break-and-retest/` folder
+    where scripts like backtest.py and visualize_results.py live.
+    """
+    prev_cwd = os.getcwd()
+    os.chdir(Path(__file__).parent)
+    try:
+        yield
+    finally:
+        os.chdir(prev_cwd)
+
+
 @pytest.fixture
 def temp_test_dir():
     """Create a temporary directory for test outputs"""
@@ -33,20 +48,29 @@ def temp_test_dir():
 
 @pytest.fixture
 def python_exe():
-    """Get the Python executable from the virtual environment"""
-    venv_python = Path(".venv/bin/python")
-    if venv_python.exists():
-        return str(venv_python)
+    """Resolve Python executable, preferring a nearby .venv if available."""
+    # Try common locations relative to this test file and current working directory
+    candidates = [
+        Path.cwd() / ".venv" / "bin" / "python",
+        Path(__file__).parent / ".venv" / "bin" / "python",
+        Path(__file__).parent.parent / ".venv" / "bin" / "python",
+    ]
+
+    for cand in candidates:
+        if cand.exists():
+            return str(cand)
+
+    # Fallback to system python
     return "python"
 
 
 class TestScannerCLI:
-    """Test the break_and_retest_strategy.py scanner CLI"""
+    """Test the break_and_retest_live_scanner.py CLI"""
 
     def test_scanner_help(self, python_exe):
         """Test scanner --help displays usage"""
         result = subprocess.run(
-            [python_exe, "break_and_retest_strategy.py", "--help"],
+            [python_exe, "break_and_retest_live_scanner.py", "--help"],
             capture_output=True,
             text=True,
         )
@@ -59,7 +83,7 @@ class TestScannerCLI:
         """Test scanner runs without errors (no real market data needed)"""
         # Note: This may return empty signals due to data/timing, but should not crash
         result = subprocess.run(
-            [python_exe, "break_and_retest_strategy.py", "--tickers", "AAPL"],
+            [python_exe, "break_and_retest_live_scanner.py", "--tickers", "AAPL"],
             capture_output=True,
             text=True,
             timeout=60,
@@ -70,7 +94,14 @@ class TestScannerCLI:
     def test_scanner_with_grade_filter(self, python_exe):
         """Test scanner with minimum grade filter"""
         result = subprocess.run(
-            [python_exe, "break_and_retest_strategy.py", "--tickers", "AAPL", "--min-grade", "A"],
+            [
+                python_exe,
+                "break_and_retest_live_scanner.py",
+                "--tickers",
+                "AAPL",
+                "--min-grade",
+                "A",
+            ],
             capture_output=True,
             text=True,
             timeout=60,
@@ -84,7 +115,7 @@ class TestScannerCLI:
     def test_scanner_with_scarface_grading(self, python_exe):
         """Test scanner outputs Scarface Rules grading"""
         result = subprocess.run(
-            [python_exe, "break_and_retest_strategy.py", "--tickers", "AAPL"],
+            [python_exe, "break_and_retest_live_scanner.py", "--tickers", "AAPL"],
             capture_output=True,
             text=True,
             timeout=60,

@@ -261,7 +261,6 @@ def grade_retest(
     # - B-grade: Pierces more but closes on correct side (some pressure)
     # - C-grade: Comes within 1-2 candle widths but doesn't touch
 
-
     # ===== SCARFACE RULES: RETEST PRECISION CRITERIA =====
     # Measure distance from level to assess "tap quality"
     # - A-grade: Wick touches or slightly pierces level
@@ -297,8 +296,8 @@ def grade_retest(
         # - Body strong (≥ 60%)
         # - Green candle showing buying strength
         pierce_depth_pct = abs(min(wick_distance_to_level, 0)) / rng if rng > 0 else 0
-    # clean tap helper (no longer used directly; left for clarity)
-    # clean_tap = wick_touches_level and pierce_depth_pct <= 0.10
+        # clean tap helper (no longer used directly; left for clarity)
+        # clean_tap = wick_touches_level and pierce_depth_pct <= 0.10
 
         bull_A = (
             is_green
@@ -391,8 +390,8 @@ def grade_retest(
         # ===== A-GRADE: "TAP AND GO" (SHORT) =====
         # Wick touches/pierces resistance level, clean rejection, closes just below level
         pierce_depth_pct = max(wick_distance_to_level, 0) / rng if rng > 0 else 0
-    # clean tap helper (no longer used directly)
-    # clean_tap = wick_touches_level and pierce_depth_pct <= 0.10
+        # clean tap helper (no longer used directly)
+        # clean_tap = wick_touches_level and pierce_depth_pct <= 0.10
 
         bear_A = (
             is_red

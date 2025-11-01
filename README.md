@@ -32,10 +32,10 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-2. Run scanner from CLI for default tickers:
+2. Run live scanner from CLI for default tickers:
 
 ```bash
-python break_and_retest_strategy.py
+python break_and_retest_live_scanner.py
 ```
 
 3. Scan a single ticker and save a chart:
@@ -100,7 +100,8 @@ Unit tests automatically generate:
 The `--show-test` command groups and opens all test files from the same test run (minute-level grouping).
 
 ## Files
-- `break_and_retest_strategy.py` — main scanner + CLI
+- `break_and_retest_live_scanner.py` — live scanner CLI (multi-timeframe)
+- `break_and_retest_strategy.py` — reusable scanning functions (importable)
 - `visualize_results.py` — create Plotly HTML/PNG charts for found signals
 - `test_break_and_retest_strategy.py` — unit tests for detection logic with auto-visualization
 - `backtest.py` — backtesting engine with data caching

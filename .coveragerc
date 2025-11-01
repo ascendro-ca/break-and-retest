@@ -5,6 +5,7 @@ omit =
     */test_*.py
     backtest.py
     break_and_retest_strategy.py
+    break_and_retest_live_scanner.py
     visualize_results.py
     find_break_and_retest.sh
     conftest.py

@@ -194,9 +194,7 @@ def scan_ticker(
     scan_df_5m["vol_ma"] = scan_df_5m["Volume"].rolling(window=10, min_periods=1).mean()
 
     # Calculate VWAP for trend filtering
-    scan_df_5m["typical_price"] = (
-        scan_df_5m["High"] + scan_df_5m["Low"] + scan_df_5m["Close"]
-    ) / 3
+    scan_df_5m["typical_price"] = (scan_df_5m["High"] + scan_df_5m["Low"] + scan_df_5m["Close"]) / 3
     scan_df_5m["tp_volume"] = scan_df_5m["typical_price"] * scan_df_5m["Volume"]
     scan_df_5m["vwap"] = scan_df_5m["tp_volume"].cumsum() / scan_df_5m["Volume"].cumsum()
 

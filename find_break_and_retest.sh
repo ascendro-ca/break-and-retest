@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # run_break_and_retest.sh
-# Run the new break_and_retest_strategy.py scanner on a schedule (default: every 1 minute).
+# Run the live scanner on a schedule (default: every 1 minute).
 # Usage:
 #   ./run_break_and_retest.sh                # run forever, aligned to 1-minute clock marks
 #   ./run_break_and_retest.sh --once         # run a single scan and exit
@@ -12,7 +12,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$DIR/.venv"
 PY="$VENV/bin/python"
-SCRIPT="$DIR/break_and_retest_strategy.py"
+SCRIPT="$DIR/break_and_retest_live_scanner.py"
 LOGDIR="$DIR/logs"
 mkdir -p "$LOGDIR"
 # Default: 60 seconds (1 minute)
