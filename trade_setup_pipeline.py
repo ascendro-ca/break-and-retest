@@ -1,0 +1,223 @@
+"""
+Trade Setup Pipeline
+====================
+
+Top-level orchestrator for the Break & Retest detection pipeline.
+Similar to a Jenkins CI/CD pipeline, each stage is sequential and must pass
+before the next stage runs.
+
+Pipeline Levels:
+- Level 0 (Base): Stages 1-3 only (OR → Breakout → Retest)
+  - Minimal/permissive filters for candidate identification
+  - No trades executed (candidates only)
+
+- Level 1: Stages 1-3 with base criteria for trade execution
+  - Trades entered on open of 1m candle after retest
+  - Stage 4 (Ignition) NOT used at Level 1
+  - Progressively stricter filtering than Level 0
+
+- Level 2+: Reserved for future enhanced filtering/grading
+  - May include Stage 4 (Ignition) and additional criteria
+
+Pipeline Stages:
+1. Opening Range (OR) - Establishes the reference level
+2. Breakout - Detects 5m candles that break beyond OR
+3. Retest - Detects 1m candles that retest the breakout level
+4. Ignition (Level 2+) - Detects ignition candle confirming continuation after entry
+
+Usage:
+    # Level 0: Base 3-stage pipeline (candidates only, no trades)
+    pipeline = TradeSetupPipeline(pipeline_level=0)
+    candidates = pipeline.run(session_df_5m, session_df_1m)
+
+    # Level 1: Trade execution with base criteria (no ignition)
+    pipeline = TradeSetupPipeline(pipeline_level=1)
+    candidates = pipeline.run(session_df_5m, session_df_1m)
+
+Architecture:
+- Designed for both backtesting and live scanning
+- Data-source agnostic (just feed it 5m and 1m OHLCV slices)
+- Extensible via custom filter functions per stage
+"""
+
+from typing import Callable, Dict, List, Optional, Tuple
+
+import pandas as pd
+
+from stage_breakout import detect_breakouts
+from stage_ignition import detect_ignition
+from stage_opening_range import detect_opening_range
+from stage_retest import detect_retest
+
+
+class TradeSetupPipeline:
+    """
+    Sequential pipeline for Break & Retest trade setup detection.
+
+    Pipeline Levels:
+    - Level 0: Candidates only (Stages 1-3: OR, Breakout, Retest)
+    - Level 1: Trade execution with base criteria (Stages 1-3, no ignition)
+    - Level 2+: Enhanced filtering, may include Stage 4 (Ignition)
+    """
+
+    def __init__(
+        self,
+        breakout_window_minutes: int = 90,
+        retest_lookahead_minutes: int = 30,
+        ignition_lookahead_minutes: int = 30,
+        pipeline_level: int = 0,
+        breakout_filter: Optional[
+            Callable[[pd.Series, pd.Series, float, float], Optional[Tuple[str, float]]]
+        ] = None,
+        retest_filter: Optional[Callable[[pd.Series, str, float], bool]] = None,
+        ignition_filter: Optional[Callable[[pd.Series, str, float, float], bool]] = None,
+    ) -> None:
+        """
+        Initialize the pipeline.
+
+        Args:
+            breakout_window_minutes: Minutes from session open to scan for breakouts
+            retest_lookahead_minutes: Minutes after breakout close to search for retest
+            ignition_lookahead_minutes: Minutes after retest to search for ignition
+            pipeline_level: Pipeline strictness level (0=candidates only, 1=trades, 2+=enhanced)
+            breakout_filter: Optional custom Stage 2 filter
+            retest_filter: Optional custom Stage 3 filter
+            ignition_filter: Optional custom Stage 4 filter
+        """
+        self.breakout_window_minutes = int(breakout_window_minutes)
+        self.retest_lookahead_minutes = int(retest_lookahead_minutes)
+        self.ignition_lookahead_minutes = int(ignition_lookahead_minutes)
+        self.pipeline_level = int(pipeline_level)
+        self.breakout_filter = breakout_filter
+        self.retest_filter = retest_filter
+        self.ignition_filter = ignition_filter
+
+    def run(self, session_df_5m: pd.DataFrame, session_df_1m: pd.DataFrame) -> List[Dict]:
+        """
+        Run the full 4-stage pipeline on a trading session.
+
+        Args:
+            session_df_5m: 5-minute OHLCV data for the session, sorted ascending
+            session_df_1m: 1-minute OHLCV data for the session, sorted ascending
+
+        Returns:
+            List of candidate setups that passed all 4 stages.
+            Each dict contains: direction, level, breakout_time, retest_time,
+            ignition_time, breakout_candle, retest_candle, ignition_candle
+        """
+        if session_df_5m is None or session_df_1m is None:
+            return []
+        if session_df_5m.empty or session_df_1m.empty:
+            return []
+
+        # Ensure sorted
+        session_df_5m = session_df_5m.sort_values("Datetime").copy()
+        session_df_1m = session_df_1m.sort_values("Datetime").copy()
+
+        # =====================================
+        # STAGE 1: Opening Range
+        # =====================================
+        or_result = detect_opening_range(session_df_5m)
+        or_high = or_result["high"]
+        or_low = or_result["low"]
+
+        if or_high == 0.0 or or_low == 0.0:
+            return []
+
+        # =====================================
+        # STAGE 2: Breakout Detection
+        # =====================================
+        breakouts = detect_breakouts(
+            session_df_5m=session_df_5m,
+            or_high=or_high,
+            or_low=or_low,
+            breakout_window_minutes=self.breakout_window_minutes,
+            breakout_filter=self.breakout_filter,
+        )
+
+        if not breakouts:
+            return []
+
+        # =====================================
+        # STAGE 3: Retest Detection
+        # =====================================
+        candidates = []
+        for brk in breakouts:
+            retest_result = detect_retest(
+                session_df_1m=session_df_1m,
+                breakout_time=brk["time"],
+                direction=brk["direction"],
+                level=brk["level"],
+                retest_lookahead_minutes=self.retest_lookahead_minutes,
+                retest_filter=self.retest_filter,
+            )
+
+            if retest_result is None:
+                continue
+
+            # Base candidate dict (Stage 1-3 complete)
+            candidate = {
+                "direction": brk["direction"],
+                "level": brk["level"],
+                "breakout_time": brk["time"],
+                "retest_time": retest_result["time"],
+                "breakout_candle": brk["candle"],
+                "retest_candle": retest_result["candle"],
+            }
+
+            # =====================================
+            # STAGE 4: Ignition (Level 2+)
+            # =====================================
+            if self.pipeline_level >= 2:
+                ignition_result = detect_ignition(
+                    session_df_1m=session_df_1m,
+                    retest_time=retest_result["time"],
+                    retest_candle=retest_result["candle"],
+                    direction=brk["direction"],
+                    ignition_lookahead_minutes=self.ignition_lookahead_minutes,
+                    ignition_filter=self.ignition_filter,
+                )
+
+                if ignition_result is not None:
+                    candidate["ignition_time"] = ignition_result["time"]
+                    candidate["ignition_candle"] = ignition_result["candle"]
+
+            candidates.append(candidate)
+
+        return candidates
+
+
+def run_pipeline(
+    session_df_5m: pd.DataFrame,
+    session_df_1m: pd.DataFrame,
+    breakout_window_minutes: int = 90,
+    retest_lookahead_minutes: int = 30,
+    ignition_lookahead_minutes: int = 30,
+    pipeline_level: int = 0,
+) -> List[Dict]:
+    """
+    Convenience function to run the pipeline with default settings.
+
+    This is the primary entry point for both backtesting and live scanning.
+
+    Args:
+        session_df_5m: 5-minute OHLCV data
+        session_df_1m: 1-minute OHLCV data
+        breakout_window_minutes: Minutes from session open to scan for breakouts
+        retest_lookahead_minutes: Minutes after breakout close to search for retest
+        ignition_lookahead_minutes: Minutes after retest to search for ignition
+        pipeline_level: Pipeline strictness level
+                       Level 0: Candidates only (Stages 1-3, no trades)
+                       Level 1: Trade execution with base criteria (Stages 1-3, no ignition)
+                       Level 2+: Enhanced filtering, may include Stage 4 (Ignition)
+
+    Returns:
+        List of candidates that passed all required stages
+    """
+    pipeline = TradeSetupPipeline(
+        breakout_window_minutes=breakout_window_minutes,
+        retest_lookahead_minutes=retest_lookahead_minutes,
+        ignition_lookahead_minutes=ignition_lookahead_minutes,
+        pipeline_level=pipeline_level,
+    )
+    return pipeline.run(session_df_5m, session_df_1m)

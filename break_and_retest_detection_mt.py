@@ -3,8 +3,9 @@ Break and Retest Detection Module (Multi-timeframe only)
 
 - 5m breakout detection with VWAP alignment and volume threshold
 - 1m retest strictly AFTER 5m close with wick touch/pierce and
-    correct-side close (<= 1 tick epsilon)
-- Next-1m ignition with strong body, break of retest, and volume increase
+        correct-side close (<= 1 tick epsilon)
+- Next-1m ignition must break the retest extreme intrabar (body/volume are
+    graded later; detection is permissive here for C-tier exploration)
 """
 
 from datetime import timedelta
@@ -33,6 +34,16 @@ def detect_breakout_5m(
     """
     breakouts: List[Dict] = []
 
+    # Ensure a 20-bar volume SMA is available for the loosened gate.
+    if "vol_ma_20" not in scan_df.columns:
+        try:
+            scan_df = scan_df.copy()
+            scan_df["vol_ma_20"] = scan_df["Volume"].rolling(window=20, min_periods=1).mean()
+        except Exception:
+            # Fallback to any existing vol_ma if available
+            scan_df["vol_ma_20"] = scan_df.get(
+                "vol_ma", scan_df["Volume"].rolling(window=10, min_periods=1).mean()
+            )
     for i in range(1, len(scan_df)):
         row = scan_df.iloc[i]
         prev = scan_df.iloc[i - 1]
@@ -41,21 +52,37 @@ def detect_breakout_5m(
         vwap_aligned_long = (vwap is None) or (row["Close"] > vwap)
         vwap_aligned_short = (vwap is None) or (row["Close"] < vwap)
 
+        # Loosened breakout criteria for exploration:
+        # - Volume > 1x 20-bar SMA
+        # - Close beyond OR (above for long, below for short)
+        # - Upper wick less than 25% of candle body (for longs) / lower wick for shorts
+        vol_gate = row.get("vol_ma_20", row.get("vol_ma", 1.0)) * vol_threshold
+
+        body_abs = abs(row["Close"] - row["Open"]) if ("Close" in row and "Open" in row) else 0.0
+        upper_wick = row["High"] - max(row["Open"], row["Close"]) if body_abs >= 0 else 0.0
+        lower_wick = min(row["Open"], row["Close"]) - row["Low"] if body_abs >= 0 else 0.0
+
+        upper_wick_ok = True
+        lower_wick_ok = True
+        if body_abs > 0:
+            upper_wick_ok = upper_wick <= 0.25 * body_abs
+            lower_wick_ok = lower_wick <= 0.25 * body_abs
+
         breakout_up = (
             prev["High"] <= or_high
             and row["High"] > or_high
-            and is_strong_body(row)
-            and row["Volume"] > row["vol_ma"] * vol_threshold
+            and row["Volume"] > vol_gate
             and row["Close"] > or_high
             and vwap_aligned_long
+            and upper_wick_ok
         )
         breakout_down = (
             prev["Low"] >= or_low
             and row["Low"] < or_low
-            and is_strong_body(row)
-            and row["Volume"] > row["vol_ma"] * vol_threshold
+            and row["Volume"] > vol_gate
             and row["Close"] < or_low
             and vwap_aligned_short
+            and lower_wick_ok
         )
 
         if breakout_up:
@@ -120,13 +147,10 @@ def detect_retest_and_ignition_1m(
         )
         if returns_to_level and close_holds:
             ign = window.iloc[j + 1]
-            ignition = (
-                is_strong_body(ign)
-                and (
-                    (breakout_up and ign["High"] > ret["High"])
-                    or (not breakout_up and ign["Low"] < ret["Low"])  # noqa: E501
-                )
-                and ign["Volume"] > ret["Volume"]
+            # Detection requires next-1m to break the retest extreme intrabar.
+            # Body/volume strength are assessed in grading; allow permissive C-tier here.
+            ignition = (breakout_up and ign["High"] > ret["High"]) or (
+                not breakout_up and ign["Low"] < ret["Low"]
             )
             if ignition:
                 return {

@@ -254,13 +254,14 @@ def test_cache_directory_organization(temp_cache_dir):
 
 
 def test_multitimeframe_breakout_detection(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
-    """Test that breakout is detected on 5m and retest/ignition on 1m"""
-    engine = BacktestEngine(initial_capital=10000, position_size_pct=0.1)
+    """Test that breakout is detected on 5m and retest on 1m at Level 0 (base pipeline)"""
+    # Level 0: Base pipeline (Stages 1-3 only, no ignition)
+    engine = BacktestEngine(initial_capital=10000, position_size_pct=0.1, pipeline_level=0)
 
     # Run backtest
     result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
 
-    # Should detect at least one signal with our crafted data
+    # Should detect at least one candidate with our crafted data
     assert len(result["signals"]) >= 1
 
     if len(result["signals"]) > 0:
@@ -270,20 +271,14 @@ def test_multitimeframe_breakout_detection(sample_ohlcv_data_5m, sample_ohlcv_da
         assert "breakout_time_5m" in signal
         assert "vol_breakout_5m" in signal
         assert "vol_retest_1m" in signal
-        assert "vol_ignition_1m" in signal
+        # At Level 0, ignition is not detected
+        # assert "vol_ignition_1m" in signal  # Only present at Level 1+
 
-        # Verify entry/stop/target are set
-        assert signal["entry"] > 0
-        assert signal["stop"] > 0
-        assert signal["target"] > 0
-        assert signal["risk"] > 0
-
-        # For long: target > entry > stop
-        # For short: target < entry < stop
-        if signal["direction"] == "long":
-            assert signal["target"] > signal["entry"] > signal["stop"]
-        else:
-            assert signal["target"] < signal["entry"] < signal["stop"]
+        # At Level 0, entry/stop/target are None (candidates only)
+        assert signal["entry"] is None
+        assert signal["stop"] is None
+        assert signal["target"] is None
+        assert signal["risk"] is None
 
 
 if __name__ == "__main__":

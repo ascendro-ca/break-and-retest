@@ -9,6 +9,7 @@
     "SPOT",
     "UBER"
   ],
+  "initial_capital": 7500,
   "timeframe_5m": "5m",
   "timeframe_1m": "1m",
   "lookback": "2d",

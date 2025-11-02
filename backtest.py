@@ -9,16 +9,22 @@ Usage:
 """
 
 import argparse
-import json
 from datetime import datetime, timedelta
+import json
+import math
 from pathlib import Path
 from typing import Dict, List, Optional
-
-import pandas as pd
-import yfinance as yf
 from zoneinfo import ZoneInfo
 
-from break_and_retest_detection_mt import scan_for_setups
+import pandas as pd
+# Note: yfinance provider removed; keep import out to avoid unused import lint
+
+from cache_utils import (
+    get_cache_path,
+    load_cached_day,
+    save_day,
+    integrity_check_range,
+)
 from signal_grader import (
     calculate_overall_grade,
     generate_signal_report,
@@ -29,6 +35,7 @@ from signal_grader import (
     grade_risk_reward,
 )
 from time_utils import get_display_timezone
+from trade_setup_pipeline import run_pipeline
 
 
 def load_config():
@@ -44,6 +51,7 @@ def load_config():
 
 CONFIG = load_config()
 DEFAULT_TICKERS = CONFIG["tickers"]
+DEFAULT_INITIAL_CAPITAL = CONFIG.get("initial_capital", 7500)
 RETEST_VOL_GATE = CONFIG.get("retest_volume_gate_ratio", 0.20)
 BREAKOUT_A_UW_MAX = CONFIG.get("breakout_A_upper_wick_max", 0.15)
 BREAKOUT_B_BODY_MAX = CONFIG.get("breakout_B_body_max", 0.65)
@@ -69,22 +77,15 @@ class DataCache:
 
     def _get_cache_path(self, symbol: str, date: str, interval: str) -> Path:
         """Generate cache file path for a symbol and date"""
-        symbol_dir = self.cache_dir / symbol
-        symbol_dir.mkdir(exist_ok=True)
-        return symbol_dir / f"{date}_{interval}.csv"
+        return get_cache_path(self.cache_dir, symbol, date, interval)
 
     def get_cached_data(self, symbol: str, date: str, interval: str) -> Optional[pd.DataFrame]:
         """Load cached data if available"""
-        cache_path = self._get_cache_path(symbol, date, interval)
-        if cache_path.exists():
-            df = pd.read_csv(cache_path, parse_dates=["Datetime"])
-            return df
-        return None
+        return load_cached_day(self.cache_dir, symbol, date, interval)
 
     def cache_data(self, symbol: str, date: str, interval: str, df: pd.DataFrame):
         """Save data to cache"""
-        cache_path = self._get_cache_path(symbol, date, interval)
-        df.to_csv(cache_path, index=False)
+        save_day(self.cache_dir, symbol, date, interval, df)
 
     def download_data(
         self,
@@ -94,7 +95,9 @@ class DataCache:
         interval: str = "5m",
     ) -> pd.DataFrame:
         """
-        Download OHLCV data for a symbol and date range, using cache when available
+        Load OHLCV data for a symbol and date range from local cache only.
+        This tool no longer downloads from Yahoo Finance; populate cache via
+        the StockData.org fetcher (stockdata_test.py) before running.
 
         Args:
             symbol: Stock ticker symbol
@@ -111,7 +114,7 @@ class DataCache:
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d")
 
-        # For 1-minute data, yfinance only allows 7 days at a time
+        # 1m path uses same cache-only logic
         if interval == "1m":
             return self._download_1m_data(symbol, start, end)
 
@@ -127,43 +130,10 @@ class DataCache:
                 current += timedelta(days=1)
                 continue
 
-            # Download from yfinance
-            try:
-                ticker = yf.Ticker(symbol)
-                next_day = current + timedelta(days=1)
-                df = ticker.history(
-                    start=current.strftime("%Y-%m-%d"),
-                    end=next_day.strftime("%Y-%m-%d"),
-                    interval=interval,
-                    prepost=False,
-                )
-
-                if not df.empty:
-                    # Standardize column names
-                    df = df.reset_index()
-                    df.columns = [
-                        col.replace("Datetime", "Datetime") if "Datetime" in col else col
-                        for col in df.columns
-                    ]
-                    if "index" in df.columns:
-                        df = df.rename(columns={"index": "Datetime"})
-
-                    # Ensure required columns
-                    required_cols = ["Datetime", "Open", "High", "Low", "Close", "Volume"]
-                    if all(col in df.columns for col in required_cols):
-                        df = df[required_cols]
-
-                        # Cache the data
-                        self.cache_data(symbol, date_str, interval, df)
-                        all_data.append(df)
-                        print(f"Downloaded {symbol} data for {date_str} ({len(df)} bars)")
-                    else:
-                        print(f"Warning: Missing columns for {symbol} on {date_str}")
-                else:
-                    print(f"No data for {symbol} on {date_str}")
-
-            except Exception as e:
-                print(f"Error downloading {symbol} for {date_str}: {e}")
+            # No provider download here; rely on cache populated by StockData.org tool
+            # Suppress missing-cache logs on weekends (Saturday=5, Sunday=6)
+            if current.weekday() < 5:
+                print(f"No cached data for {symbol} {interval} on {date_str}")
 
             current += timedelta(days=1)
 
@@ -178,75 +148,36 @@ class DataCache:
 
     def _download_1m_data(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
         """
-        Download 1-minute data. yfinance only allows 7 days at a time for 1m data.
+        Load 1-minute data from local cache only.
 
-        Args:
-            symbol: Stock ticker symbol
-            start: Start datetime
-            end: End datetime
+            Args:
+                symbol: Stock ticker symbol
+                start: Start datetime
+                end: End datetime
 
-        Returns:
-            DataFrame with 1-minute OHLCV data
+            Returns:
+                DataFrame with 1-minute OHLCV data
         """
         all_data = []
 
-        # Download in 7-day chunks
+        # Download day by day for 1-minute as well, staying within Yahoo's 30-day limit
         current = start
         while current <= end:
-            chunk_end = min(current + timedelta(days=7), end + timedelta(days=1))
+            date_str = current.strftime("%Y-%m-%d")
 
-            # Check cache for each day in the chunk
-            chunk_start_date = current.strftime("%Y-%m-%d")
-
-            # Try cache first
-            cached_df = self.get_cached_data(symbol, chunk_start_date, "1m")
+            # Check cache only (supports 1m and legacy 1min)
+            cached_df = self.get_cached_data(symbol, date_str, "1m")
             if cached_df is not None and not cached_df.empty:
                 all_data.append(cached_df)
-                current = chunk_end
+                current += timedelta(days=1)
                 continue
 
-            # Download from yfinance
-            try:
-                ticker = yf.Ticker(symbol)
-                df = ticker.history(
-                    start=current.strftime("%Y-%m-%d"),
-                    end=chunk_end.strftime("%Y-%m-%d"),
-                    interval="1m",
-                    prepost=False,
-                )
+            # No provider download here; rely on cache populated by StockData.org tool
+            # Suppress missing-cache logs on weekends (Saturday=5, Sunday=6)
+            if current.weekday() < 5:
+                print(f"No cached 1m data for {symbol} on {date_str}")
 
-                if not df.empty:
-                    # Standardize column names
-                    df = df.reset_index()
-                    df.columns = [
-                        col.replace("Datetime", "Datetime") if "Datetime" in col else col
-                        for col in df.columns
-                    ]
-                    if "index" in df.columns:
-                        df = df.rename(columns={"index": "Datetime"})
-
-                    # Ensure required columns
-                    required_cols = ["Datetime", "Open", "High", "Low", "Close", "Volume"]
-                    if all(col in df.columns for col in required_cols):
-                        df = df[required_cols]
-
-                        # Cache the data
-                        self.cache_data(symbol, chunk_start_date, "1m", df)
-                        all_data.append(df)
-                        print(
-                            f"Downloaded {symbol} 1m data for {chunk_start_date} ({len(df)} bars)"
-                        )
-                    else:
-                        print(
-                            f"Warning: Missing columns for {symbol} 1m data on {chunk_start_date}"
-                        )
-                else:
-                    print(f"No 1m data for {symbol} starting {chunk_start_date}")
-
-            except Exception as e:
-                print(f"Error downloading {symbol} 1m data for {chunk_start_date}: {e}")
-
-            current = chunk_end
+            current += timedelta(days=1)
 
         # Combine all data
         if all_data:
@@ -272,6 +203,8 @@ class BacktestEngine:
         display_tzinfo=None,
         tz_label: str = "UTC",
         retest_vol_threshold: float = 0.15,
+        pipeline_level: int = 0,
+        no_trades: bool = False,
     ):
         """
         Initialize backtest engine
@@ -281,6 +214,11 @@ class BacktestEngine:
             position_size_pct: Percentage of capital per trade (0.1 = 10%)
             max_positions: Maximum number of concurrent positions
             scan_window_minutes: Rolling window for scanning (default: 180 = 3 hours)
+            pipeline_level: Pipeline strictness level
+                           Level 0: Candidates only (no trades, Stages 1-3)
+                           Level 1: Trades with base criteria (Stages 1-3, no ignition)
+                           Level 2+: Enhanced filtering (may include Stage 4)
+            no_trades: If True, only identify candidates without executing trades (Level 1+ only)
         """
         self.initial_capital = initial_capital
         self.position_size_pct = position_size_pct
@@ -299,12 +237,72 @@ class BacktestEngine:
         self.tz_label = tz_label
         self.retest_vol_threshold = retest_vol_threshold
 
+        # Pipeline level determines filtering strictness and trade behavior
+        # Level 0: Candidates only (no trades ever)
+        # Level 1+: Can execute trades (unless no_trades=True)
+        self.pipeline_level = int(pipeline_level)
+        self.no_trades = no_trades if pipeline_level > 0 else True  # Level 0 always no trades
+
+    def _load_1m_window(
+        self, symbol: str, center_time: pd.Timestamp, window_minutes: int = 90
+    ) -> pd.DataFrame:
+        """
+        Load 1-minute data for a window around a specific time (e.g., breakout).
+        Handles market close/open boundaries by loading multiple days if needed.
+
+        Args:
+            symbol: Stock ticker
+            center_time: The center time (e.g., breakout time)
+            window_minutes: Minutes to load before and after center_time
+
+        Returns:
+            DataFrame with 1-minute OHLCV data for the window
+        """
+        cache = DataCache(self.cache_dir)
+
+        # Calculate the date range we need (may span multiple days)
+        start_time = center_time - timedelta(minutes=window_minutes)
+        end_time = center_time + timedelta(minutes=window_minutes)
+
+        # Get unique dates we need to load
+        current = start_time.date()
+        end_date = end_time.date()
+        dates_needed = []
+
+        while current <= end_date:
+            # Skip weekends
+            if current.weekday() < 5:
+                dates_needed.append(current)
+            current += timedelta(days=1)
+
+        # Load all needed days
+        dfs = []
+        for date in dates_needed:
+            date_str = date.strftime("%Y-%m-%d")
+            cached = cache.get_cached_data(symbol, date_str, "1m")
+            if cached is not None and not cached.empty:
+                dfs.append(cached)
+
+        if not dfs:
+            return pd.DataFrame()
+
+        # Combine and filter to window
+        df = pd.concat(dfs, ignore_index=True)
+        df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+        df = df.sort_values("Datetime").reset_index(drop=True)
+
+        # Filter to the actual time window
+        df = df[(df["Datetime"] >= start_time) & (df["Datetime"] <= end_time)]
+
+        return df
+
     def _scan_continuous_data(
-        self, symbol: str, df_5m: pd.DataFrame, df_1m: pd.DataFrame
+        self, symbol: str, df_5m: pd.DataFrame, cache_dir: str = "cache"
     ) -> List[Dict]:
         """
-        Scan data using multi-timeframe approach:
+        Scan data using multi-timeframe approach with on-demand 1m loading:
         - Use 5-minute candles to identify opening range and breakouts
+        - Load 1-minute data on-demand when breakout detected
         - Switch to 1-minute candles for retest and ignition entry
 
         Relaxed criteria for backtesting (vs live scanning):
@@ -313,23 +311,20 @@ class BacktestEngine:
         - Tight candle: < 75% of breakout range (vs 50%)
 
         Args:
+            symbol: Stock ticker
             df_5m: DataFrame with 5-minute OHLCV data
-            df_1m: DataFrame with 1-minute OHLCV data
+            cache_dir: Cache directory for loading 1m data on-demand
 
         Returns:
             List of all detected signals
         """
         all_signals = []
+        self.cache_dir = cache_dir  # Store for _load_1m_window
 
         # Calculate 10-bar volume MA on 5-minute data (for breakout volume ratio)
         df_5m = df_5m.copy()
         df_5m["vol_ma"] = df_5m["Volume"].rolling(window=10, min_periods=1).mean()
         df_5m["Date"] = df_5m["Datetime"].dt.date
-
-        # Prepare 1-minute data
-        df_1m = df_1m.copy()
-        df_1m["Date"] = df_1m["Datetime"].dt.date
-        available_1m_dates = set(df_1m["Date"].unique())
 
         trading_days = df_5m["Date"].unique()
 
@@ -354,26 +349,6 @@ class BacktestEngine:
                 session_df_5m["tp_volume"].cumsum() / session_df_5m["Volume"].cumsum()
             )
 
-            # Check if we have 1-minute data for this day
-            has_1m_data = day in available_1m_dates
-
-            # Get 1-minute data for this day (if available)
-            if has_1m_data:
-                day_df_1m = df_1m[df_1m["Date"] == day].copy()
-                session_df_1m = day_df_1m[
-                    (day_df_1m["Datetime"].dt.strftime("%H:%M") >= "09:30")
-                    & (day_df_1m["Datetime"].dt.strftime("%H:%M") < "16:00")
-                ]
-
-                if len(session_df_1m) < 50:
-                    has_1m_data = False  # Not enough 1m data, fall back to 5m only
-            else:
-                session_df_1m = pd.DataFrame()
-
-            # Use first 5-minute candle as opening range
-            or_high = session_df_5m.iloc[0]["High"]
-            or_low = session_df_5m.iloc[0]["Low"]
-
             # Scan the first 90 minutes of 5-minute data for breakouts (18 bars)
             start_time = session_df_5m["Datetime"].iloc[0]
             end_time = start_time + timedelta(minutes=90)
@@ -384,114 +359,272 @@ class BacktestEngine:
             if len(scan_df_5m) < 10:
                 continue
 
-            # Require 1m data; skip day if missing
-            if not has_1m_data:
+            # Prepare 1m data for this day
+            # Prefer inline 1m (tests) else load on-demand from cache
+            session_start = session_df_5m["Datetime"].iloc[0]
+            if getattr(self, "_inline_df_1m", None) is not None:
+                df1 = self._inline_df_1m.copy()  # type: ignore[attr-defined]
+                df1["Datetime"] = pd.to_datetime(df1["Datetime"], errors="coerce")
+                # Filter by calendar day and typical session hours
+                session_df_1m = df1[
+                    (df1["Datetime"].dt.date == day)
+                    & (df1["Datetime"].dt.strftime("%H:%M") >= "09:00")
+                    & (df1["Datetime"].dt.strftime("%H:%M") <= "16:00")
+                ].copy()
+            else:
+                # Load 1m data with a window from 30 min before open to end of session
+                session_df_1m = self._load_1m_window(
+                    symbol=symbol,
+                    center_time=session_start + timedelta(minutes=195),  # Mid-session
+                    window_minutes=240,  # Cover full session plus buffer
+                )
+
+            if session_df_1m.empty or len(session_df_1m) < 50:
+                # No 1m data available for this day, skip
                 continue
 
-            # Use shared detection module to find setups (multi-timeframe only)
-            setups = scan_for_setups(
-                df_5m=scan_df_5m,
-                df_1m=session_df_1m,
-                or_high=or_high,
-                or_low=or_low,
-                vol_threshold=1.0,  # Backtest uses relaxed 1.0x threshold
+            if self.pipeline_level == 0:
+                # Level 0: Base pipeline - Delegate Stage 1-3 detection to shared pipeline
+                # (Ignition detection disabled at Level 0)
+                candidates = run_pipeline(
+                    session_df_5m=session_df_5m,
+                    session_df_1m=session_df_1m,
+                    breakout_window_minutes=90,
+                    retest_lookahead_minutes=30,
+                    pipeline_level=0,
+                )
+
+                for c in candidates:
+                    breakout_candle = c.get("breakout_candle", {})
+                    retest_candle = c.get("retest_candle", {})
+                    all_signals.append(
+                        {
+                            "ticker": symbol,
+                            "direction": c.get("direction"),
+                            "entry": None,
+                            "stop": None,
+                            "target": None,
+                            "risk": None,
+                            "level": c.get("level"),
+                            "datetime": c.get("retest_time"),
+                            "breakout_time_5m": c.get("breakout_time"),
+                            "vol_breakout_5m": getattr(breakout_candle, "Volume", None)
+                            if hasattr(breakout_candle, "__getitem__")
+                            else None,
+                            "vol_retest_1m": getattr(retest_candle, "Volume", None)
+                            if hasattr(retest_candle, "__getitem__")
+                            else None,
+                            "breakout_candle": {
+                                "Open": breakout_candle.get("Open")
+                                if hasattr(breakout_candle, "get")
+                                else None,
+                                "High": breakout_candle.get("High")
+                                if hasattr(breakout_candle, "get")
+                                else None,
+                                "Low": breakout_candle.get("Low")
+                                if hasattr(breakout_candle, "get")
+                                else None,
+                                "Close": breakout_candle.get("Close")
+                                if hasattr(breakout_candle, "get")
+                                else None,
+                                "Volume": breakout_candle.get("Volume")
+                                if hasattr(breakout_candle, "get")
+                                else None,
+                            },
+                            "retest_candle": {
+                                "Open": retest_candle.get("Open")
+                                if hasattr(retest_candle, "get")
+                                else None,
+                                "High": retest_candle.get("High")
+                                if hasattr(retest_candle, "get")
+                                else None,
+                                "Low": retest_candle.get("Low")
+                                if hasattr(retest_candle, "get")
+                                else None,
+                                "Close": retest_candle.get("Close")
+                                if hasattr(retest_candle, "get")
+                                else None,
+                                "Volume": retest_candle.get("Volume")
+                                if hasattr(retest_candle, "get")
+                                else None,
+                            },
+                        }
+                    )
+
+                # Proceed to next day
+                continue
+
+            # Use shared pipeline for Level 1+ (Stages 1-3; Stage 4 only at Level 2+)
+            pipeline_candidates = run_pipeline(
+                session_df_5m=session_df_5m,
+                session_df_1m=session_df_1m,
+                breakout_window_minutes=90,
+                retest_lookahead_minutes=30,
+                pipeline_level=self.pipeline_level,
             )
 
-            for setup in setups:
-                breakout_candle = setup["breakout"]["candle"]
-                retest_candle = setup["retest"]
-                ignition_candle = setup["ignition"]
-                direction = setup["direction"]
-                level = setup["level"]
-                breakout_time = setup["breakout"]["time"]
+            for cand in pipeline_candidates:
+                direction = cand.get("direction")
+                level = cand.get("level")
+                breakout_time = cand.get("breakout_time")
+                breakout_candle = cand.get("breakout_candle", {})
+                retest_candle = cand.get("retest_candle", {})
+                retest_time = pd.to_datetime(cand.get("retest_time"))
+
+                # Entry at the open of the next 1m candle after retest (Level 1 design)
+                next_bars = session_df_1m[session_df_1m["Datetime"] > retest_time]
+                if next_bars.empty:
+                    continue
+                entry_bar = next_bars.iloc[0]
+                entry_time = entry_bar["Datetime"]
+                entry = float(entry_bar.get("Open"))
 
                 breakout_up = direction == "long"
-
-                # Calculate entry, stop, target
-                entry = ignition_candle["High"] if breakout_up else ignition_candle["Low"]
-                stop = retest_candle["Low"] - 0.05 if breakout_up else retest_candle["High"] + 0.05
+                # Stop below/above retest candle with a 5c buffer
+                stop = (
+                    float(retest_candle.get("Low", entry)) - 0.05
+                    if breakout_up
+                    else float(retest_candle.get("High", entry)) + 0.05
+                )
                 risk = abs(entry - stop)
+                if risk == 0 or not pd.notna(risk):
+                    continue
                 target = entry + 2 * risk if breakout_up else entry - 2 * risk
 
-                # Calculate grading metadata
-                breakout_body_pct = abs(breakout_candle["Close"] - breakout_candle["Open"]) / (
-                    breakout_candle["High"] - breakout_candle["Low"]
-                )
-                breakout_vol_ratio = breakout_candle["Volume"] / breakout_candle["vol_ma"]
-                retest_vol_ratio = retest_candle["Volume"] / breakout_candle["Volume"]
-                ignition_body_pct = abs(ignition_candle["Close"] - ignition_candle["Open"]) / (
-                    ignition_candle["High"] - ignition_candle["Low"]
-                )
-                ignition_vol_ratio = ignition_candle["Volume"] / breakout_candle["Volume"]
+                # Grading metadata from breakout/retest only (ignition is post-entry)
+                try:
+                    breakout_body_pct = abs(
+                        float(breakout_candle.get("Close")) - float(breakout_candle.get("Open"))
+                    ) / max(
+                        float(breakout_candle.get("High")) - float(breakout_candle.get("Low")),
+                        1e-9,
+                    )
+                except Exception:
+                    breakout_body_pct = 0.0
+                try:
+                    breakout_vol_ratio = float(breakout_candle.get("Volume", 0.0)) / max(
+                        float(
+                            session_df_5m.loc[
+                                session_df_5m["Datetime"] == breakout_time, "vol_ma"
+                            ].iloc[0]
+                        ),
+                        1e-9,
+                    )
+                except Exception:
+                    breakout_vol_ratio = 0.0
+                try:
+                    retest_vol_ratio = float(retest_candle.get("Volume", 0.0)) / max(
+                        float(breakout_candle.get("Volume", 0.0)), 1e-9
+                    )
+                except Exception:
+                    retest_vol_ratio = 0.0
 
-                # Calculate distance to target achieved by ignition
-                if breakout_up:
-                    distance_to_target = (ignition_candle["High"] - entry) / (target - entry)
-                else:
-                    distance_to_target = (entry - ignition_candle["Low"]) / (entry - target)
+                signal = {
+                    "ticker": symbol,
+                    "direction": direction,
+                    "entry": entry,
+                    "stop": stop,
+                    "target": target,
+                    "risk": risk,
+                    "level": level,
+                    "datetime": entry_time,
+                    "breakout_time_5m": breakout_time,
+                    "vol_breakout_5m": breakout_candle.get("Volume"),
+                    "vol_retest_1m": retest_candle.get("Volume"),
+                    # Grading metadata
+                    "breakout_candle": breakout_candle,
+                    "retest_candle": retest_candle,
+                    "breakout_body_pct": breakout_body_pct,
+                    "breakout_vol_ratio": breakout_vol_ratio,
+                    "retest_vol_ratio": retest_vol_ratio,
+                }
 
-                all_signals.append(
-                    {
-                        "ticker": symbol,
-                        "direction": direction,
-                        "entry": entry,
-                        "stop": stop,
-                        "target": target,
-                        "risk": risk,
-                        "level": level,
-                        "datetime": ignition_candle["Datetime"],
-                        "breakout_time_5m": breakout_time,
-                        "vol_breakout_5m": breakout_candle["Volume"],
-                        "vol_retest_1m": retest_candle["Volume"],
-                        "vol_ignition_1m": ignition_candle["Volume"],
-                        "vwap": setup.get("vwap"),  # VWAP at breakout time
-                        # Grading metadata
-                        "breakout_candle": {
-                            "Open": breakout_candle["Open"],
-                            "High": breakout_candle["High"],
-                            "Low": breakout_candle["Low"],
-                            "Close": breakout_candle["Close"],
-                            "Volume": breakout_candle["Volume"],
-                        },
-                        "retest_candle": {
-                            "Open": retest_candle["Open"],
-                            "High": retest_candle["High"],
-                            "Low": retest_candle["Low"],
-                            "Close": retest_candle["Close"],
-                            "Volume": retest_candle["Volume"],
-                        },
-                        "ignition_candle": {
-                            "Open": ignition_candle["Open"],
-                            "High": ignition_candle["High"],
-                            "Low": ignition_candle["Low"],
-                            "Close": ignition_candle["Close"],
-                            "Volume": ignition_candle["Volume"],
-                        },
-                        "breakout_body_pct": breakout_body_pct,
-                        "breakout_vol_ratio": breakout_vol_ratio,
-                        "retest_vol_ratio": retest_vol_ratio,
-                        "ignition_body_pct": ignition_body_pct,
-                        "ignition_vol_ratio": ignition_vol_ratio,
-                        "distance_to_target": distance_to_target,
-                    }
-                )
+                # If Level 2+, attach ignition info when available (post-entry diagnostic only)
+                if self.pipeline_level >= 2 and "ignition_candle" in cand:
+                    ign = cand.get("ignition_candle") or {}
+                    signal.update(
+                        {
+                            "ignition_candle": ign,
+                            "vol_ignition_1m": ign.get("Volume"),
+                            # Post-entry metrics will be computed later at trade simulation
+                        }
+                    )
+
+                all_signals.append(signal)
 
         return all_signals
 
-    def run_backtest(self, symbol: str, df_5m: pd.DataFrame, df_1m: pd.DataFrame) -> Dict:
+    def run_backtest(
+        self, symbol: str, df_5m: pd.DataFrame, cache_dir: Optional[object] = "cache"
+    ) -> Dict:
         """
-        Run backtest on a single symbol's data using multi-timeframe approach
+        Run backtest on a single symbol's data using multi-timeframe approach.
+        1-minute data is loaded on-demand when breakouts are detected.
 
         Args:
             symbol: Stock ticker
             df_5m: DataFrame with 5-minute OHLCV data
-            df_1m: DataFrame with 1-minute OHLCV data
+            cache_dir: Either a cache directory (str, default "cache") or an inline
+                1m DataFrame (used by unit tests). Accepts positional DataFrame as third arg
+                for unit tests or keyword 'cache_dir' for CLI runs.
 
         Returns:
             Dictionary with backtest results
         """
-        # Get signals using multi-timeframe scanning approach
-        signals = self._scan_continuous_data(symbol, df_5m, df_1m)
+        # Configure 1m source (inline DataFrame for tests or cache directory)
+        inline_1m: Optional[pd.DataFrame] = None
+        selected_cache_dir = "cache"
+        if isinstance(cache_dir, pd.DataFrame):
+            inline_1m = cache_dir
+        elif isinstance(cache_dir, str):
+            selected_cache_dir = cache_dir
+        else:
+            selected_cache_dir = "cache"
+
+        # Stash inline 1m for the scan (used when provided by tests)
+        self._inline_df_1m = inline_1m
+
+        # Get signals using multi-timeframe scanning approach with on-demand 1m loading
+        signals = self._scan_continuous_data(symbol, df_5m, selected_cache_dir)
+
+        # Track candidates for all levels
+        candidates = [
+            {
+                "datetime": s.get("datetime"),
+                "direction": s.get("direction"),
+                "level": s.get("level"),
+                "breakout_time_5m": s.get("breakout_time_5m"),
+            }
+            for s in signals
+        ]
+        candidate_count = len(candidates)
+
+        # Level 0 OR no_trades: candidates only (no trades executed)
+        if self.no_trades:
+            level_msg = f"Level {self.pipeline_level}"
+            if self.pipeline_level > 0:
+                level_msg += " (no trades)"
+            print(f"Found {len(candidates)} candidates for {symbol} ({level_msg})")
+            for c in candidates[:10]:  # print first 10 per symbol for brevity
+                try:
+                    bt = pd.to_datetime(c.get("breakout_time_5m"))
+                    rt = pd.to_datetime(c.get("datetime"))
+                except Exception:
+                    bt = c.get("breakout_time_5m")
+                    rt = c.get("datetime")
+                print(f"  - {c.get('direction')} | level {c.get('level')} | 5m {bt} -> 1m {rt}")
+            return {
+                "symbol": symbol,
+                "total_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "total_pnl": 0.0,
+                "win_rate": 0.0,
+                "signals": signals,
+                "trades": [],
+                "candidates": candidates,
+                "candidate_count": candidate_count,
+            }
 
         if not signals:
             return {
@@ -502,6 +635,7 @@ class BacktestEngine:
                 "total_pnl": 0,
                 "win_rate": 0,
                 "signals": [],
+                "candidate_count": 0,
             }
 
         # Compute grades for each signal and optionally filter by min_grade
@@ -590,10 +724,17 @@ class BacktestEngine:
             if shares == 0:
                 continue
 
-            # Get price bars after entry to track if stop or target hit
-            future_bars = df_1m[df_1m["Datetime"] > entry_datetime].copy()
-            # Ensure time-ascending order
+            # Load 1m data for this trade: from entry time forward for a reasonable window
+            # to track exits. Load up to 1 day (390 market minutes) or until we find an exit.
+            future_bars = self._load_1m_window(
+                symbol=symbol,
+                center_time=entry_datetime + timedelta(minutes=195),  # Mid-day from entry
+                window_minutes=200,  # Cover rest of session plus next day if needed
+            )
+
+            # Filter to bars after entry
             if not future_bars.empty:
+                future_bars = future_bars[future_bars["Datetime"] > entry_datetime].copy()
                 future_bars = future_bars.sort_values("Datetime")
 
             if future_bars.empty:
@@ -779,6 +920,7 @@ class BacktestEngine:
             "win_rate": win_rate,
             "signals": graded_signals,
             "trades": trades,
+            "candidate_count": candidate_count,
         }
 
 
@@ -792,6 +934,7 @@ def format_results(results: List[Dict]) -> str:
     total_trades = 0
     total_winners = 0
     total_pnl = 0
+    total_candidates = 0
 
     for res in results:
         output.append(f"\n{res['symbol']}:")
@@ -800,10 +943,17 @@ def format_results(results: List[Dict]) -> str:
         output.append(f"  Losers: {res['losing_trades']}")
         output.append(f"  Win Rate: {res['win_rate']:.1%}")
         output.append(f"  Total P&L: ${res['total_pnl']:.2f}")
+        if "candidate_count" in res:
+            output.append(f"  Candidates: {res['candidate_count']}")
 
         total_trades += res["total_trades"]
         total_winners += res["winning_trades"]
         total_pnl += res["total_pnl"]
+        if "candidate_count" in res:
+            try:
+                total_candidates += int(res["candidate_count"])
+            except Exception:
+                pass
 
     output.append("\n" + "-" * 60)
     output.append("OVERALL:")
@@ -815,6 +965,8 @@ def format_results(results: List[Dict]) -> str:
         else "  Overall Win Rate: N/A"
     )
     output.append(f"  Total P&L: ${total_pnl:.2f}")
+    if total_candidates > 0:
+        output.append(f"  Candidates: {total_candidates}")
     output.append("=" * 60 + "\n")
 
     return "\n".join(output)
@@ -882,10 +1034,10 @@ def generate_markdown_trade_summary(
         lines.append("\n## Trade summary (all entries)\n")
     lines.append(f"_Timezone: {tz_label}_\n")
     lines.append(
-        f"| Date ({tz_label}) | Time | Symbol | Dir | Entry | Stop | Target | Exit | Outcome | "
-        "P&L | Shares |"
+        f"| Date ({tz_label}) | Entry Time | Exit Time | Time in trade (min) | "
+        "Symbol | Dir | Entry | Stop | Target | Exit | Outcome | P&L | Shares |"
     )
-    lines.append("|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|")
+    lines.append("|---|---|---|---:|---|---:|---:|---:|---:|---:|---|---:|---:|")
 
     total = 0
     winners = 0
@@ -900,6 +1052,30 @@ def generate_markdown_trade_summary(
 
         dt = tr["_entry_dt"].strftime("%Y-%m-%d")
         tm = tr["_entry_dt"].strftime("%H:%M:%S")
+
+        # Resolve exit time in requested timezone (best-effort)
+        exit_tm = ""
+        exit_dt_local = None
+        try:
+            raw_exit = tr.get("exit_time")
+            if raw_exit is not None:
+                exit_dt = pd.to_datetime(raw_exit)
+                if getattr(exit_dt, "tzinfo", None) is None:
+                    exit_dt = exit_dt.tz_localize("UTC")
+                exit_dt_local = exit_dt.tz_convert(tzinfo)
+                exit_tm = exit_dt_local.strftime("%H:%M:%S")
+        except Exception:
+            exit_tm = str(tr.get("exit_time", ""))
+
+        # Compute time in trade in whole minutes (ceil for sub-minute trades)
+        time_in_min = ""
+        try:
+            if exit_dt_local is not None and tr.get("_entry_dt") is not None:
+                delta = exit_dt_local - tr["_entry_dt"]
+                secs = max(0.0, float(delta.total_seconds()))
+                time_in_min = str(int(math.ceil(secs / 60.0)))
+        except Exception:
+            time_in_min = ""
         sym = tr.get("symbol", "?")
         dirn = tr.get("direction", "?")
 
@@ -915,6 +1091,8 @@ def generate_markdown_trade_summary(
                 [
                     dt,
                     tm,
+                    exit_tm,
+                    time_in_min,
                     sym,
                     dirn,
                     f(tr.get("entry")),
@@ -969,7 +1147,10 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     parser.add_argument("--start", required=False, default=None, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", required=False, default=None, help="End date (YYYY-MM-DD)")
     parser.add_argument(
-        "--initial-capital", type=float, default=7500, help="Initial capital (default: 7500)"
+        "--initial-capital",
+        type=float,
+        default=DEFAULT_INITIAL_CAPITAL,
+        help=f"Initial capital (default: {DEFAULT_INITIAL_CAPITAL} from config.json if set)",
     )
     parser.add_argument(
         "--position-size",
@@ -1008,6 +1189,27 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
             "Default: disabled (all trades listed)."
         ),
     )
+    parser.add_argument(
+        "--level",
+        type=int,
+        default=0,
+        choices=[0, 1, 2, 3, 4, 5],
+        help=(
+            "Pipeline level (0-5, default: 0): "
+            "Level 0: Candidates only (Stages 1-3: OR, Breakout, Retest), no trades. "
+            "Level 1: Trades with base criteria (Stages 1-3), entry on open after retest. "
+            "Level 2+: Enhanced filtering (may include Stage 4: Ignition)."
+        ),
+    )
+    parser.add_argument(
+        "--no-trades",
+        action="store_true",
+        default=False,
+        help=(
+            "For Level 1+: identify candidates without executing trades. "
+            "Level 0 always runs in no-trades mode."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1026,9 +1228,14 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     if not start_date or not end_date:
         parser.error("Either provide --start and --end, or use --last-days N")
 
+    pipeline_level = args.level
+
     print(f"Backtesting symbols: {', '.join(symbols)}")
     print(f"Date range: {start_date} to {end_date}")
     print(f"Initial capital: ${args.initial_capital:,.2f}")
+    print(f"Pipeline Level: {pipeline_level}")
+    if args.no_trades and pipeline_level > 0:
+        print("Mode: Candidates only (no trades)")
     print()
 
     # Initialize components
@@ -1049,9 +1256,30 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         display_tzinfo=display_tz,
         tz_label=tz_label,
         retest_vol_threshold=RETEST_VOL_GATE,
+        pipeline_level=pipeline_level,
+        no_trades=args.no_trades,
     )
 
     results = []
+
+    # Run cache integrity check for the requested symbols/date range before processing
+    try:
+        ic_summary = integrity_check_range(
+            cache_dir=Path(args.cache_dir),
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            intervals=["1m", "5m"],
+            cross_interval=True,
+            skip_weekends=True,
+        )
+        print(
+            "Cache integrity (requested range): "
+            f"checked={ic_summary.get('checked_files')} errors={ic_summary.get('errors')} "
+            f"warnings={ic_summary.get('warnings')} missing={ic_summary.get('missing_files')}"
+        )
+    except Exception as e:
+        print(f"Cache integrity check skipped due to error: {e}")
 
     # Run backtest for each symbol
     for symbol in symbols:
@@ -1073,35 +1301,10 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
             continue
 
         print(f"Loaded {len(df_5m)} 5-minute bars for {symbol}")
+        print("Note: 1-minute data will be loaded on-demand when breakouts are detected")
 
-        # Download/load 1-minute data (limited to last 30 days due to Yahoo Finance constraint)
-        print("Downloading 1-minute data...")
-        # Calculate the actual 1m data window (last 30 days max)
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-        start_1m_dt = max(
-            datetime.strptime(start_date, "%Y-%m-%d"),
-            end_dt - timedelta(days=29),  # 30 days including end date
-        )
-        start_1m_date = start_1m_dt.strftime("%Y-%m-%d")
-
-        if start_1m_date != start_date:
-            print(f"Note: 1m data limited to last 30 days ({start_1m_date} to {end_date})")
-
-        df_1m = cache.download_data(
-            symbol=symbol,
-            start_date=start_1m_date,
-            end_date=end_date,
-            interval="1m",
-        )
-
-        if df_1m.empty:
-            print(f"No 1-minute data available for {symbol}")
-            continue
-
-        print(f"Loaded {len(df_1m)} 1-minute bars for {symbol}")
-
-        # Run backtest
-        result = engine.run_backtest(symbol, df_5m, df_1m)
+        # Run backtest with on-demand 1m loading
+        result = engine.run_backtest(symbol, df_5m, cache_dir=args.cache_dir)
         results.append(result)
 
     # Display results
