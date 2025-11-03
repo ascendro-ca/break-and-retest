@@ -8,7 +8,6 @@ omit =
     break_and_retest_live_scanner.py
     stockdata_retriever.py
     stockdata_test.py
-    twelvedata_test.py
     visualize_results.py
     find_break_and_retest.sh
     conftest.py

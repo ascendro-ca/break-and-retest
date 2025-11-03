@@ -1,8 +1,6 @@
 [tool.ruff]
 line-length = 100
-exclude = [
-	"twelvedata_test.py",
-]
+
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
