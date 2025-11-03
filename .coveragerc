@@ -9,6 +9,9 @@ omit =
     stockdata_retriever.py
     stockdata_test.py
     visualize_results.py
+    visualize_test_results.py
+    visualize_trade_results.py
+    plot_backtest_trades.py
     find_break_and_retest.sh
     conftest.py
     first_trade_analysis.py

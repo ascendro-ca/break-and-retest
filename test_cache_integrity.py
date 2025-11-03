@@ -19,12 +19,12 @@ def _df_1m_for_date(date_str: str, start_time: str = "09:30", bars: int = 10):
     times = [base_dt + timedelta(minutes=i) for i in range(bars)]
     df = pd.DataFrame(
         {
-       "Datetime": times,
-       "Open": [10 + i * 0.1 for i in range(bars)],
-       "High": [10 + i * 0.1 + 0.2 for i in range(bars)],
-       "Low": [10 + i * 0.1 - 0.2 for i in range(bars)],
-       "Close": [10 + i * 0.1 for i in range(bars)],
-       "Volume": [1000 for _ in range(bars)],
+            "Datetime": times,
+            "Open": [10 + i * 0.1 for i in range(bars)],
+            "High": [10 + i * 0.1 + 0.2 for i in range(bars)],
+            "Low": [10 + i * 0.1 - 0.2 for i in range(bars)],
+            "Close": [10 + i * 0.1 for i in range(bars)],
+            "Volume": [1000 for _ in range(bars)],
         }
     )
     return df
@@ -92,12 +92,12 @@ def test_integrity_gaps_alignment_and_ohlc(tmp_path):
     times = [base + timedelta(minutes=5 * i) for i in range(4)]  # 09:31, 09:36, 09:41, 09:46
     df = pd.DataFrame(
         {
-       "Datetime": times,
-       "Open": [10, 11, 12, 13],
-       "High": [10.5, 11.5, 12.5, 13.5],
-       "Low": [9.5, 10.5, 11.5, 12.5],
-       "Close": [10.2, 11.2, 12.2, 13.2],
-       "Volume": [100, 200, 300, 400],
+            "Datetime": times,
+            "Open": [10, 11, 12, 13],
+            "High": [10.5, 11.5, 12.5, 13.5],
+            "Low": [9.5, 10.5, 11.5, 12.5],
+            "Close": [10.2, 11.2, 12.2, 13.2],
+            "Volume": [100, 200, 300, 400],
         }
     )
     save_day(cache_dir, sym, d, "5m", df)
@@ -128,12 +128,12 @@ def test_integrity_duplicates_and_cross_interval(tmp_path):
     times.append(b)
     df1 = pd.DataFrame(
         {
-       "Datetime": times,
-       "Open": [10, 10.1, 10.3, 10],
-       "High": [10.2, 10.3, 10.5, 10.2],
-       "Low": [9.9, 10.0, 10.2, 9.9],
-       "Close": [10.1, 10.2, 10.4, 10.1],
-       "Volume": [100, 110, 120, 100],
+            "Datetime": times,
+            "Open": [10, 10.1, 10.3, 10],
+            "High": [10.2, 10.3, 10.5, 10.2],
+            "Low": [9.9, 10.0, 10.2, 9.9],
+            "Close": [10.1, 10.2, 10.4, 10.1],
+            "Volume": [100, 110, 120, 100],
         }
     )
     save_day(cache_dir, sym, d, "1m", df1)
@@ -143,12 +143,12 @@ def test_integrity_duplicates_and_cross_interval(tmp_path):
     # Create a mismatched 5m cache to trigger cross-interval warning
     df5 = pd.DataFrame(
         {
-       "Datetime": [b + timedelta(minutes=5)],  # Single bar at 09:35
-       "Open": [10.0],
-       "High": [10.6],
-       "Low": [9.8],
-       "Close": [10.5],
-       "Volume": [330],
+            "Datetime": [b + timedelta(minutes=5)],  # Single bar at 09:35
+            "Open": [10.0],
+            "High": [10.6],
+            "Low": [9.8],
+            "Close": [10.5],
+            "Volume": [330],
         }
     )
     save_day(cache_dir, sym, d, "5m", df5)
@@ -210,14 +210,16 @@ def test_save_and_load_preserves_utc_timezone(tmp_path):
     market_open_utc = datetime(2025, 7, 7, 13, 30, 0, tzinfo=ZoneInfo("UTC"))
     times = [market_open_utc + timedelta(minutes=i) for i in range(5)]
 
-    df = pd.DataFrame({
-        "Datetime": times,
-        "Open": [100.0, 101.0, 102.0, 103.0, 104.0],
-        "High": [100.5, 101.5, 102.5, 103.5, 104.5],
-        "Low": [99.5, 100.5, 101.5, 102.5, 103.5],
-        "Close": [100.2, 101.2, 102.2, 103.2, 104.2],
-        "Volume": [1000, 1100, 1200, 1300, 1400],
-    })
+    df = pd.DataFrame(
+        {
+            "Datetime": times,
+            "Open": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "High": [100.5, 101.5, 102.5, 103.5, 104.5],
+            "Low": [99.5, 100.5, 101.5, 102.5, 103.5],
+            "Close": [100.2, 101.2, 102.2, 103.2, 104.2],
+            "Volume": [1000, 1100, 1200, 1300, 1400],
+        }
+    )
 
     # Save to cache
     save_day(cache_dir, "TEST", "2025-07-07", "1m", df)

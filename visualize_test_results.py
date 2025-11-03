@@ -3,9 +3,9 @@
 Visualize Break & Re-Test signals on a candlestick chart
 
 Usage:
-    python3 break-and-retest/visualize_results.py --ticker AAPL --out /tmp/aapl_br.html
-    python3 break-and-retest/visualize_results.py --demo --demo-scenario long
-    python3 break-and-retest/visualize_results.py --show-test
+    python3 break-and-retest/visualize_test_results.py --ticker AAPL --out /tmp/aapl_br.html
+    python3 break-and-retest/visualize_test_results.py --demo --demo-scenario long
+    python3 break-and-retest/visualize_test_results.py --show-test
 
 This will run the scanner (first 90m) and plot detected signals with
 entry/stop/target and opening range.

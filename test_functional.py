@@ -28,7 +28,7 @@ def chdir_to_project_dir():
     """Ensure tests run from the project directory so relative paths resolve.
 
     Many functional tests assume execution from the `break-and-retest/` folder
-    where scripts like backtest.py and visualize_results.py live.
+    where scripts like backtest.py and visualize_test_results.py live.
     """
     prev_cwd = os.getcwd()
     os.chdir(Path(__file__).parent)
@@ -222,12 +222,12 @@ class TestBacktestEngine:
 
 
 class TestVisualization:
-    """Test visualize_results.py generation"""
+    """Test visualize_test_results.py generation"""
 
     def test_visualize_help(self, python_exe):
         """Test visualize --help displays usage"""
         result = subprocess.run(
-            [python_exe, "visualize_results.py", "--help"],
+            [python_exe, "visualize_test_results.py", "--help"],
             capture_output=True,
             text=True,
         )
@@ -240,7 +240,7 @@ class TestVisualization:
         result = subprocess.run(
             [
                 python_exe,
-                "visualize_results.py",
+                "visualize_test_results.py",
                 "--demo",
                 "--demo-scenario",
                 "long",
@@ -257,7 +257,7 @@ class TestVisualization:
         result = subprocess.run(
             [
                 python_exe,
-                "visualize_results.py",
+                "visualize_test_results.py",
                 "--demo",
                 "--demo-scenario",
                 "short",
@@ -274,7 +274,7 @@ class TestVisualization:
         result = subprocess.run(
             [
                 python_exe,
-                "visualize_results.py",
+                "visualize_test_results.py",
                 "--demo",
                 "--demo-scenario",
                 "long_fail",
@@ -291,7 +291,7 @@ class TestVisualization:
         result = subprocess.run(
             [
                 python_exe,
-                "visualize_results.py",
+                "visualize_test_results.py",
                 "--demo",
                 "--demo-scenario",
                 "short_fail",

@@ -166,8 +166,8 @@ def _resample_minute_to_five(minute_rows: List[Dict]) -> List[Dict]:
 
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
 
-        # Check if timestamps are from API (mislabeled UTC that's actually ET)
-        # or from cache (correct UTC)
+    # Check if timestamps are from API (mislabeled UTC that's actually ET)
+    # or from cache (correct UTC)
     # If already in correct UTC (from cache), no conversion needed
     # If from API with 'Z' (mislabeled), needs ET→UTC conversion
     current_tz = getattr(df["datetime"].dt, "tz", None)
@@ -278,11 +278,11 @@ def fetch_timeseries(
                 # Convert 1min cached day to rows and resample (preserve timezone)
                 rows = [
                     {
-                            "datetime": (
-                                r["Datetime"].isoformat()
-                                if hasattr(r["Datetime"], "isoformat")
-                                else str(r["Datetime"])
-                            ),
+                        "datetime": (
+                            r["Datetime"].isoformat()
+                            if hasattr(r["Datetime"], "isoformat")
+                            else str(r["Datetime"])
+                        ),
                         "open": r.get("Open"),
                         "high": r.get("High"),
                         "low": r.get("Low"),

@@ -13,7 +13,7 @@ if project_root not in sys.path:
 
 from break_and_retest_detection_mt import is_strong_body
 from break_and_retest_strategy import scan_ticker
-from visualize_results import create_chart
+from visualize_test_results import create_chart
 
 
 # --- Helper to simulate realistic 5-min OHLCV data ---
