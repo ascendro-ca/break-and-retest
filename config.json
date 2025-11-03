@@ -16,8 +16,8 @@
   "lookback": "2d",
   "session_start": "09:30",
   "session_end": "16:00",
-  "market_open_minutes": 90
-  ,
+  "market_open_minutes": 90,
+  "timezone": "PST",
   "retest_volume_gate_ratio": 0.15,
   "retest_B_level_epsilon_pct": 0.20,
   "retest_B_structure_soft": true,
