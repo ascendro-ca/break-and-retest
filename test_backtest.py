@@ -281,5 +281,114 @@ def test_multitimeframe_breakout_detection(sample_ohlcv_data_5m, sample_ohlcv_da
         assert signal["risk"] is None
 
 
+def test_level_1_no_grading_applied(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
+    """Test that Level 1 uses base criteria only, no grading filters"""
+    # Level 1: Base pipeline + trades (Stages 1-3), no grading
+    engine = BacktestEngine(
+        initial_capital=7500, position_size_pct=0.01, pipeline_level=1, min_grade=None
+    )
+
+    result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
+
+    # At Level 1, all signals matching base criteria should become trades
+    # Grading should not filter any signals
+    if len(result["signals"]) > 0:
+        signal = result["signals"][0]
+
+        # Level 1 should have entry/stop/target (trades enabled)
+        assert signal["entry"] is not None
+        assert signal["stop"] is not None
+        assert signal["target"] is not None
+        assert signal["risk"] is not None
+
+        # Grading fields should NOT be present (no compute_grades called)
+        assert "overall_grade" not in signal
+        assert "breakout_tier" not in signal
+        assert "breakout_grade" not in signal
+        assert "retest_grade" not in signal
+
+
+def test_level_1_position_sizing_risk_based(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
+    """Test that Level 1 uses 0.5% risk-based position sizing"""
+    initial_capital = 7500
+    engine = BacktestEngine(initial_capital=initial_capital, pipeline_level=1)
+
+    result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
+
+    if result["total_trades"] > 0 and len(result["trades"]) > 0:
+        trade = result["trades"][0]
+
+        # Calculate expected position size
+        entry = trade["entry"]
+        stop = trade["stop"]
+        risk_per_share = abs(entry - stop)
+        risk_amount = initial_capital * 0.005  # 0.5% risk
+        expected_shares = int(risk_amount / risk_per_share)
+
+        # Verify shares match 0.5% risk calculation
+        assert trade["shares"] == expected_shares or trade["shares"] == expected_shares + 1
+        # Allow ±1 share for rounding
+
+        # Verify total risk is approximately 0.5% of capital
+        total_risk = trade["shares"] * risk_per_share
+        risk_pct = total_risk / initial_capital
+        assert 0.004 <= risk_pct <= 0.006  # 0.4% to 0.6% tolerance
+
+
+def test_level_2_grading_applied(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
+    """Test that Level 2 applies grading and filters"""
+    # Level 2: Enhanced pipeline with grading
+    engine = BacktestEngine(
+        initial_capital=7500,
+        pipeline_level=2,
+        min_grade="B",  # Filter for B-grade or better
+    )
+
+    result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
+
+    # At Level 2, grading should be applied
+    if len(result["signals"]) > 0:
+        signal = result["signals"][0]
+
+        # Grading fields SHOULD be present at Level 2
+        assert "overall_grade" in signal
+        # min_grade filter should have removed C-grade signals
+        grade_order = {"C": 0, "B": 1, "A": 2, "A+": 3}
+        if signal.get("overall_grade"):
+            assert grade_order.get(signal["overall_grade"], 0) >= grade_order["B"]
+
+
+def test_level_0_vs_level_1_differences(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
+    """Test key differences between Level 0 (candidates) and Level 1 (trades)"""
+    # Level 0: Candidates only
+    engine_0 = BacktestEngine(initial_capital=7500, pipeline_level=0)
+    result_0 = engine_0.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
+
+    # Level 1: Trades with base criteria
+    engine_1 = BacktestEngine(initial_capital=7500, pipeline_level=1)
+    result_1 = engine_1.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
+
+    # Both should detect same number of candidates
+    assert len(result_0["signals"]) == len(result_1["signals"])
+
+    if len(result_0["signals"]) > 0:
+        sig_0 = result_0["signals"][0]
+        sig_1 = result_1["signals"][0]
+
+        # Level 0: No entry/stop/target (candidates only)
+        assert sig_0["entry"] is None
+        assert sig_0["stop"] is None
+        assert sig_0["target"] is None
+
+        # Level 1: Has entry/stop/target (trades)
+        assert sig_1["entry"] is not None
+        assert sig_1["stop"] is not None
+        assert sig_1["target"] is not None
+
+        # Neither should have grading at Level 0 or 1
+        assert "overall_grade" not in sig_0
+        assert "overall_grade" not in sig_1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

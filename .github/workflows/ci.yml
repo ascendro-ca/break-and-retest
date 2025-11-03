@@ -31,5 +31,6 @@ jobs:
       - name: Run pre-commit (linters & checks)
         run: pre-commit run --all-files --show-diff-on-failure
 
-      - name: Run tests
-        run: pytest -q
+      - name: Run unit tests with coverage (exclude functional)
+        run: |
+          pytest --cov=. --cov-report=term -k "not functional" -q

@@ -37,7 +37,7 @@ pip install -r requirements.txt
 2. Populate the cache (Stockdata.org; requires API key):
 
 ```bash
-python stockdata_test.py --symbols AAPL MSFT --intervals 1m 5m \
+python stockdata_retriever.py --symbols AAPL MSFT --intervals 1m 5m \
   --start 2025-10-15 --end 2025-10-16 --apikey $STOCK_DATA_API_KEY
 ```
 
@@ -121,7 +121,7 @@ The `--show-test` command groups and opens all test files from the same test run
 - Backtesting and data
   - `backtest.py` — backtesting engine with on‑demand 1m loading
   - `cache_utils.py` — cache I/O + integrity verification
-  - `stockdata_test.py` — Stockdata.org cache populator and integrity reporter
+  - `stockdata_retriever.py` — Stockdata.org cache populator and integrity reporter
 - Analysis and tooling
   - `first_trade_analysis.py` — “first trade of day” analysis
   - `visualize_results.py` — plot HTML/PNG; grouped test viewer
@@ -135,7 +135,7 @@ The backtesting engine allows you to test the Break & Re-Test strategy on histor
 
 ### Features
 - Memory‑efficient: loads 1‑minute windows on demand only when a 5m breakout is found
-- Cache‑only data access (populate via `stockdata_test.py` first)
+- Cache‑only data access (populate via `stockdata_retriever.py` first)
 - Multi‑symbol backtests with per‑symbol and overall stats
 - Configurable: initial capital, position sizing, pipeline level, grade filters
 
@@ -193,11 +193,11 @@ cache/
 Populate or repair cache with the Stockdata.org tool:
 ```bash
 # Populate 1m and 5m (5m is resampled from 1m when missing)
-python stockdata_test.py --symbols AAPL MSFT --intervals 1m 5m \
+python stockdata_retriever.py --symbols AAPL MSFT --intervals 1m 5m \
   --start 2025-10-15 --end 2025-10-16 --apikey $STOCK_DATA_API_KEY
 
 # Repair any accidental multi-day files in canonical cache
-python stockdata_test.py --repair-cache-splits
+python stockdata_retriever.py --repair-cache-splits
 ```
 
 Force refresh cached data in backtest (clears cache dir first):
@@ -217,6 +217,7 @@ pytest test_backtest.py -v
 - `--start` / `--end`: Date range (YYYY-MM-DD)
 - `--initial-capital`: Starting capital (default from `config.json` or 7500)
 - `--position-size`: Position size as % of capital (default: 0.1 = 10%)
+- `--leverage`: Max notional leverage (1.0 = no leverage). Caps shares so entry*shares <= cash*leverage
 - `--level`: Pipeline level (0=candidates only; 1=trades; 2+=enhanced)
 - `--min-grade`: Minimum overall grade to include (A+/A/B/C)
 - `--breakout-tier`: Filter by breakout tier (A/B/C)
@@ -255,7 +256,7 @@ OVERALL:
 ```
 
 ## Notes & Caveats
-- Data provider: Stockdata.org for intraday (minute/hour). Use `stockdata_test.py` to populate cache.
+- Data provider: Stockdata.org for intraday (minute/hour). Use `stockdata_retriever.py` to populate cache.
 - Canonical cache intervals are `1m` and `5m`. Legacy `*_1min/*_5min` can be normalized via `--normalize-cache`.
 - Backtester loads 1‑minute windows on demand only after detecting a 5m breakout.
 - Timestamps are normalized to America/New_York in cache for session alignment.

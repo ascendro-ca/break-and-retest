@@ -51,7 +51,7 @@ Unified helpers for reading/writing `cache/<SYMBOL>/<YYYY-MM-DD>_{1m|5m}.csv` an
 - Day‑file normalization and timestamp ordering
 - Gap/duplication/misalignment checks and cross‑interval 1m→5m consistency
 
-### 7) `stockdata_test.py` — Data Loader/Verifier
+### 7) `stockdata_retriever.py` — Data Loader/Verifier
 Stockdata.org fetcher that populates canonical cache and resamples 1m→5m when needed. Includes full‑cache integrity report and coverage summary.
 
 ## Configuration (`config.json`)
@@ -99,4 +99,4 @@ brk_long = prev["High"] <= or_high and row["Close"] > or_high and vol_ok and row
 Single sources of truth:
 - Detection: Stage modules + `trade_setup_pipeline`
 - Grading: `signal_grader.py`
-- Data: canonical cache via `cache_utils.py` and `stockdata_test.py`
+- Data: canonical cache via `cache_utils.py` and `stockdata_retriever.py`

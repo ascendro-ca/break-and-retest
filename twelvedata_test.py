@@ -2,14 +2,14 @@
 """
 This script has been removed. The project now uses Stockdata.org for intraday data.
 
-Please use stockdata_test.py instead.
+Please use stockdata_retriever.py instead.
 """
 
 # Early exit if executed directly
 if __name__ == "__main__":
-        import sys
-        print("twelvedata_test.py has been removed. Use stockdata_test.py instead.")
-        sys.exit(0)
+    import sys
+    print("twelvedata_test.py has been removed. Use stockdata_retriever.py instead.")
+    sys.exit(0)
 
 import argparse  # legacy (unused; kept for compatibility)
 import json  # legacy

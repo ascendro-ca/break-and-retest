@@ -156,3 +156,44 @@ def test_integrity_duplicates_and_cross_interval(tmp_path):
     # Run full cache as well to hit that path
     csum = integrity_check_cache(cache_dir, intervals=["1m", "5m"], cross_interval=True)
     assert csum["checked_files"] >= 2
+
+
+def test_canonical_interval_edge_cases():
+    """Test canonical_interval function with various inputs"""
+    from cache_utils import canonical_interval
+
+    # Test already canonical
+    assert canonical_interval("1m") == "1m"
+    assert canonical_interval("5m") == "5m"
+    assert canonical_interval("1h") == "1h"
+
+    # Test variations
+    assert canonical_interval("1min") == "1m"
+    assert canonical_interval("5min") == "5m"
+    assert canonical_interval("hour") == "1h"
+    assert canonical_interval("60min") == "1h"
+    assert canonical_interval("h") == "1h"
+
+    # Test pass-through for unknown intervals
+    assert canonical_interval("15m") == "15m"
+    assert canonical_interval("custom") == "custom"
+
+
+def test_get_cache_path_creates_directory(tmp_path):
+    """Test that get_cache_path creates symbol directory"""
+    from cache_utils import get_cache_path
+
+    cache_dir = tmp_path / "cache"
+    path = get_cache_path(cache_dir, "AAPL", "2025-11-02", "1m")
+
+    # Should create symbol directory
+    assert (cache_dir / "AAPL").exists()
+    assert path == cache_dir / "AAPL" / "2025-11-02_1m.csv"
+
+
+def test_load_cached_day_nonexistent(tmp_path):
+    """Test loading a day that doesn't exist in cache"""
+    from cache_utils import load_cached_day
+
+    result = load_cached_day(tmp_path, "TSLA", "2025-11-02", "1m")
+    assert result is None

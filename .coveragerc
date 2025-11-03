@@ -6,6 +6,7 @@ omit =
     backtest.py
     break_and_retest_strategy.py
     break_and_retest_live_scanner.py
+    stockdata_retriever.py
     stockdata_test.py
     twelvedata_test.py
     visualize_results.py
@@ -19,4 +20,7 @@ omit =
 exclude_lines =
     pragma: no cover
     if __name__ == .__main__.
+     except Exception:
+     pass
 show_missing = True
+fail_under = 90

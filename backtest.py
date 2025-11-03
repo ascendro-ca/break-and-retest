@@ -52,6 +52,7 @@ def load_config():
 CONFIG = load_config()
 DEFAULT_TICKERS = CONFIG["tickers"]
 DEFAULT_INITIAL_CAPITAL = CONFIG.get("initial_capital", 7500)
+DEFAULT_LEVERAGE = CONFIG.get("leverage", 2.0)
 RETEST_VOL_GATE = CONFIG.get("retest_volume_gate_ratio", 0.20)
 BREAKOUT_A_UW_MAX = CONFIG.get("breakout_A_upper_wick_max", 0.15)
 BREAKOUT_B_BODY_MAX = CONFIG.get("breakout_B_body_max", 0.65)
@@ -95,18 +96,18 @@ class DataCache:
         interval: str = "5m",
     ) -> pd.DataFrame:
         """
-        Load OHLCV data for a symbol and date range from local cache only.
+            Load OHLCV data for a symbol and date range from local cache only.
         This tool no longer downloads from Yahoo Finance; populate cache via
-        the StockData.org fetcher (stockdata_test.py) before running.
+        the StockData.org fetcher (stockdata_retriever.py) before running.
 
-        Args:
-            symbol: Stock ticker symbol
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            interval: Data interval (1m, 5m, 15m, 1h, 1d)
+            Args:
+                symbol: Stock ticker symbol
+                start_date: Start date (YYYY-MM-DD)
+                end_date: End date (YYYY-MM-DD)
+                interval: Data interval (1m, 5m, 15m, 1h, 1d)
 
-        Returns:
-            DataFrame with OHLCV data
+            Returns:
+                DataFrame with OHLCV data
         """
         all_data = []
 
@@ -196,6 +197,7 @@ class BacktestEngine:
         self,
         initial_capital: float = 10000,
         position_size_pct: float = 0.1,
+        leverage: float = 1.0,
         max_positions: int = 3,
         scan_window_minutes: int = 180,
         min_grade: Optional[str] = None,
@@ -211,9 +213,11 @@ class BacktestEngine:
 
         Args:
             initial_capital: Starting capital
-            position_size_pct: Percentage of capital per trade (0.1 = 10%)
+            position_size_pct: Percentage of capital risked per trade (0.1 = 10%)
             max_positions: Maximum number of concurrent positions
             scan_window_minutes: Rolling window for scanning (default: 180 = 3 hours)
+            leverage: Max notional leverage (1.0 = no leverage).
+                      Caps shares by notional <= cash * leverage
             pipeline_level: Pipeline strictness level
                            Level 0: Candidates only (no trades, Stages 1-3)
                            Level 1: Trades with base criteria (Stages 1-3, no ignition)
@@ -222,6 +226,7 @@ class BacktestEngine:
         """
         self.initial_capital = initial_capital
         self.position_size_pct = position_size_pct
+        self.leverage = max(0.0, float(leverage))
         self.max_positions = max_positions
         self.scan_window_minutes = scan_window_minutes
         self.cash = initial_capital
@@ -541,14 +546,17 @@ class BacktestEngine:
 
                 # If Level 2+, attach ignition info when available (post-entry diagnostic only)
                 if self.pipeline_level >= 2 and "ignition_candle" in cand:
-                    ign = cand.get("ignition_candle") or {}
-                    signal.update(
-                        {
-                            "ignition_candle": ign,
-                            "vol_ignition_1m": ign.get("Volume"),
-                            # Post-entry metrics will be computed later at trade simulation
-                        }
-                    )
+                    ign = cand.get("ignition_candle")
+                    if ign is not None:
+                        signal.update(
+                            {
+                                "ignition_candle": ign,
+                                "vol_ignition_1m": (
+                                    ign.get("Volume") if isinstance(ign, dict) else ign["Volume"]
+                                ),
+                                # Post-entry metrics will be computed later at trade simulation
+                            }
+                        )
 
                 all_signals.append(signal)
 
@@ -690,21 +698,29 @@ class BacktestEngine:
             )
             return sig
 
-        graded_signals = [compute_grades(dict(sig)) for sig in signals]
+        # Level 0 and 1: No grading, use base criteria only (stages 1-3)
+        # Level 2+: Apply grading and filters
+        if self.pipeline_level >= 2:
+            graded_signals = [compute_grades(dict(sig)) for sig in signals]
 
-        # Apply min_grade filter if provided
-        if self.min_grade:
-            order = {"C": 0, "B": 1, "A": 2, "A+": 3}
-            threshold = order.get(self.min_grade, 0)
-            graded_signals = [
-                s for s in graded_signals if order.get(s.get("overall_grade", "C"), 0) >= threshold
-            ]
+            # Apply min_grade filter if provided
+            if self.min_grade:
+                order = {"C": 0, "B": 1, "A": 2, "A+": 3}
+                threshold = order.get(self.min_grade, 0)
+                graded_signals = [
+                    s
+                    for s in graded_signals
+                    if order.get(s.get("overall_grade", "C"), 0) >= threshold
+                ]
 
-        # Apply breakout tier filter if specified
-        if self.breakout_tier_filter:
-            graded_signals = [
-                s for s in graded_signals if s.get("breakout_tier") == self.breakout_tier_filter
-            ]
+            # Apply breakout tier filter if specified
+            if self.breakout_tier_filter:
+                graded_signals = [
+                    s for s in graded_signals if s.get("breakout_tier") == self.breakout_tier_filter
+                ]
+        else:
+            # Level 0 or 1: Pass signals through without grading (convert to dicts)
+            graded_signals = [dict(sig) for sig in signals]
 
         trades = []
 
@@ -716,8 +732,9 @@ class BacktestEngine:
             direction = sig["direction"]
             entry_datetime = pd.to_datetime(sig["datetime"])
 
-            # Calculate position size
-            risk_per_trade = self.cash * self.position_size_pct
+            # Calculate position size: risk 0.5% of initial capital per trade
+            # shares = (initial_capital * 0.005) / abs(entry - stop)
+            risk_per_trade = self.initial_capital * 0.005  # Fixed 0.5% risk
             risk_per_share = abs(entry_price - stop_price)
             shares = int(risk_per_trade / risk_per_share) if risk_per_share > 0 else 0
 
@@ -870,39 +887,40 @@ class BacktestEngine:
                 }
             )
 
-            # Generate and print Scarface Rules report for this signal
-            report = generate_signal_report(
-                sig,
-                retest_volume_a_max_ratio=0.30,
-                retest_volume_b_max_ratio=0.60,
-                a_upper_wick_max=BREAKOUT_A_UW_MAX,
-                b_body_max=BREAKOUT_B_BODY_MAX,
-                b_level_epsilon_pct=RETEST_B_EPSILON,
-                b_structure_soft=RETEST_B_SOFT,
-            )
-            print("\n" + "=" * 70)
-            print(report)
-            # Print continuation diagnostics at exit for information purposes
-            if continuation_diag["continuation_grade"] is not None:
-                # Format ignition time in reporting timezone
-                ign_ts = continuation_diag["ignition_time"]
-                try:
-                    ign_ts = pd.to_datetime(ign_ts)
-                    if getattr(ign_ts, "tzinfo", None) is None:
-                        ign_ts = ign_ts.tz_localize("UTC")
-                    ign_ts_local = ign_ts.tz_convert(self.display_tz)
-                    ign_ts_str = ign_ts_local.strftime("%Y-%m-%d %H:%M:%S ") + self.tz_label
-                except Exception:
-                    ign_ts_str = str(ign_ts)
-                info_line = (
-                    f"Continuation (post-entry): {continuation_diag['continuation_desc']} "
-                    f"{continuation_diag['continuation_grade']} | "
-                    f"progress={continuation_diag['distance_to_target']:.0%}, "
-                    f"ign_vol_ratio={continuation_diag['ignition_vol_ratio']:.2f} at "
-                    f"{ign_ts_str}"
+            # Generate and print Scarface Rules report (Level 2+ only)
+            if self.pipeline_level >= 2:
+                report = generate_signal_report(
+                    sig,
+                    retest_volume_a_max_ratio=0.30,
+                    retest_volume_b_max_ratio=0.60,
+                    a_upper_wick_max=BREAKOUT_A_UW_MAX,
+                    b_body_max=BREAKOUT_B_BODY_MAX,
+                    b_level_epsilon_pct=RETEST_B_EPSILON,
+                    b_structure_soft=RETEST_B_SOFT,
                 )
-                print(info_line)
-            print("=" * 70 + "\n")
+                print("\n" + "=" * 70)
+                print(report)
+                # Print continuation diagnostics at exit for information purposes
+                if continuation_diag["continuation_grade"] is not None:
+                    # Format ignition time in reporting timezone
+                    ign_ts = continuation_diag["ignition_time"]
+                    try:
+                        ign_ts = pd.to_datetime(ign_ts)
+                        if getattr(ign_ts, "tzinfo", None) is None:
+                            ign_ts = ign_ts.tz_localize("UTC")
+                        ign_ts_local = ign_ts.tz_convert(self.display_tz)
+                        ign_ts_str = ign_ts_local.strftime("%Y-%m-%d %H:%M:%S ") + self.tz_label
+                    except Exception:
+                        ign_ts_str = str(ign_ts)
+                    info_line = (
+                        f"Continuation (post-entry): {continuation_diag['continuation_desc']} "
+                        f"{continuation_diag['continuation_grade']} | "
+                        f"progress={continuation_diag['distance_to_target']:.0%}, "
+                        f"ign_vol_ratio={continuation_diag['ignition_vol_ratio']:.2f} at "
+                        f"{ign_ts_str}"
+                    )
+                    print(info_line)
+                print("=" * 70 + "\n")
 
         # Calculate statistics
         total_trades = len(trades)
@@ -1156,7 +1174,16 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         "--position-size",
         type=float,
         default=0.1,
-        help="Position size as %% of capital (default: 0.1)",
+        help="Risk per trade as %% of capital (default: 0.1)",
+    )
+    parser.add_argument(
+        "--leverage",
+        type=float,
+        default=DEFAULT_LEVERAGE,
+        help=(
+            f"Max notional leverage (default: {DEFAULT_LEVERAGE}). "
+            "Caps shares so entry*shares <= cash*leverage"
+        ),
     )
     parser.add_argument("--cache-dir", default="cache", help="Cache directory (default: cache)")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh cached data")
@@ -1233,6 +1260,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     print(f"Backtesting symbols: {', '.join(symbols)}")
     print(f"Date range: {start_date} to {end_date}")
     print(f"Initial capital: ${args.initial_capital:,.2f}")
+    print(f"Leverage: {args.leverage}x")
     print(f"Pipeline Level: {pipeline_level}")
     if args.no_trades and pipeline_level > 0:
         print("Mode: Candidates only (no trades)")
@@ -1251,6 +1279,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     engine = BacktestEngine(
         initial_capital=args.initial_capital,
         position_size_pct=args.position_size,
+        leverage=args.leverage,
         min_grade=args.min_grade,
         breakout_tier_filter=args.breakout_tier,
         display_tzinfo=display_tz,
