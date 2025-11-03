@@ -13,6 +13,7 @@ Supported keys in config.json:
 
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -61,6 +62,9 @@ def get_display_timezone(config_dir: Path | None = None) -> Tuple[ZoneInfo, str]
 
     Reads config.json in the provided directory (or the script directory if None).
     Defaults to PDT if not configured or unmapped.
+
+    Note: Returns the configured abbreviation (e.g., "PST") which represents the timezone family.
+    For actual DST-aware abbreviations in reports, use get_timezone_label_for_date().
     """
     base_dir = config_dir if config_dir is not None else Path(__file__).parent
     config = _load_config(base_dir / "config.json")
@@ -81,3 +85,28 @@ def get_display_timezone(config_dir: Path | None = None) -> Tuple[ZoneInfo, str]
         abbrev = "UTC"
 
     return tzinfo, abbrev
+
+
+def get_timezone_label_for_date(
+    tzinfo: ZoneInfo, sample_date: datetime.datetime | None = None
+) -> str:
+    """
+    Get the actual timezone abbreviation (e.g., PST or PDT) for a given date.
+
+    Args:
+        tzinfo: The timezone to check
+        sample_date: A representative date to check DST status. If None, uses current time.
+
+    Returns:
+        The timezone abbreviation (e.g., "PDT" or "PST")
+    """
+    import datetime
+
+    if sample_date is None:
+        sample_date = datetime.datetime.now(tz=tzinfo)
+    elif sample_date.tzinfo is None:
+        sample_date = sample_date.replace(tzinfo=tzinfo)
+    else:
+        sample_date = sample_date.astimezone(tzinfo)
+
+    return sample_date.strftime("%Z")

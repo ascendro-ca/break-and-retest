@@ -35,18 +35,15 @@ def load_cached_day(
         return None
     try:
         df = pd.read_csv(path, parse_dates=["Datetime"], dtype={"Volume": float})
-        # standardize columns and timezone to America/New_York
+        # standardize columns and preserve timezone as stored (should be UTC)
         req = ["Datetime", "Open", "High", "Low", "Close", "Volume"]
         if all(c in df.columns for c in req):
             df = df[req].copy()
-            # Ensure tz-aware in America/New_York for consistency with market hours
-            ny = ZoneInfo("America/New_York")
-            # Convert to datetime first (if parse_dates missed or mixed types)
+            # Ensure tz-aware - if no timezone, assume UTC (stockdata.org provides UTC)
             df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
             if getattr(df["Datetime"].dt, "tz", None) is None:
-                df["Datetime"] = df["Datetime"].dt.tz_localize(ny)
-            else:
-                df["Datetime"] = df["Datetime"].dt.tz_convert(ny)
+                df["Datetime"] = df["Datetime"].dt.tz_localize("UTC")
+            # Keep in original timezone (UTC) - do NOT convert
             df = df.sort_values("Datetime")
         return df
     except Exception:
@@ -93,12 +90,10 @@ def _normalize_df_like(values: Union[pd.DataFrame, List[Dict]]) -> pd.DataFrame:
 
     if "Datetime" in df.columns:
         df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
-        # Normalize timezone to America/New_York
-        ny = ZoneInfo("America/New_York")
+        # Preserve timezone - if none, assume UTC
         if getattr(df["Datetime"].dt, "tz", None) is None:
-            df["Datetime"] = df["Datetime"].dt.tz_localize(ny)
-        else:
-            df["Datetime"] = df["Datetime"].dt.tz_convert(ny)
+            df["Datetime"] = df["Datetime"].dt.tz_localize("UTC")
+        # Keep in original timezone (UTC) - do NOT convert
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")

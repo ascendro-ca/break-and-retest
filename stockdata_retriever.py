@@ -163,7 +163,31 @@ def _resample_minute_to_five(minute_rows: List[Dict]) -> List[Dict]:
     df = pd.DataFrame(minute_rows)
     if df.empty or "datetime" not in df.columns:
         return []
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+
+        # Check if timestamps are from API (mislabeled UTC that's actually ET)
+        # or from cache (correct UTC)
+    # If already in correct UTC (from cache), no conversion needed
+    # If from API with 'Z' (mislabeled), needs ET→UTC conversion
+    current_tz = getattr(df["datetime"].dt, "tz", None)
+
+    if current_tz is not None and str(current_tz) == "UTC":
+        # Check if this looks like API data (09:30 UTC) or cache data (13:30 UTC)
+        # Market open in correct UTC should be around 13:30-14:30 depending on DST
+        sample_hour = df["datetime"].iloc[0].hour if len(df) > 0 else 0
+
+        if 8 <= sample_hour <= 11:
+            # Looks like mislabeled API data (09:30 labeled as UTC but actually ET)
+            df["datetime"] = df["datetime"].dt.tz_localize(None)
+            df["datetime"] = df["datetime"].dt.tz_localize("America/New_York")
+            df["datetime"] = df["datetime"].dt.tz_convert("UTC")
+        # else: already correct UTC from cache, keep as-is
+    elif current_tz is None:
+        # Timezone-naive, assume it's from API and is actually ET
+        df["datetime"] = df["datetime"].dt.tz_localize("America/New_York")
+        df["datetime"] = df["datetime"].dt.tz_convert("UTC")
+
     df = df.set_index("datetime").sort_index()
     # Use label='right' so each 5T bar ends at its timestamp (e.g., 09:35 covers 09:31-09:35)
     ohlc = (
@@ -202,7 +226,7 @@ def fetch_timeseries(
     start: datetime,
     end: datetime,
     apikey: str,
-    timezone: str = "America/New_York",
+    timezone: str = "America/New_York",  # Deprecated: timestamps stored in UTC
     max_per_minute: int = 8,
 ) -> List[Dict]:
     cache_dir = DEFAULT_CACHE_DIR
@@ -251,10 +275,14 @@ def fetch_timeseries(
         if cache_interval == "5m":
             cached_1m = _load_cached_day(cache_dir, symbol, day_str, "1m")
             if cached_1m is not None and not cached_1m.empty:
-                # Convert 1min cached day to rows and resample
+                # Convert 1min cached day to rows and resample (preserve timezone)
                 rows = [
                     {
-                        "datetime": pd.to_datetime(r["Datetime"]).tz_localize(None).isoformat(),
+                            "datetime": (
+                                r["Datetime"].isoformat()
+                                if hasattr(r["Datetime"], "isoformat")
+                                else str(r["Datetime"])
+                            ),
                         "open": r.get("Open"),
                         "high": r.get("High"),
                         "low": r.get("Low"),
@@ -339,15 +367,21 @@ def fetch_timeseries(
         if use_values:
             df = pd.DataFrame(use_values)
             if not df.empty:
-                # Parse and align to America/New_York before grouping into per-day files
+                # IMPORTANT: stockdata.org returns timestamps with 'Z' but they're actually ET
                 df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
                 try:
-                    # Ensure tz-aware UTC then convert to NY to avoid cross-date mismatches
-                    if getattr(df["datetime"].dt, "tz", None) is None:
-                        df["datetime"] = df["datetime"].dt.tz_localize("UTC")
-                    df["datetime"] = df["datetime"].dt.tz_convert("America/New_York")
+                    # If UTC-aware (from 'Z'), strip it and reinterpret as America/New_York
+                    if getattr(df["datetime"].dt, "tz", None) is not None:
+                        df["datetime"] = df["datetime"].dt.tz_localize(None)
+
+                    # Localize as America/New_York (actual API timezone)
+                    df["datetime"] = df["datetime"].dt.tz_localize("America/New_York")
+
+                    # Convert to UTC for storage
+                    df["datetime"] = df["datetime"].dt.tz_convert("UTC")
                 except Exception:
                     pass
+                # Use UTC date for grouping per-day files
                 df["_date"] = df["datetime"].dt.strftime("%Y-%m-%d")
                 for d, ddf in df.groupby("_date"):
                     _save_day(cache_dir, symbol, d, cache_interval, ddf.to_dict("records"))

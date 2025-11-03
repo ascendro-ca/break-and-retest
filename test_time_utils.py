@@ -1,6 +1,9 @@
+from datetime import datetime
 from pathlib import Path
 
-from time_utils import get_display_timezone
+from zoneinfo import ZoneInfo
+
+from time_utils import get_display_timezone, get_timezone_label_for_date
 
 
 def test_get_display_timezone_default(tmp_path: Path):
@@ -79,3 +82,52 @@ def test_get_display_timezone_malformed_json(tmp_path: Path):
     # Should fall back to default
     assert label in {"PDT", "UTC"}
     assert hasattr(tz, "key")
+
+
+def test_get_timezone_label_for_date_summer():
+    """Test that Pacific timezone shows PDT during summer (daylight saving time)"""
+    tz = ZoneInfo("America/Los_Angeles")
+    summer_date = datetime(2025, 7, 15, 12, 0, 0)  # July - daylight time
+    label = get_timezone_label_for_date(tz, summer_date)
+    assert label == "PDT"
+
+
+def test_get_timezone_label_for_date_winter():
+    """Test that Pacific timezone shows PST during winter (standard time)"""
+    tz = ZoneInfo("America/Los_Angeles")
+    winter_date = datetime(2025, 1, 15, 12, 0, 0)  # January - standard time
+    label = get_timezone_label_for_date(tz, winter_date)
+    assert label == "PST"
+
+
+def test_get_timezone_label_for_date_eastern_summer():
+    """Test that Eastern timezone shows EDT during summer"""
+    tz = ZoneInfo("America/New_York")
+    summer_date = datetime(2025, 7, 15, 12, 0, 0)
+    label = get_timezone_label_for_date(tz, summer_date)
+    assert label == "EDT"
+
+
+def test_get_timezone_label_for_date_eastern_winter():
+    """Test that Eastern timezone shows EST during winter"""
+    tz = ZoneInfo("America/New_York")
+    winter_date = datetime(2025, 1, 15, 12, 0, 0)
+    label = get_timezone_label_for_date(tz, winter_date)
+    assert label == "EST"
+
+
+def test_get_timezone_label_for_date_utc():
+    """Test that UTC always shows UTC regardless of date"""
+    tz = ZoneInfo("UTC")
+    summer_date = datetime(2025, 7, 15, 12, 0, 0)
+    winter_date = datetime(2025, 1, 15, 12, 0, 0)
+    assert get_timezone_label_for_date(tz, summer_date) == "UTC"
+    assert get_timezone_label_for_date(tz, winter_date) == "UTC"
+
+
+def test_get_timezone_label_for_date_no_date():
+    """Test that function works with no date provided (uses current time)"""
+    tz = ZoneInfo("America/Los_Angeles")
+    label = get_timezone_label_for_date(tz, None)
+    # Should return either PST or PDT depending on current date
+    assert label in {"PST", "PDT"}

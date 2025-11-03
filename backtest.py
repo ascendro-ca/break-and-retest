@@ -34,7 +34,7 @@ from signal_grader import (
     grade_retest,
     grade_risk_reward,
 )
-from time_utils import get_display_timezone
+from time_utils import get_display_timezone, get_timezone_label_for_date
 from trade_setup_pipeline import run_pipeline
 
 
@@ -483,6 +483,11 @@ class BacktestEngine:
                 entry_bar = next_bars.iloc[0]
                 entry_time = entry_bar["Datetime"]
                 entry = float(entry_bar.get("Open"))
+
+                # CRITICAL: Only enter trades within the first 90 minutes of regular market hours
+                # Market opens at 09:30 ET, so 90-minute window ends at 11:00 ET
+                if entry_time >= end_time:
+                    continue
 
                 breakout_up = direction == "long"
                 # Stop below/above retest candle with a 5c buffer
@@ -1030,6 +1035,11 @@ def generate_markdown_trade_summary(
 
     # Sort by entry datetime asc
     all_trades.sort(key=lambda x: x["_entry_dt"])
+
+    # Determine actual timezone label (PST vs PDT, EST vs EDT, etc.) based on first trade date
+    if all_trades and tz_label != "UTC":
+        sample_date = all_trades[0]["_entry_dt"]
+        tz_label = get_timezone_label_for_date(tzinfo, sample_date)
 
     # Optionally keep only one per day in specified timezone – earliest already due to sorting
     trades_for_summary = all_trades
