@@ -8,9 +8,13 @@ The backtester and live scanner share ALL detection and grading logic. Update on
 
 - Stage 1 — Opening Range: `stage_opening_range.detect_opening_range()`
 - Stage 2 — Breakout (5m): `stage_breakout.detect_breakouts()`
-  - Enforces VWAP alignment and volume >= 20‑SMA by default
+  - Enforces volume >= 20‑SMA by default
+  - Relaxed criteria with tolerance for gap continuations:
+    - Open tolerance: ≤ OR high + 0.25% (long) or ≥ OR low - 0.25% (short)
+    - Close tolerance: ≥ OR high - $0.01 (long) or ≤ OR low + $0.01 (short)
 - Stage 3 — Retest (1m): `stage_retest.detect_retest()`
   - Retest search strictly after breakout 5m candle closes
+  - Enforces VWAP alignment with 0.05% price buffer
 - Stage 4 — Ignition (1m): `stage_ignition.detect_ignition()` (Level 2+)
   - Post‑entry continuation; not required for Level 0/1
 
@@ -85,14 +89,24 @@ Avoid:
 - Cache integrity: `test_cache_integrity.py`
 - Backtest coverage: `test_backtest.py`
 
-## VWAP & Volume Filter (Stage 2)
+## Volume Filter (Stage 2) & VWAP Alignment (Stage 3)
 
-Applied in `stage_breakout.detect_breakouts()`:
+**Stage 2 - Breakout Volume Filter** applied in `stage_breakout.detect_breakouts()`:
 ```python
 vol_ok = float(row["Volume"]) >= float(row.get("vol_ma_20", 0.0))
-vwap_val = float(row.get("vwap", float("nan")))
-brk_long = prev["High"] <= or_high and row["Close"] > or_high and vol_ok and row["Close"] > vwap_val
+brk_long = prev["High"] <= or_high and row["Close"] > or_high and vol_ok
 ```
+
+**Stage 3 - VWAP Alignment Filter** applied in `stage_retest.detect_retest()`:
+```python
+vwap_buffer = abs(vwap_val) * 0.0005  # 0.05% price tolerance
+if direction == "long":
+    vwap_aligned = c >= (vwap_val - vwap_buffer)
+else:  # short
+    vwap_aligned = c <= (vwap_val + vwap_buffer)
+```
+
+**Rationale**: Moving VWAP alignment to the retest stage reduces false negatives at breakout while still ensuring institutional alignment at entry point. The 0.05% buffer provides reasonable tolerance for intrabar price action.
 
 ## Summary
 

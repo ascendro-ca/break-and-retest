@@ -6,9 +6,15 @@ Detects when price breaks beyond the opening range on a 5-minute candle.
 
 Base Criteria (always applied at Level 0/1):
 - Breakout candle is NOT the first 5m candle of the session
-- Breakout candle OPEN is inside the Opening Range (between OR low and OR high)
-- Breakout candle CLOSE beyond OR level (≥ OR high for long, ≤ OR low for short)
-- VWAP alignment: long close > VWAP, short close < VWAP
+- Breakout candle OPEN is inside OR or within small tolerance (gap continuation):
+  - Long: open ≤ OR high + 0.25% buffer (allows slight gap above)
+  - Short: open ≥ OR low - 0.25% buffer (allows slight gap below)
+- Breakout candle CLOSE beyond OR level with 1-tick tolerance:
+  - Long: close ≥ OR high - $0.01
+  - Short: close ≤ OR low + $0.01
+
+Note: VWAP alignment has been moved to Stage 3 (Retest) to reduce false negatives
+      and align with institutional logic for cleaner breakout-confirmation structure.
 
 Note: Volume confirmation (Volume ≥ 1.0× 20-period SMA) has been moved to
     Grade C criteria and is no longer enforced at the base filter for Level 0/1.
@@ -52,14 +58,18 @@ def base_breakout_filter(
     row: pd.Series, prev: pd.Series, or_high: float, or_low: float
 ) -> Optional[Tuple[str, float]]:
     """
-    Base breakout criteria (minimal/permissive).
+    Base breakout criteria (minimal/permissive with tolerance for gap continuations).
+
+    Allows:
+    1. Open inside OR with 0.25% tolerance (gap continuation cases)
+    2. Close beyond OR level with 1-tick ($0.01) tolerance
+
+    Note: VWAP alignment moved to retest stage for cleaner breakout detection.
 
     Returns:
         (direction, level) if breakout valid, else None
     """
-    # Base (Level 0/1) relaxed criteria
-    vwap_val = float(row.get("vwap", float("nan")))
-    # Open may be missing in some unit tests; if missing, skip the open-inside-OR constraint
+    # Base (Level 0/1) relaxed criteria with tolerance
     open_raw = row.get("Open")
     try:
         open_val = float(open_raw) if open_raw is not None else float("nan")
@@ -67,20 +77,29 @@ def base_breakout_filter(
         open_val = float("nan")
     close_val = float(row["Close"])
 
+    # Tolerance parameters
+    TICK_BUFFER = 0.01  # $0.01 tolerance for close
+    OPEN_GAP_PCT = 0.0025  # 0.25% tolerance for open (gap continuation)
+
     # 1) Not the first 5m candle – guaranteed by iteration in detect_breakouts (i>=1)
-    # 2) Open must be inside OR
-    opened_inside_or = (open_val >= or_low and open_val <= or_high) if pd.notna(open_val) else True
 
-    # 3) Close beyond OR level (inclusive)
-    close_beyond_long = close_val >= or_high
-    close_beyond_short = close_val <= or_low
+    # 2) Open must be inside OR with tolerance for gap continuations
+    if pd.notna(open_val):
+        or_high_buffer = or_high * (1 + OPEN_GAP_PCT)
+        or_low_buffer = or_low * (1 - OPEN_GAP_PCT)
+        opened_inside_or_long = open_val <= or_high_buffer
+        opened_inside_or_short = open_val >= or_low_buffer
+    else:
+        # If open is missing, allow (for compatibility with unit tests)
+        opened_inside_or_long = True
+        opened_inside_or_short = True
 
-    # 4) VWAP alignment
-    vwap_aligned_long = close_val > vwap_val
-    vwap_aligned_short = close_val < vwap_val
+    # 3) Close beyond OR level with 1-tick tolerance
+    close_beyond_long = close_val >= (or_high - TICK_BUFFER)
+    close_beyond_short = close_val <= (or_low + TICK_BUFFER)
 
-    brk_long = opened_inside_or and close_beyond_long and vwap_aligned_long
-    brk_short = opened_inside_or and close_beyond_short and vwap_aligned_short
+    brk_long = opened_inside_or_long and close_beyond_long
+    brk_short = opened_inside_or_short and close_beyond_short
 
     if brk_long:
         return ("long", or_high)

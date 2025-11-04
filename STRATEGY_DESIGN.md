@@ -46,7 +46,10 @@ The strategy employs a progressive filtering system across backtesting levels to
   2) A later 5m candle closes beyond OR (breakout)
   3) After the breakout 5m closes, the next valid 1m retest must tap the level
   4) The following 1m is the ignition candidate
-- Trend filter: VWAP-aligned breakout close (long: above VWAP, short: below VWAP).
+- VWAP alignment: Checked at retest stage (entry point) with 0.05% buffer
+  - Long: retest close ≥ VWAP - 0.05%
+  - Short: retest close ≤ VWAP + 0.05%
+  - Rationale: Reduces false negatives at breakout while confirming institutional flow at entry
 
 ## Retest Quality (Conceptual)
 

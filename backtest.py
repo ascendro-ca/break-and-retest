@@ -46,6 +46,7 @@ CONFIG = load_config()
 DEFAULT_TICKERS = CONFIG["tickers"]
 DEFAULT_INITIAL_CAPITAL = CONFIG.get("initial_capital", 7500)
 DEFAULT_LEVERAGE = CONFIG.get("leverage", 2.0)
+DEFAULT_RESULTS_DIR = CONFIG.get("backtest_results_dir", "backtest_results")
 RETEST_VOL_GATE = CONFIG.get("retest_volume_gate_ratio", 0.20)
 BREAKOUT_A_UW_MAX = CONFIG.get("breakout_A_upper_wick_max", 0.15)
 BREAKOUT_B_BODY_MAX = CONFIG.get("breakout_B_body_max", 0.65)
@@ -808,7 +809,7 @@ class BacktestEngine:
                 print(f"    Rejected (retest ❌): {rejected_retest}")
                 print(f"    Rejected (ignition ❌): {rejected_ignition}")
                 print(f"    Rejected (candle type): {rejected_candle_type}")
-                print(f"    After filter: {filtered_count} signals (passed C+ criteria)")
+                print(f"    After filter: {filtered_count} signals (passed >= C criteria)")
 
             # Apply min_grade filter if provided (A+/A/B/C overall grade)
             if self.min_grade:
@@ -1319,7 +1320,14 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     )
     parser.add_argument("--cache-dir", default="cache", help="Cache directory (default: cache)")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh cached data")
-    parser.add_argument("--output", help="Output JSON file for results")
+    parser.add_argument(
+        "--output", help="Output JSON file for results (saves to backtest_results/ by default)"
+    )
+    parser.add_argument(
+        "--console-only",
+        action="store_true",
+        help="Only output to console, do not save files (default: False - saves results)",
+    )
     parser.add_argument(
         "--min-grade",
         choices=["A+", "A", "B", "C"],
@@ -1485,14 +1493,26 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     )
     print(md_summary)
 
-    # Save results if output file specified
-    if args.output:
+    # Save results by default unless --console-only is specified
+    if not args.console_only:
         # Create backtest_results directory if it doesn't exist
-        results_dir = Path("backtest_results")
+        results_dir = Path(DEFAULT_RESULTS_DIR)
         results_dir.mkdir(exist_ok=True)
 
+        # Generate default filename if not specified
+        if args.output:
+            output_filename = args.output
+        else:
+            # Auto-generate filename based on parameters
+            symbols_str = "_".join(symbols) if len(symbols) <= 3 else "ALL"
+            start_str = start_date.replace("-", "")
+            end_str = end_date.replace("-", "")
+            level_str = f"level{args.level}"
+            grading_str = args.grading_system
+            output_filename = f"{level_str}_{symbols_str}_{start_str}_{end_str}_{grading_str}.json"
+
         # Construct output path in backtest_results directory
-        output_path = results_dir / args.output
+        output_path = results_dir / output_filename
 
         with open(output_path, "w") as f:
             json.dump(results, f, indent=2, default=str)

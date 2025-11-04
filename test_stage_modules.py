@@ -140,23 +140,25 @@ def test_base_breakout_filter_no_volume():
 
 
 def test_base_breakout_filter_vwap_alignment():
-    """Should reject long breakout if close is below VWAP"""
+    """VWAP alignment removed from breakout - now handled at retest stage"""
     prev = pd.Series({"High": 100.0, "Low": 99.0, "Close": 99.5, "Volume": 5000})
     row = pd.Series(
         {
+            "Open": 99.5,  # Inside OR
             "High": 101.5,
             "Low": 100.0,
-            "Close": 101.0,
+            "Close": 101.0,  # Beyond OR high
             "Volume": 10000,
             "vol_ma_20": 8000,
-            "vwap": 101.5,  # Close below VWAP
+            "vwap": 101.5,  # Close below VWAP - but this no longer blocks breakout
         }
     )
     or_high = 100.0
     or_low = 99.0
 
     result = base_breakout_filter(row, prev, or_high, or_low)
-    assert result is None
+    # Should now pass breakout even with close < VWAP since VWAP check moved to retest
+    assert result == ("long", 100.0)
 
 
 def test_detect_breakouts_within_window():
@@ -265,21 +267,41 @@ def test_breakout_with_existing_vol_ma():
 
 
 def test_base_retest_filter_long():
-    """Retest filter should accept long retest when close >= level"""
-    m1 = pd.Series({"Close": 100.5})
+    """Retest filter should accept long retest when close >= level and VWAP aligned"""
+    # Close >= level AND close >= VWAP - 0.05% buffer
+    m1 = pd.Series({"Close": 100.5, "vwap": 100.0})
     assert base_retest_filter(m1, "long", 100.0) is True
-    assert base_retest_filter(m1, "long", 101.0) is False
+
+    # Close >= level but below VWAP threshold
+    m1_below_vwap = pd.Series({"Close": 100.5, "vwap": 101.0})
+    # 101.0 - (101.0 * 0.0005) = 101.0 - 0.0505 = 100.9495
+    # Close 100.5 < 100.9495, so should fail
+    assert base_retest_filter(m1_below_vwap, "long", 100.0) is False
+
+    # Close < level
+    m1_below_level = pd.Series({"Close": 99.5, "vwap": 100.0})
+    assert base_retest_filter(m1_below_level, "long", 100.0) is False
 
 
 def test_base_retest_filter_short():
-    """Retest filter should accept short retest when close <= level"""
-    m1 = pd.Series({"Close": 99.5})
+    """Retest filter should accept short retest when close <= level and VWAP aligned"""
+    # Close <= level AND close <= VWAP + 0.05% buffer
+    m1 = pd.Series({"Close": 99.5, "vwap": 100.0})
     assert base_retest_filter(m1, "short", 100.0) is True
-    assert base_retest_filter(m1, "short", 99.0) is False
+
+    # Close <= level but above VWAP threshold
+    m1_above_vwap = pd.Series({"Close": 99.5, "vwap": 99.0})
+    # 99.0 + (99.0 * 0.0005) = 99.0 + 0.0495 = 99.0495
+    # Close 99.5 > 99.0495, so should fail
+    assert base_retest_filter(m1_above_vwap, "short", 100.0) is False
+
+    # Close > level
+    m1_above_level = pd.Series({"Close": 100.5, "vwap": 100.0})
+    assert base_retest_filter(m1_above_level, "short", 100.0) is False
 
 
 def test_detect_retest_after_breakout_close():
-    """Retest should only be detected after the 5m breakout closes"""
+    """Retest should only be detected after the 5m breakout closes and VWAP aligned"""
     breakout_time = pd.Timestamp("2025-11-02 09:40")
     times_1m = pd.date_range(breakout_time, periods=20, freq="1min")
 
@@ -297,13 +319,15 @@ def test_detect_retest_after_breakout_close():
             }
         )
     # After breakout close - valid retest at minute 6
+    # Need close >= level (100.0) AND close >= VWAP - 0.05%
+    # With the data above, VWAP ~100.93, so need close >= 100.88
     rows.append(
         {
             "Datetime": times_1m[6],
             "Open": 100.5,
-            "High": 100.8,
+            "High": 101.2,
             "Low": 100.2,
-            "Close": 100.4,  # Close above level (100.0)
+            "Close": 101.0,  # Close above level and above VWAP threshold
             "Volume": 1500,
         }
     )
@@ -320,6 +344,10 @@ def test_detect_retest_after_breakout_close():
         )
 
     df_1m = pd.DataFrame(rows)
+    # Add VWAP column (simplified - calculated from typical price)
+    df_1m["typical_price"] = (df_1m["High"] + df_1m["Low"] + df_1m["Close"]) / 3
+    df_1m["tp_volume"] = df_1m["typical_price"] * df_1m["Volume"]
+    df_1m["vwap"] = df_1m["tp_volume"].cumsum() / df_1m["Volume"].cumsum()
 
     result = detect_retest(
         df_1m,

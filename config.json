@@ -22,5 +22,6 @@
   "retest_B_level_epsilon_pct": 0.20,
   "retest_B_structure_soft": true,
   "breakout_A_upper_wick_max": 0.20,
-  "breakout_B_body_max": 0.72
+  "breakout_B_body_max": 0.72,
+  "backtest_results_dir": "backtest_results"
 }

@@ -378,8 +378,8 @@ pytest --cov=. --cov-report=html
 
 ### Core Pipeline Modules
 - **`stage_opening_range.py`** — Stage 1: Opening Range detection
-- **`stage_breakout.py`** — Stage 2: 5-minute breakout with VWAP + volume confirmation
-- **`stage_retest.py`** — Stage 3: 1-minute retest pattern detection
+- **`stage_breakout.py`** — Stage 2: 5-minute breakout with volume confirmation
+- **`stage_retest.py`** — Stage 3: 1-minute retest pattern detection with VWAP alignment (0.05% buffer)
 - **`stage_ignition.py`** — Stage 4: Post-entry continuation validation
 - **`trade_setup_pipeline.py`** — Orchestrates all 4 stages and pipeline levels
 

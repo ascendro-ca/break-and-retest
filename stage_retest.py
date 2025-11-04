@@ -10,6 +10,9 @@ Base Criteria (always applied):
 - First 1m candle whose body closes on the correct side of the level:
   - Long: close >= level
   - Short: close <= level
+- VWAP alignment with 0.05% buffer:
+  - Long: close >= VWAP - 0.05% buffer
+  - Short: close <= VWAP + 0.05% buffer
 - Retest must occur within the first 90 minutes of market open
   (and still after the breakout candle closes)
 
@@ -29,15 +32,45 @@ from typing import Callable, Dict, Optional
 import pandas as pd
 
 
+def _ensure_vwap(df: pd.DataFrame) -> pd.DataFrame:
+    """Add VWAP column if not present"""
+    if "vwap" in df.columns:
+        return df
+    df = df.copy()
+    df["typical_price"] = (df["High"] + df["Low"] + df["Close"]) / 3
+    df["tp_volume"] = df["typical_price"] * df["Volume"]
+    df["vwap"] = df["tp_volume"].cumsum() / df["Volume"].cumsum()
+    return df
+
+
 def base_retest_filter(m1: pd.Series, direction: str, level: float) -> bool:
     """
-    Base retest criteria (minimal/permissive).
+    Base retest criteria with VWAP alignment.
+
+    VWAP alignment reduces false negatives and aligns with institutional logic
+    for cleaner breakout-confirmation structure.
 
     Returns:
         True if the 1m candle qualifies as a valid retest close
     """
     c = float(m1.get("Close", 0.0))
-    return (direction == "long" and c >= level) or (direction == "short" and c <= level)
+    vwap_val = float(m1.get("vwap", float("nan")))
+
+    # Check if close is on correct side of level
+    level_check = (direction == "long" and c >= level) or (direction == "short" and c <= level)
+
+    if not level_check:
+        return False
+
+    # VWAP alignment with 0.05% buffer
+    vwap_buffer = abs(vwap_val) * 0.0005  # 0.05% = 0.0005
+
+    if direction == "long":
+        vwap_aligned = c >= (vwap_val - vwap_buffer)
+    else:  # short
+        vwap_aligned = c <= (vwap_val + vwap_buffer)
+
+    return vwap_aligned
 
 
 def detect_retest(
@@ -65,6 +98,9 @@ def detect_retest(
     """
     if session_df_1m is None or session_df_1m.empty:
         return None
+
+    # Ensure VWAP is calculated for retest filtering
+    session_df_1m = _ensure_vwap(session_df_1m)
 
     # Determine market open time (first timestamp in session data)
     market_open = session_df_1m.iloc[0]["Datetime"]

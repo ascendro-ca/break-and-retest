@@ -210,15 +210,18 @@ Reward: $1.08
 
 ## Step 7: Additional Filters
 
-### VWAP Trend Filter
-- **LONG**: Breakout 5m candle must close **above** VWAP
-- **SHORT**: Breakout 5m candle must close **below** VWAP
-- Ensures trade is aligned with intraday trend
-
 ### Volume Requirements
 - **Breakout volume**: Should be elevated (≥ 1.0× average)
 - **Retest volume**: Should be light (< 15% of breakout volume)
 - Light retest volume indicates lack of supply/demand absorption
+
+### VWAP Alignment Filter (Applied at Retest)
+- **LONG**: Retest candle close must be **≥ VWAP - 0.05%**
+- **SHORT**: Retest candle close must be **≤ VWAP + 0.05%**
+- Ensures trade is aligned with intraday institutional flow at entry point
+- 0.05% buffer provides reasonable tolerance for price action
+
+**Rationale**: VWAP alignment is checked at the retest stage rather than breakout stage to reduce false negatives while still confirming institutional alignment before entry.
 
 ---
 

@@ -8,13 +8,14 @@ This is the implementation companion to STRATEGY_SPEC.md. It defines concrete ru
 ## 1) Detection pipeline (sequencing)
 
 1. Compute Opening Range (OR) from the first 5m candle after 09:30.
-2. A 5m breakout occurs when the 5m close exceeds the OR boundary in the breakout direction and aligns with VWAP:
-   - Long: 5m close > OR High and 5m close > VWAP
-   - Short: 5m close < OR Low and 5m close < VWAP
+2. A 5m breakout occurs when the 5m close exceeds the OR boundary (with tolerance) in the breakout direction:
+   - Long: 5m open ≤ OR High + 0.25% AND 5m close ≥ OR High - $0.01
+   - Short: 5m open ≥ OR Low - 0.25% AND 5m close ≤ OR Low + $0.01
+   - Tolerances allow gap continuation breakouts and near-miss closes that maintain momentum
    - Optional: breakout volume ≥ 1.0× session 5m average
 3. Start the 1m retest search only after the breakout 5m candle closes:
    - retest_window_start = breakout_time + 5 minutes
-4. The first 1m candle whose wick touches or pierces the breakout level and whose close holds on the correct side (with ≤1 tick epsilon on the close side only) is the valid retest.
+4. The first 1m candle whose wick touches or pierces the breakout level, whose close holds on the correct side (with ≤1 tick epsilon on the close side only), and which aligns with VWAP (see below) is the valid retest.
 5. The very next 1m candle is the ignition candidate; grade its quality.
 
 ## 2) Key formulas
@@ -98,12 +99,13 @@ Helper:
 - Target:
   - target = entry ± 2 × (entry − stop)  # 2:1 R/R by default
 
-## 6) VWAP and breakout volume filters
+## 6) VWAP alignment and breakout volume filters
 
-- VWAP alignment is enforced on breakout candle (5m):
-  - Long: breakout close > VWAP
-  - Short: breakout close < VWAP
-- Breakout volume filter (recommended): breakout_vol ≥ 1.0× session 5m average
+- **VWAP alignment** is enforced at the **retest stage** (1m candle) with 0.05% buffer:
+  - Long: retest close ≥ VWAP - (VWAP × 0.0005)
+  - Short: retest close ≤ VWAP + (VWAP × 0.0005)
+  - Rationale: Confirms institutional flow alignment at entry point while reducing false negatives at breakout
+- **Breakout volume filter** (recommended): breakout_vol ≥ 1.0× session 5m average
 
 ## 7) Configuration parameters
 
@@ -119,15 +121,25 @@ Helper:
 ```python
 # Breakout (5m)
 for each 5m bar after OR:
-    if long_breakout(close, or_high, vwap, vol, vol_ma):
+    if long_breakout(close, or_high, vol, vol_ma):
         yield breakout(long, level=or_high, time=bar.time, breakout_vol=vol)
-    if short_breakout(close, or_low, vwap, vol, vol_ma):
+    if short_breakout(close, or_low, vol, vol_ma):
         yield breakout(short, level=or_low, time=bar.time, breakout_vol=vol)
 
 # Retest (1m) — begins only after breakout 5m bar closes
 start = breakout.time + timedelta(minutes=5)
 for m1 in one_minute_bars_from(start):
     if wick_touches(level, side) and close_holds_with_epsilon(m1, level, side, eps=1_tick):
+        # Check VWAP alignment at retest
+        vwap_buffer = abs(m1.vwap) * 0.0005  # 0.05%
+        if side == "long":
+            vwap_aligned = m1.close >= (m1.vwap - vwap_buffer)
+        else:  # short
+            vwap_aligned = m1.close <= (m1.vwap + vwap_buffer)
+
+        if not vwap_aligned:
+            continue
+
         grade = grade_retest(m1, breakout)
         if grade in {A, B}:
             retest = m1

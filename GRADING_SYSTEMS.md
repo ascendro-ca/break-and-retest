@@ -98,11 +98,13 @@ Score based on **1-minute ignition candle** type and volume.
 
 | Condition                                      | Points |
 |-----------------------------------------------|--------|
-| Breakout candle closes on correct side of VWAP (above for long / below for short) | +5 |
+| Retest candle closes aligned with VWAP (≥ VWAP - 0.05% for long / ≤ VWAP + 0.05% for short) | +5 |
 | Overall trend (15m/30m HTF) aligns with trade direction                         | +3 |
 | Pre-market / HTF level confluence (optional)                                   | +2 |
 
-**Example**: VWAP aligned (+5), HTF trend aligned (+3), HTF level matches breakout (+2) = **10/10**
+**Note**: VWAP alignment is checked at the retest stage (entry point) rather than breakout stage to reduce false negatives while confirming institutional flow alignment.
+
+**Example**: VWAP aligned at retest (+5), HTF trend aligned (+3), HTF level matches breakout (+2) = **10/10**
 
 ---
 
@@ -113,7 +115,8 @@ Score based on **1-minute ignition candle** type and volume.
 | 95–100      | A+        | Elite, high-probability setup  |
 | 86–95       | A         | Strong, tradeable setup        |
 | 70–85       | B         | Moderate confidence, needs confluence |
-| < 70        | C / Reject| Weak setup, avoid or wait      |
+| 56-69       | C         | Weak setup, should avoid or wait      |
+| < 55        | D / Reject| Very weak setup, definitely avoid or wait      |
 
 ---
 

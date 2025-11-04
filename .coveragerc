@@ -3,9 +3,13 @@ source =
     .
 omit =
     */test_*.py
-    backtest.py
+     analyze_breakout_patterns.py
+     analyze_losses.py
+     analyze_trade_patterns.py
+     backtest.py
     break_and_retest_strategy.py
     break_and_retest_live_scanner.py
+     compare_backtests.py
     stockdata_retriever.py
     stockdata_test.py
     visualize_results.py

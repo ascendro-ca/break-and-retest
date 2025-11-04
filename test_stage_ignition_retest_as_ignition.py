@@ -35,18 +35,13 @@ def test_retest_qualifies_as_ignition_long_perfect():
 
     # Session data with lower median volume
     session_times = pd.date_range("2025-11-02 09:30", periods=10, freq="1min")
-    session_df = pd.DataFrame(
-        [
-            {"Datetime": t, "Volume": 3000}
-            for t in session_times
-        ]
-    )
+    session_df = pd.DataFrame([{"Datetime": t, "Volume": 3000} for t in session_times])
 
     result = retest_qualifies_as_ignition(
         retest_candle=retest_candle,
         direction="long",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=session_df
+        session_df_1m=session_df,
     )
 
     assert result is True
@@ -65,18 +60,13 @@ def test_retest_qualifies_as_ignition_long_weak_body():
     )
 
     session_times = pd.date_range("2025-11-02 09:30", periods=10, freq="1min")
-    session_df = pd.DataFrame(
-        [
-            {"Datetime": t, "Volume": 3000}
-            for t in session_times
-        ]
-    )
+    session_df = pd.DataFrame([{"Datetime": t, "Volume": 3000} for t in session_times])
 
     result = retest_qualifies_as_ignition(
         retest_candle=retest_candle,
         direction="long",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=session_df
+        session_df_1m=session_df,
     )
 
     assert result is False
@@ -95,18 +85,13 @@ def test_retest_qualifies_as_ignition_long_wrong_directionality():
     )
 
     session_times = pd.date_range("2025-11-02 09:30", periods=10, freq="1min")
-    session_df = pd.DataFrame(
-        [
-            {"Datetime": t, "Volume": 3000}
-            for t in session_times
-        ]
-    )
+    session_df = pd.DataFrame([{"Datetime": t, "Volume": 3000} for t in session_times])
 
     result = retest_qualifies_as_ignition(
         retest_candle=retest_candle,
         direction="long",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=session_df
+        session_df_1m=session_df,
     )
 
     assert result is False
@@ -136,7 +121,7 @@ def test_retest_qualifies_as_ignition_long_low_volume():
         retest_candle=retest_candle,
         direction="long",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=session_df
+        session_df_1m=session_df,
     )
 
     assert result is False
@@ -155,18 +140,13 @@ def test_retest_qualifies_as_ignition_short_perfect():
     )
 
     session_times = pd.date_range("2025-11-02 09:30", periods=10, freq="1min")
-    session_df = pd.DataFrame(
-        [
-            {"Datetime": t, "Volume": 3000}
-            for t in session_times
-        ]
-    )
+    session_df = pd.DataFrame([{"Datetime": t, "Volume": 3000} for t in session_times])
 
     result = retest_qualifies_as_ignition(
         retest_candle=retest_candle,
         direction="short",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=session_df
+        session_df_1m=session_df,
     )
 
     assert result is True
@@ -185,18 +165,13 @@ def test_retest_qualifies_as_ignition_short_wrong_directionality():
     )
 
     session_times = pd.date_range("2025-11-02 09:30", periods=10, freq="1min")
-    session_df = pd.DataFrame(
-        [
-            {"Datetime": t, "Volume": 3000}
-            for t in session_times
-        ]
-    )
+    session_df = pd.DataFrame([{"Datetime": t, "Volume": 3000} for t in session_times])
 
     result = retest_qualifies_as_ignition(
         retest_candle=retest_candle,
         direction="short",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=session_df
+        session_df_1m=session_df,
     )
 
     assert result is False
@@ -218,7 +193,7 @@ def test_retest_qualifies_as_ignition_no_session_data():
         retest_candle=retest_candle,
         direction="long",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=None
+        session_df_1m=None,
     )
 
     assert result is True
@@ -242,7 +217,7 @@ def test_retest_qualifies_as_ignition_empty_session_data():
         retest_candle=retest_candle,
         direction="long",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=session_df
+        session_df_1m=session_df,
     )
 
     assert result is True
@@ -264,7 +239,7 @@ def test_retest_qualifies_as_ignition_zero_range():
         retest_candle=retest_candle,
         direction="long",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=None
+        session_df_1m=None,
     )
 
     # With zero range, body_pct will be 0, which is < 0.60
@@ -288,7 +263,7 @@ def test_retest_qualifies_as_ignition_exception_handling():
         retest_candle=retest_candle,
         direction="long",
         breakout_candle=create_breakout_candle(),
-        session_df_1m=None
+        session_df_1m=None,
     )
 
     # Should return False on exception

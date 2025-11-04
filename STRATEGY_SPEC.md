@@ -50,10 +50,22 @@ Breakout candle (09:35–09:40):
   - **Touches or pierces** the breakout level
   - **Closes on the correct side** (above for long, below for short)
   - Allows **≤ 1 tick** tolerance in automation
+  - **Aligns with VWAP** using 0.05% buffer:
+    - Long: close ≥ VWAP - 0.05%
+    - Short: close ≤ VWAP + 0.05%
 
 ### Timing Rule:
 ```python
 start_time = breakout_time + timedelta(minutes=5)
+```
+
+### VWAP Alignment:
+```python
+vwap_buffer = abs(vwap_val) * 0.0005  # 0.05%
+if direction == "long":
+    vwap_aligned = close >= (vwap_val - vwap_buffer)
+else:  # short
+    vwap_aligned = close <= (vwap_val + vwap_buffer)
 ```
 
 ---
@@ -140,16 +152,20 @@ target = entry ± 2 × (entry − stop)
 
 ## 8. 🧰 Step 7: Additional Filters
 
-### ✅ VWAP Trend Filter
-- Long: Breakout candle must close **above VWAP**
-- Short: Must close **below VWAP**
+### ✅ Volume Requirements
+- Breakout candle volume ≥ 1.0 × session average
+- Retest candle volume should be light (< 15% of breakout volume)
+
+### ✅ VWAP Alignment (Applied at Retest Stage)
+- Long: Retest candle close ≥ **VWAP - 0.05%**
+- Short: Retest candle close ≤ **VWAP + 0.05%**
 
 ```python
-valid_trend = (breakout_close > VWAP) if long else (breakout_close < VWAP)
+vwap_buffer = abs(vwap_val) * 0.0005  # 0.05% tolerance
+valid_alignment = (close >= vwap_val - vwap_buffer) if long else (close <= vwap_val + vwap_buffer)
 ```
 
-### ✅ Breakout Candle Volume Filter
-- Breakout candle volume ≥ 1.0 × session average
+**Rationale**: VWAP alignment checked at retest (entry point) rather than breakout reduces false negatives while maintaining institutional flow confirmation.
 
 ---
 
