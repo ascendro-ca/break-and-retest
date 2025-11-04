@@ -37,11 +37,84 @@ from typing import Callable, Dict, Optional
 import pandas as pd
 
 
+def retest_qualifies_as_ignition(
+    retest_candle: pd.Series,
+    direction: str,
+    breakout_candle: pd.Series,
+    session_df_1m: pd.DataFrame = None,
+) -> bool:
+    """
+    Check if retest candle meets ignition criteria (Case 2).
+
+    Uses the same grading logic as grade_continuation from points grading system:
+    - Strong body (marubozu/WRB-like)
+    - Good volume (retest candle itself has strong volume)
+
+    If retest qualifies as ignition, we can enter immediately without waiting for Stage 4.
+
+    Args:
+        retest_candle: The retest candle
+        direction: 'long' or 'short'
+        breakout_candle: The breakout candle (for reference, not used in current logic)
+        session_df_1m: Optional 1m session data for volume percentile checks
+
+    Returns:
+        True if retest candle qualifies as ignition (can bypass Stage 4)
+    """
+    try:
+        # Calculate body percentage (same as grading logic)
+        o = float(retest_candle.get("Open", 0.0))
+        h = float(retest_candle.get("High", 0.0))
+        low = float(retest_candle.get("Low", 0.0))
+        c = float(retest_candle.get("Close", 0.0))
+        rng = max(h - low, 1e-9)
+        body_pct = abs(c - o) / rng
+
+        # For retest-as-ignition, we want strong volume on the retest itself
+        # Since we're comparing ignition to retest, and retest IS ignition here,
+        # we need the retest to have strong absolute volume
+        retest_vol = float(retest_candle.get("Volume", 0.0))
+
+        # Require strong body (at least belt-hold level: 60% body)
+        if body_pct < 0.60:
+            return False
+
+        # Check directionality: close must be in correct direction
+        if direction == "long":
+            # For long: close should be in upper half of range
+            close_position = (c - low) / rng if rng > 0 else 0.0
+            if close_position < 0.5:
+                return False
+        else:
+            # For short: close should be in lower half of range
+            close_position = (c - low) / rng if rng > 0 else 0.0
+            if close_position > 0.5:
+                return False
+
+        # If session data available, check if retest volume is strong relative to session
+        if session_df_1m is not None and not session_df_1m.empty:
+            try:
+                session_volumes = session_df_1m["Volume"].dropna()
+                if len(session_volumes) > 0:
+                    # Require retest volume to be at least above median for retest-as-ignition
+                    if retest_vol < session_volumes.median():
+                        return False
+            except Exception:
+                pass
+
+        return True
+
+    except Exception:
+        return False
+
+
 def base_ignition_filter(
     m1: pd.Series, direction: str, retest_high: float, retest_low: float
 ) -> bool:
     """
     Base ignition criteria (minimal/permissive).
+
+    For Stage 4 ignition: Ignition must break beyond retest candle (wick or close).
 
     Args:
         m1: 1-minute candle
@@ -53,10 +126,10 @@ def base_ignition_filter(
         True if the candle qualifies as ignition
     """
     if direction == "long":
-        # For long, ignition must break above retest high
+        # For long, ignition must break above retest high (wick or close)
         return float(m1.get("High", 0.0)) > retest_high
     else:
-        # For short, ignition must break below retest low
+        # For short, ignition must break below retest low (wick or close)
         return float(m1.get("Low", 0.0)) < retest_low
 
 

@@ -4,3 +4,4 @@ yfinance
 plotly
 pytest
 kaleido
+TA-Lib

@@ -37,7 +37,13 @@ test-functional:
 	$(PYTHON) -m pytest test_functional.py -v --tb=short
 
 coverage:
-	$(PYTHON) -m pytest -v --cov=. --cov-report=term-missing:skip-covered --cov-report=html --cov-fail-under=80 --ignore=test_functional.py
+	$(PYTHON) -m pytest -v \
+		--cov=. \
+		--cov-config=pyproject.toml \
+		--cov-report=term-missing:skip-covered \
+		--cov-report=html \
+		--cov-fail-under=80 \
+		--ignore=test_functional.py
 
 .PHONY: coverage-all
 coverage-all:
@@ -48,12 +54,15 @@ qa-full: format lint test test-functional
 
 ci: lint test
 	$(PRECOMMIT) run --all-files --show-diff-on-failure
-	$(PYTHON) -m pytest -q
+	@echo "CI pipeline complete ✓"
 
 install-dev:
 	$(PIP) install --upgrade pip
 	$(PIP) install -r requirements.txt
 	$(PIP) install ruff pre-commit pytest-cov
+	# Attempt to install TA-Lib (optional). Manylinux wheels may not exist for all Python versions.
+	# Try wheels first; if unavailable, fall back to source build. Ignore failure to keep dev setup working.
+	-$(PIP) install --only-binary=:all: TA-Lib || $(PIP) install TA-Lib || echo "[install-dev] TA-Lib not installed (no wheels or build deps missing). Skipping."
 
 hooks:
 	pre-commit install

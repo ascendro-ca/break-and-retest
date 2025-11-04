@@ -45,7 +45,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import pandas as pd
 
 from stage_breakout import detect_breakouts
-from stage_ignition import detect_ignition
+from stage_ignition import detect_ignition, retest_qualifies_as_ignition
 from stage_opening_range import detect_opening_range
 from stage_retest import detect_retest
 
@@ -169,18 +169,39 @@ class TradeSetupPipeline:
             # STAGE 4: Ignition (Level 2+)
             # =====================================
             if self.pipeline_level >= 2:
-                ignition_result = detect_ignition(
-                    session_df_1m=session_df_1m,
-                    retest_time=retest_result["time"],
+                # Case 2: Check if retest candle qualifies as ignition
+                retest_is_ignition = retest_qualifies_as_ignition(
                     retest_candle=retest_result["candle"],
                     direction=brk["direction"],
-                    ignition_lookahead_minutes=self.ignition_lookahead_minutes,
-                    ignition_filter=self.ignition_filter,
+                    breakout_candle=brk["candle"],
+                    session_df_1m=session_df_1m,
                 )
 
-                if ignition_result is not None:
-                    candidate["ignition_time"] = ignition_result["time"]
-                    candidate["ignition_candle"] = ignition_result["candle"]
+                if retest_is_ignition:
+                    # Case 2: Retest qualifies as ignition - enter at next 1m candle open
+                    # Find the next 1m candle after retest
+                    next_candles = session_df_1m[session_df_1m["Datetime"] > retest_result["time"]]
+                    if not next_candles.empty:
+                        next_candle = next_candles.iloc[0]
+                        # Use next candle as "ignition" for entry timing
+                        candidate["ignition_time"] = next_candle["Datetime"]
+                        candidate["ignition_candle"] = next_candle
+                        candidate["retest_is_ignition"] = True
+                else:
+                    # Case 1: Retest doesn't qualify - search for Stage 4 ignition
+                    ignition_result = detect_ignition(
+                        session_df_1m=session_df_1m,
+                        retest_time=retest_result["time"],
+                        retest_candle=retest_result["candle"],
+                        direction=brk["direction"],
+                        ignition_lookahead_minutes=self.ignition_lookahead_minutes,
+                        ignition_filter=self.ignition_filter,
+                    )
+
+                    if ignition_result is not None:
+                        candidate["ignition_time"] = ignition_result["time"]
+                        candidate["ignition_candle"] = ignition_result["candle"]
+                        candidate["retest_is_ignition"] = False
 
             candidates.append(candidate)
 

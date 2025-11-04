@@ -25,17 +25,10 @@ from cache_utils import (
     save_day,
     integrity_check_range,
 )
-from signal_grader import (
-    calculate_overall_grade,
-    generate_signal_report,
-    grade_breakout_candle,
-    grade_continuation,
-    grade_market_context,
-    grade_retest,
-    grade_risk_reward,
-)
+from grading import get_grader
 from time_utils import get_display_timezone, get_timezone_label_for_date
 from trade_setup_pipeline import run_pipeline
+from stage_opening_range import detect_opening_range
 
 
 def load_config():
@@ -207,6 +200,7 @@ class BacktestEngine:
         retest_vol_threshold: float = 0.15,
         pipeline_level: int = 0,
         no_trades: bool = False,
+        grading_system: str = "points",
     ):
         """
         Initialize backtest engine
@@ -247,6 +241,8 @@ class BacktestEngine:
         # Level 1+: Can execute trades (unless no_trades=True)
         self.pipeline_level = int(pipeline_level)
         self.no_trades = no_trades if pipeline_level > 0 else True  # Level 0 always no trades
+        # Grading system
+        self.grader = get_grader(grading_system)
 
     def _load_1m_window(
         self, symbol: str, center_time: pd.Timestamp, window_minutes: int = 90
@@ -460,6 +456,10 @@ class BacktestEngine:
                 continue
 
             # Use shared pipeline for Level 1+ (Stages 1-3; Stage 4 only at Level 2+)
+            # Compute Opening Range once for the session (for OR-relative grading)
+            or_info = detect_opening_range(session_df_5m)
+            or_range = float(or_info.get("high", 0.0)) - float(or_info.get("low", 0.0))
+
             pipeline_candidates = run_pipeline(
                 session_df_5m=session_df_5m,
                 session_df_1m=session_df_1m,
@@ -476,13 +476,28 @@ class BacktestEngine:
                 retest_candle = cand.get("retest_candle", {})
                 retest_time = pd.to_datetime(cand.get("retest_time"))
 
-                # Entry at the open of the next 1m candle after retest (Level 1 design)
-                next_bars = session_df_1m[session_df_1m["Datetime"] > retest_time]
-                if next_bars.empty:
-                    continue
-                entry_bar = next_bars.iloc[0]
-                entry_time = entry_bar["Datetime"]
-                entry = float(entry_bar.get("Open"))
+                # Level 2+: Entry at ignition (Stage 4); Level 1: Entry at next bar after retest
+                if self.pipeline_level >= 2:
+                    # Wait for ignition before entering (or skip if no ignition detected)
+                    ignition_time_raw = cand.get("ignition_time")
+                    if not ignition_time_raw:
+                        continue  # No ignition detected, skip this signal
+                    entry_time = pd.to_datetime(ignition_time_raw)
+
+                    # Find the ignition bar to get entry price
+                    ignition_bars = session_df_1m[session_df_1m["Datetime"] == entry_time]
+                    if ignition_bars.empty:
+                        continue
+                    entry_bar = ignition_bars.iloc[0]
+                    entry = float(entry_bar.get("Open"))
+                else:
+                    # Level 1: Entry at the open of the next 1m candle after retest
+                    next_bars = session_df_1m[session_df_1m["Datetime"] > retest_time]
+                    if next_bars.empty:
+                        continue
+                    entry_bar = next_bars.iloc[0]
+                    entry_time = entry_bar["Datetime"]
+                    entry = float(entry_bar.get("Open"))
 
                 # CRITICAL: Only enter trades within the first 90 minutes of regular market hours
                 # Market opens at 09:30 ET, so 90-minute window ends at 11:00 ET
@@ -547,21 +562,62 @@ class BacktestEngine:
                     "breakout_body_pct": breakout_body_pct,
                     "breakout_vol_ratio": breakout_vol_ratio,
                     "retest_vol_ratio": retest_vol_ratio,
+                    # Opening Range (for body% of OR in Grade C checks)
+                    "or_range": or_range,
                 }
 
-                # If Level 2+, attach ignition info when available (post-entry diagnostic only)
+                # If Level 2+, attach ignition info when available
                 if self.pipeline_level >= 2 and "ignition_candle" in cand:
                     ign = cand.get("ignition_candle")
                     if ign is not None:
+                        ign_vol = ign.get("Volume") if isinstance(ign, dict) else ign["Volume"]
                         signal.update(
                             {
                                 "ignition_candle": ign,
-                                "vol_ignition_1m": (
-                                    ign.get("Volume") if isinstance(ign, dict) else ign["Volume"]
-                                ),
-                                # Post-entry metrics will be computed later at trade simulation
+                                "vol_ignition_1m": ign_vol,
                             }
                         )
+
+                        # Compute ignition metrics for grading
+                        try:
+                            ign_open = float(ign.get("Open"))
+                            ign_high = float(ign.get("High"))
+                            ign_low = float(ign.get("Low"))
+                            ign_close = float(ign.get("Close"))
+                            ign_range = max(ign_high - ign_low, 1e-9)
+                            ignition_body_pct = abs(ign_close - ign_open) / ign_range
+
+                            # Volume ratio: ignition vs RETEST (not breakout) per spec
+                            retest_vol_f = float(retest_candle.get("Volume", 0.0))
+                            ignition_vol_ratio = (
+                                float(ign_vol) / retest_vol_f if retest_vol_f > 0 else 0.0
+                            )
+
+                            # Distance to target (entry is at ignition open)
+                            if direction == "long":
+                                denom = target - entry
+                                progress = (ign_close - entry) / denom if denom != 0 else 0.0
+                            else:
+                                denom = entry - target
+                                progress = (entry - ign_close) / denom if denom != 0 else 0.0
+                            distance_to_target = max(0.0, min(1.0, float(progress)))
+
+                            signal.update(
+                                {
+                                    "ignition_body_pct": ignition_body_pct,
+                                    "ignition_vol_ratio": ignition_vol_ratio,
+                                    "distance_to_target": distance_to_target,
+                                }
+                            )
+                        except Exception:
+                            # If metrics can't be computed, set defaults
+                            signal.update(
+                                {
+                                    "ignition_body_pct": 0.0,
+                                    "ignition_vol_ratio": 0.0,
+                                    "distance_to_target": 0.0,
+                                }
+                            )
 
                 all_signals.append(signal)
 
@@ -658,7 +714,7 @@ class BacktestEngine:
             target = sig["target"]
             rr_ratio = abs(target - entry) / abs(entry - stop) if entry != stop else 0.0
 
-            breakout_grade, breakout_desc = grade_breakout_candle(
+            breakout_grade, breakout_desc = self.grader.grade_breakout_candle(
                 sig.get("breakout_candle", {}),
                 sig.get("breakout_vol_ratio", 0.0),
                 sig.get("breakout_body_pct", 0.0),
@@ -667,7 +723,7 @@ class BacktestEngine:
                 a_upper_wick_max=BREAKOUT_A_UW_MAX,
                 b_body_max=BREAKOUT_B_BODY_MAX,
             )
-            retest_grade, retest_desc = grade_retest(
+            retest_grade, retest_desc = self.grader.grade_retest(
                 sig.get("retest_candle", {}),
                 sig.get("retest_vol_ratio", 0.0),
                 sig.get("level", 0.0),
@@ -677,14 +733,14 @@ class BacktestEngine:
                 b_level_epsilon_pct=RETEST_B_EPSILON,
                 b_structure_soft=RETEST_B_SOFT,
             )
-            continuation_grade, continuation_desc = grade_continuation(
+            continuation_grade, continuation_desc = self.grader.grade_continuation(
                 sig.get("ignition_candle", {}),
                 sig.get("ignition_vol_ratio", 0.0),
                 sig.get("distance_to_target", 0.0),
                 sig.get("ignition_body_pct", 0.0),
             )
-            rr_grade, rr_desc = grade_risk_reward(rr_ratio)
-            market_grade, market_desc = grade_market_context("slightly_red")
+            rr_grade, rr_desc = self.grader.grade_risk_reward(rr_ratio)
+            market_grade, market_desc = self.grader.grade_market_context("slightly_red")
 
             grades = {
                 "breakout": breakout_grade,
@@ -693,7 +749,7 @@ class BacktestEngine:
                 "rr": rr_grade,
                 "market": market_grade,
             }
-            overall = calculate_overall_grade(grades)
+            overall = self.grader.calculate_overall_grade(grades)
             # Attach fields to signal
             sig["overall_grade"] = overall
             sig["component_grades"] = grades
@@ -703,12 +759,58 @@ class BacktestEngine:
             )
             return sig
 
-        # Level 0 and 1: No grading, use base criteria only (stages 1-3)
-        # Level 2+: Apply grading and filters
+        # Compute grades only for Level 2+ (grading is part of enhanced filtering/reporting)
         if self.pipeline_level >= 2:
             graded_signals = [compute_grades(dict(sig)) for sig in signals]
+        else:
+            graded_signals = list(signals)
 
-            # Apply min_grade filter if provided
+        # Initialize Level 2 rejection counters (included in results for Level 2+)
+        rejected_breakout = 0
+        rejected_retest = 0
+        rejected_ignition = 0
+        rejected_candle_type = 0
+
+        # Level 2+: Apply quality filters based on grades
+        if self.pipeline_level >= 2:
+            # Level 2 Quality Filter: Breakout, Retest, and Ignition must be grade C or higher
+            # Reject signals where any component grade is ❌ (D-grade)
+            pre_filter_count = len(graded_signals)
+            filtered_signals = []
+
+            for s in graded_signals:
+                breakout_grade = s.get("component_grades", {}).get("breakout", "❌")
+                retest_grade = s.get("component_grades", {}).get("retest", "❌")
+                continuation_grade = s.get("component_grades", {}).get("continuation", "❌")
+
+                # ❌ means D-grade (rejected/failed) - exclude these
+                if breakout_grade == "❌":
+                    rejected_breakout += 1
+                    continue  # Breakout failed minimum C criteria
+                if retest_grade == "❌":
+                    rejected_retest += 1
+                    continue  # Retest failed minimum C criteria
+                if continuation_grade == "❌":
+                    rejected_ignition += 1
+                    continue  # Ignition/Continuation failed minimum C criteria
+
+                # Signal passed Level 2 filters (all three stages at least C grade)
+                filtered_signals.append(s)
+
+            graded_signals = filtered_signals
+
+            # Print Level 2 filtering stats
+            if pre_filter_count > 0:
+                filtered_count = len(graded_signals)
+                print(f"  Level 2 Quality Filter for {symbol}:")
+                print(f"    Before filter: {pre_filter_count} signals")
+                print(f"    Rejected (breakout ❌): {rejected_breakout}")
+                print(f"    Rejected (retest ❌): {rejected_retest}")
+                print(f"    Rejected (ignition ❌): {rejected_ignition}")
+                print(f"    Rejected (candle type): {rejected_candle_type}")
+                print(f"    After filter: {filtered_count} signals (passed C+ criteria)")
+
+            # Apply min_grade filter if provided (A+/A/B/C overall grade)
             if self.min_grade:
                 order = {"C": 0, "B": 1, "A": 2, "A+": 3}
                 threshold = order.get(self.min_grade, 0)
@@ -723,9 +825,7 @@ class BacktestEngine:
                 graded_signals = [
                     s for s in graded_signals if s.get("breakout_tier") == self.breakout_tier_filter
                 ]
-        else:
-            # Level 0 or 1: Pass signals through without grading (convert to dicts)
-            graded_signals = [dict(sig) for sig in signals]
+        # Level 0 or 1: Grades are computed but no filtering applied
 
         trades = []
 
@@ -793,13 +893,13 @@ class BacktestEngine:
                     abs(ignition_close - ignition_open) / range_ if range_ > 0 else 0.0
                 )
 
-                # Volume ratio vs breakout 5m volume (if available on signal)
-                breakout_vol = sig.get("vol_breakout_5m")
+                # Volume ratio vs RETEST 1m volume (per spec, not breakout)
+                retest_vol = sig.get("vol_retest_1m")
                 try:
-                    breakout_vol_f = float(breakout_vol) if breakout_vol is not None else 0.0
+                    retest_vol_f = float(retest_vol) if retest_vol is not None else 0.0
                 except Exception:
-                    breakout_vol_f = 0.0
-                ignition_vol_ratio = ignition_vol / breakout_vol_f if breakout_vol_f > 0 else 0.0
+                    retest_vol_f = 0.0
+                ignition_vol_ratio = ignition_vol / retest_vol_f if retest_vol_f > 0 else 0.0
 
                 # Distance to target progress at ignition close
                 if direction == "long":
@@ -812,7 +912,7 @@ class BacktestEngine:
                 distance_to_target = max(0.0, min(1.0, float(progress)))
 
                 # Grade continuation (post-entry analysis only)
-                cont_grade, cont_desc = grade_continuation(
+                cont_grade, cont_desc = self.grader.grade_continuation(
                     {
                         "Open": ignition_open,
                         "High": ignition_high,
@@ -875,26 +975,40 @@ class BacktestEngine:
             else:  # short
                 pnl = (entry_price - exit_price) * shares
 
-            trades.append(
-                {
-                    "datetime": sig.get("datetime"),
-                    "direction": direction,
-                    "entry": entry_price,
-                    "exit": exit_price,
-                    "exit_time": str(exit_time),
-                    "stop": stop_price,
-                    "target": target_price,
-                    "shares": shares,
-                    "pnl": pnl,
-                    "outcome": outcome,
-                    # Continuation diagnostics (post-entry informational only)
-                    **{k: v for k, v in continuation_diag.items() if v is not None},
-                }
-            )
+            # Build trade dict with all available information
+            trade_dict = {
+                "datetime": sig.get("datetime"),
+                "direction": direction,
+                "entry": entry_price,
+                "exit": exit_price,
+                "exit_time": str(exit_time),
+                "stop": stop_price,
+                "target": target_price,
+                "shares": shares,
+                "pnl": pnl,
+                "outcome": outcome,
+                # Continuation diagnostics (post-entry informational only)
+                **{k: v for k, v in continuation_diag.items() if v is not None},
+            }
 
-            # Generate and print Scarface Rules report (Level 2+ only)
+            # Add grading information if available (Level 2+)
+            if "component_grades" in sig:
+                trade_dict["breakout_grade"] = sig["component_grades"].get("breakout")
+                trade_dict["retest_grade"] = sig["component_grades"].get("retest")
+                trade_dict["rr_grade"] = sig["component_grades"].get("rr")
+                trade_dict["context_grade"] = sig["component_grades"].get("context")
+                trade_dict["overall_grade"] = sig.get("overall_grade")
+
+                # Add detailed descriptions
+                if "component_descriptions" in sig:
+                    trade_dict["breakout_desc"] = sig["component_descriptions"].get("breakout")
+                    trade_dict["retest_desc"] = sig["component_descriptions"].get("retest")
+
+            trades.append(trade_dict)
+
+            # Generate and print grading report (Level 2+ only)
             if self.pipeline_level >= 2:
-                report = generate_signal_report(
+                report = self.grader.generate_signal_report(
                     sig,
                     retest_volume_a_max_ratio=0.30,
                     retest_volume_b_max_ratio=0.60,
@@ -934,7 +1048,7 @@ class BacktestEngine:
         total_pnl = sum(t["pnl"] for t in trades)
         win_rate = winning_trades / total_trades if total_trades > 0 else 0
 
-        return {
+        result = {
             "symbol": symbol,
             "total_trades": total_trades,
             "winning_trades": winning_trades,
@@ -945,6 +1059,14 @@ class BacktestEngine:
             "trades": trades,
             "candidate_count": candidate_count,
         }
+        # Attach Level 2 rejection counters for downstream comparisons
+        if self.pipeline_level >= 2:
+            result["level2_rejections"] = {
+                "breakout_fail": rejected_breakout,
+                "retest_fail": rejected_retest,
+                "candle_type_fail": rejected_candle_type,
+            }
+        return result
 
 
 def format_results(results: List[Dict]) -> str:
@@ -1235,8 +1357,15 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
             "Pipeline level (0-5, default: 0): "
             "Level 0: Candidates only (Stages 1-3: OR, Breakout, Retest), no trades. "
             "Level 1: Trades with base criteria (Stages 1-3), entry on open after retest. "
-            "Level 2+: Enhanced filtering (may include Stage 4: Ignition)."
+            "Level 2: Quality filter - Breakout and Retest must be grade C or higher (filters ❌). "
+            "Level 3+: Reserved for future (may include Stage 4: Ignition, stricter filters)."
         ),
+    )
+    parser.add_argument(
+        "--grading-system",
+        choices=["points"],
+        default="points",
+        help="Grading system (default: points - 100-point scoring system)",
     )
     parser.add_argument(
         "--no-trades",
@@ -1297,6 +1426,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         retest_vol_threshold=RETEST_VOL_GATE,
         pipeline_level=pipeline_level,
         no_trades=args.no_trades,
+        grading_system=args.grading_system,
     )
 
     results = []

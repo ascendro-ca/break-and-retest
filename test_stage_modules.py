@@ -118,7 +118,7 @@ def test_base_breakout_filter_short():
 
 
 def test_base_breakout_filter_no_volume():
-    """Should reject breakout without sufficient volume"""
+    """Base filter should accept even without volume; volume enforced at Grade C"""
     prev = pd.Series({"High": 100.0, "Low": 99.0, "Close": 99.5, "Volume": 5000})
     row = pd.Series(
         {
@@ -134,7 +134,9 @@ def test_base_breakout_filter_no_volume():
     or_low = 99.0
 
     result = base_breakout_filter(row, prev, or_high, or_low)
-    assert result is None
+    assert result is not None
+    assert result[0] == "long"
+    assert result[1] == or_high
 
 
 def test_base_breakout_filter_vwap_alignment():
@@ -577,7 +579,7 @@ def test_ignition_immediate_in_retest():
             "Open": 100.2,
             "High": 101.0,  # Breaks above retest high (100.8)
             "Low": 100.0,
-            "Close": 100.8,
+            "Close": 100.8,  # Can close at or below retest high
             "Volume": 3000,
         }
     )

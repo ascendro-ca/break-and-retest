@@ -4,11 +4,14 @@ Stage 2: Breakout Detection
 
 Detects when price breaks beyond the opening range on a 5-minute candle.
 
-Base Criteria (always applied):
-- Previous 5m high <= OR high (for long) or previous 5m low >= OR low (for short)
-- Current 5m close beyond OR level (above for long, below for short)
-- Volume >= 1.0x 20-period SMA of volume
+Base Criteria (always applied at Level 0/1):
+- Breakout candle is NOT the first 5m candle of the session
+- Breakout candle OPEN is inside the Opening Range (between OR low and OR high)
+- Breakout candle CLOSE beyond OR level (≥ OR high for long, ≤ OR low for short)
 - VWAP alignment: long close > VWAP, short close < VWAP
+
+Note: Volume confirmation (Volume ≥ 1.0× 20-period SMA) has been moved to
+    Grade C criteria and is no longer enforced at the base filter for Level 0/1.
 
 Grading (optional, via config/CLI):
 - Body strength: % of candle that is body vs wick
@@ -54,16 +57,30 @@ def base_breakout_filter(
     Returns:
         (direction, level) if breakout valid, else None
     """
-    vol_ok = float(row["Volume"]) >= float(row.get("vol_ma_20", 0.0))
+    # Base (Level 0/1) relaxed criteria
     vwap_val = float(row.get("vwap", float("nan")))
+    # Open may be missing in some unit tests; if missing, skip the open-inside-OR constraint
+    open_raw = row.get("Open")
+    try:
+        open_val = float(open_raw) if open_raw is not None else float("nan")
+    except Exception:
+        open_val = float("nan")
     close_val = float(row["Close"])
 
-    brk_long = (
-        float(prev["High"]) <= or_high and close_val > or_high and vol_ok and close_val > vwap_val
-    )
-    brk_short = (
-        float(prev["Low"]) >= or_low and close_val < or_low and vol_ok and close_val < vwap_val
-    )
+    # 1) Not the first 5m candle – guaranteed by iteration in detect_breakouts (i>=1)
+    # 2) Open must be inside OR
+    opened_inside_or = (open_val >= or_low and open_val <= or_high) if pd.notna(open_val) else True
+
+    # 3) Close beyond OR level (inclusive)
+    close_beyond_long = close_val >= or_high
+    close_beyond_short = close_val <= or_low
+
+    # 4) VWAP alignment
+    vwap_aligned_long = close_val > vwap_val
+    vwap_aligned_short = close_val < vwap_val
+
+    brk_long = opened_inside_or and close_beyond_long and vwap_aligned_long
+    brk_short = opened_inside_or and close_beyond_short and vwap_aligned_short
 
     if brk_long:
         return ("long", or_high)
@@ -99,6 +116,7 @@ def detect_breakouts(
 
     session_df_5m = session_df_5m.copy()
     session_df_5m = _ensure_vwap(session_df_5m)
+    # Keep vol_ma_20 present for grading, but not used by base filter anymore
     session_df_5m = _ensure_vol_ma_20(session_df_5m)
 
     start_time = session_df_5m.iloc[0]["Datetime"]

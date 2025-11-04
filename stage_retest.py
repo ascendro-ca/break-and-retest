@@ -10,7 +10,8 @@ Base Criteria (always applied):
 - First 1m candle whose body closes on the correct side of the level:
   - Long: close >= level
   - Short: close <= level
-- Retest must occur within retest_lookahead_minutes of breakout close
+- Retest must occur within the first 90 minutes of market open
+  (and still after the breakout candle closes)
 
 Grading (optional, via config/CLI):
 - Wick touch/pierce requirement (currently not in base)
@@ -44,7 +45,7 @@ def detect_retest(
     breakout_time: pd.Timestamp,
     direction: str,
     level: float,
-    retest_lookahead_minutes: int = 30,
+    retest_lookahead_minutes: int = 30,  # Deprecated but kept for backward compatibility
     retest_filter: Optional[Callable[[pd.Series, str, float], bool]] = None,
 ) -> Optional[Dict]:
     """
@@ -55,7 +56,8 @@ def detect_retest(
         breakout_time: Datetime when the 5m breakout candle started
         direction: 'long' or 'short'
         level: The OR level being tested
-        retest_lookahead_minutes: Minutes after breakout close to search
+        retest_lookahead_minutes: DEPRECATED - No longer used. Retest window is now
+                                  determined by 90 minutes from market open.
         retest_filter: Optional custom filter; if None, uses base_retest_filter
 
     Returns:
@@ -64,9 +66,14 @@ def detect_retest(
     if session_df_1m is None or session_df_1m.empty:
         return None
 
+    # Determine market open time (first timestamp in session data)
+    market_open = session_df_1m.iloc[0]["Datetime"]
+
     # Retest window starts AFTER the 5m breakout candle closes
     retest_window_start = breakout_time + timedelta(minutes=5)
-    retest_window_end = breakout_time + timedelta(minutes=retest_lookahead_minutes)
+
+    # Retest window ends at 90 minutes from market open
+    retest_window_end = market_open + timedelta(minutes=90)
 
     window_1m = session_df_1m[
         (session_df_1m["Datetime"] >= retest_window_start)

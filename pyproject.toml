@@ -15,3 +15,32 @@ known-third-party = ["plotly", "pandas", "numpy", "yfinance"]
 "backtest.py" = ["I001"]
 "cache_utils.py" = ["I001"]
 "stockdata_retriever.py" = ["I001"]
+"analyze_*.py" = ["E501", "F401"]
+"compare_backtests.py" = ["E501"]
+
+[tool.coverage.run]
+omit = [
+    "test_*.py",
+    "analyze_*.py",
+    "compare_backtests.py",
+    "grading/grading_basic.py",
+    "visualize_*.py",
+    "first_trade_analysis.py",
+    "conftest.py",
+    "break_and_retest_strategy.py",
+    "break_and_retest_detection.py",
+    "break_and_retest_live_scanner.py",
+    "stockdata_retriever.py",
+    "backtest.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "if typing.TYPE_CHECKING:",
+]

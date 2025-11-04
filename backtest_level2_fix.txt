@@ -1,0 +1,56 @@
+        # Level 2+: Apply quality filters based on grades
+        if self.pipeline_level >= 2:
+            # Level 2 Quality Filter: Breakout and Retest must be grade C or higher
+            # Reject signals where breakout_grade or retest_grade is ❌
+            pre_filter_count = len(graded_signals)
+            filtered_signals = []
+            rejected_breakout = 0
+            rejected_retest = 0
+            rejected_candle_type = 0
+
+            for s in graded_signals:
+                breakout_grade = s.get("component_grades", {}).get("breakout", "❌")
+                retest_grade = s.get("component_grades", {}).get("retest", "❌")
+
+                # ❌ means rejected/failed - exclude these
+                if breakout_grade == "❌":
+                    rejected_breakout += 1
+                    continue  # Breakout failed minimum C criteria
+                if retest_grade == "❌":
+                    rejected_retest += 1
+                    continue  # Retest failed minimum C criteria
+
+                # Additional Level 2 filter: C-grade breakouts must be candle type 4 or 5 minimum
+                if breakout_grade == "C":
+                    breakout_candle = s.get("breakout_candle", {})
+                    direction = s.get("direction", "long")
+
+                    # Classify the breakout candle
+                    candle_classification = classify_candle_strength(pd.Series(breakout_candle))
+                    candle_type = candle_classification.get("type", "unknown")
+                    candle_direction = candle_classification.get("direction", "neutral")
+                    candle_strength = candle_classification.get("strength", 0)
+
+                    # For C-grade breakouts, require:
+                    # 1. Candle strength 4 or 5 (spinning top or inverted hammer minimum)
+                    # 2. Candle direction matches trade direction (bullish for long, bearish for short)
+                    expected_direction = "bullish" if direction == "long" else "bearish"
+
+                    if candle_strength not in [4, 5] or candle_direction != expected_direction:
+                        rejected_candle_type += 1
+                        continue  # C-grade breakout failed candle type criteria
+
+                # Signal passed Level 2 filters (both at least C grade)
+                filtered_signals.append(s)
+
+            graded_signals = filtered_signals
+
+            # Print Level 2 filtering stats
+            if pre_filter_count > 0:
+                filtered_count = len(graded_signals)
+                print(f"  Level 2 Quality Filter for {symbol}:")
+                print(f"    Before filter: {pre_filter_count} signals")
+                print(f"    Rejected (breakout ❌): {rejected_breakout}")
+                print(f"    Rejected (retest ❌): {rejected_retest}")
+                print(f"    Rejected (C-grade candle type): {rejected_candle_type}")
+                print(f"    After filter: {filtered_count} signals (passed C+ criteria)")
