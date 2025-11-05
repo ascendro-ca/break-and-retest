@@ -346,3 +346,70 @@ def analyze_candle_patterns(df: pd.DataFrame) -> pd.DataFrame:
     result_df["lower_wick_pct"] = classifications.apply(lambda x: x["lower_wick_pct"])
 
     return result_df
+
+
+def detect_engulfing(prev: pd.Series, curr: pd.Series, tol: float = 1e-6) -> Dict[str, any]:
+    """
+    Detect true two-candle Engulfing pattern using the prior candle.
+
+    - Bullish Engulfing: prev bearish, curr bullish, curr body engulfs prev body
+    - Bearish Engulfing: prev bullish, curr bearish, curr body engulfs prev body
+
+    Returns a dict:
+      { 'detected': bool, 'direction': 'bullish'|'bearish'|'neutral',
+        'strength': int, 'reason': str }
+    """
+    try:
+        po, pc = (
+            float(prev["Open"]),
+            float(prev["Close"]),
+        )
+        co, cc = (
+            float(curr["Open"]),
+            float(curr["Close"]),
+        )
+    except Exception:
+        return {"detected": False, "direction": "neutral", "strength": 0, "reason": "invalid_ohlc"}
+
+    prev_bear = pc < po
+    prev_bull = pc > po
+    curr_bear = cc < co
+    curr_bull = cc > co
+
+    prev_body = abs(pc - po)
+    curr_body = abs(cc - co)
+
+    if max(prev_body, curr_body) <= 0:
+        return {"detected": False, "direction": "neutral", "strength": 0, "reason": "zero_body"}
+
+    # Bullish engulfing: current body spans from <= prev close to >= prev open
+    if (
+        prev_bear
+        and curr_bull
+        and (co <= pc + tol)
+        and (cc >= po - tol)
+        and (curr_body >= prev_body * 0.95)
+    ):
+        return {
+            "detected": True,
+            "direction": "bullish",
+            "strength": 1,
+            "reason": "bullish_engulfing",
+        }
+
+    # Bearish engulfing: current body spans from >= prev close to <= prev open
+    if (
+        prev_bull
+        and curr_bear
+        and (co >= pc - tol)
+        and (cc <= po + tol)
+        and (curr_body >= prev_body * 0.95)
+    ):
+        return {
+            "detected": True,
+            "direction": "bearish",
+            "strength": 1,
+            "reason": "bearish_engulfing",
+        }
+
+    return {"detected": False, "direction": "neutral", "strength": 0, "reason": "no_match"}

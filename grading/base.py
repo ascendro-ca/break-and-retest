@@ -23,6 +23,7 @@ class Grader(Protocol):
         a_upper_wick_max: float = 0.15,
         b_body_max: float = 0.65,
         or_range: float | None = None,
+        prev_candle: Dict[str, float] | None = None,
     ) -> Tuple[str, str]: ...
 
     def grade_retest(

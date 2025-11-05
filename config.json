@@ -18,10 +18,7 @@
   "session_end": "16:00",
   "market_open_minutes": 90,
   "timezone": "PST",
-  "retest_volume_gate_ratio": 0.15,
-  "retest_B_level_epsilon_pct": 0.20,
-  "retest_B_structure_soft": true,
-  "breakout_A_upper_wick_max": 0.20,
-  "breakout_B_body_max": 0.72,
-  "backtest_results_dir": "backtest_results"
+  "backtest_results_dir": "backtest_results",
+  "feature_level0_enable_vwap_check": true,
+  "feature_cache_check_integrity": false
 }

@@ -43,12 +43,20 @@ def _ensure_vwap(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def base_retest_filter(m1: pd.Series, direction: str, level: float) -> bool:
+def base_retest_filter(
+    m1: pd.Series, direction: str, level: float, enable_vwap_check: bool = True
+) -> bool:
     """
-    Base retest criteria with VWAP alignment.
+    Base retest criteria with optional VWAP alignment.
 
     VWAP alignment reduces false negatives and aligns with institutional logic
     for cleaner breakout-confirmation structure.
+
+    Args:
+        m1: 1-minute candle series
+        direction: 'long' or 'short'
+        level: The price level being tested
+        enable_vwap_check: If True, enforce VWAP alignment (default: True)
 
     Returns:
         True if the 1m candle qualifies as a valid retest close
@@ -62,15 +70,19 @@ def base_retest_filter(m1: pd.Series, direction: str, level: float) -> bool:
     if not level_check:
         return False
 
-    # VWAP alignment with 0.05% buffer
-    vwap_buffer = abs(vwap_val) * 0.0005  # 0.05% = 0.0005
+    # VWAP alignment with 0.05% buffer (optional)
+    if enable_vwap_check:
+        vwap_buffer = abs(vwap_val) * 0.0005  # 0.05% = 0.0005
 
-    if direction == "long":
-        vwap_aligned = c >= (vwap_val - vwap_buffer)
-    else:  # short
-        vwap_aligned = c <= (vwap_val + vwap_buffer)
+        if direction == "long":
+            vwap_aligned = c >= (vwap_val - vwap_buffer)
+        else:  # short
+            vwap_aligned = c <= (vwap_val + vwap_buffer)
 
-    return vwap_aligned
+        return vwap_aligned
+
+    # If VWAP check is disabled, just return True (level check already passed)
+    return True
 
 
 def detect_retest(
@@ -80,6 +92,7 @@ def detect_retest(
     level: float,
     retest_lookahead_minutes: int = 30,  # Deprecated but kept for backward compatibility
     retest_filter: Optional[Callable[[pd.Series, str, float], bool]] = None,
+    enable_vwap_check: bool = True,
 ) -> Optional[Dict]:
     """
     Detect retest after a breakout.
@@ -92,6 +105,7 @@ def detect_retest(
         retest_lookahead_minutes: DEPRECATED - No longer used. Retest window is now
                                   determined by 90 minutes from market open.
         retest_filter: Optional custom filter; if None, uses base_retest_filter
+        enable_vwap_check: If True, enforce VWAP alignment in base filter (default: True)
 
     Returns:
         Dict with keys: time, candle if retest found, else None
@@ -119,7 +133,13 @@ def detect_retest(
     if window_1m.empty:
         return None
 
-    filter_fn = retest_filter or base_retest_filter
+    # Use custom filter if provided, otherwise use base filter with VWAP check setting
+    if retest_filter is not None:
+        filter_fn = retest_filter
+    else:
+        # Create a function that captures the enable_vwap_check parameter
+        def filter_fn(m1, direction, level):
+            return base_retest_filter(m1, direction, level, enable_vwap_check)
 
     for _, m1 in window_1m.iterrows():
         if filter_fn(m1, direction, level):

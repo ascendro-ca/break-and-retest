@@ -25,11 +25,14 @@ Understand existing structure and patterns
 Validate understanding before implementing
 Don't make assumptions - verify first
 5. Don't worry about backward compatibility, just keep the codebase clean and self-consistent
-6. Unit tests should be run in areas of changes after updates are made
+6. Unit tests should be run in areas of changes after updates are made. In general, each Python file should have it's own unit test and have >= 80% test coverage.
 7. When I ask to run pre-commit, checks this includes unit tests, linting, code coverage, functional tests
 8. Maintain all main s/w dev workflow operations in the Makefile. Prefer running these workflow operations using "make" operations over running specific commands unless specific commands are warranted.
 9. Over-arching tasks that we're working on are in todo.md
-10. Start Terminal commands by default in ~/Development/python/break-and-retest folder in a Python venv
+10. Maintain a history of what we've worked on in each chat thread in the context_summary.md
+11. Start Terminal commands by default in ~/Development/python/break-and-retest folder in a Python venv
+12. Use the Markdown documents in this project for specifications (*.md files in this project) when you don't have enough information, and if you still can't find the info you're looking for ask me when in doubt.
+13. Before making any code changes first explain to me why you want to make them and how they will improve the code. Let me give the "okay" before you make the code changes.
 
 Core Theme
 Take action directly using tools, wait for explicit approval on commits, and don't create unnecessary documentation files.

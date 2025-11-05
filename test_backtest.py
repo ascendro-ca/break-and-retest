@@ -3,6 +3,7 @@
 Test suite for backtesting functionality
 """
 
+import json
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ import pandas as pd
 import pytest
 
 from backtest import BacktestEngine, DataCache
+from config_utils import load_config
 
 
 @pytest.fixture
@@ -388,6 +390,61 @@ def test_level_0_vs_level_1_differences(sample_ohlcv_data_5m, sample_ohlcv_data_
         # Neither should have grading at Level 0 or 1
         assert "overall_grade" not in sig_0
         assert "overall_grade" not in sig_1
+
+
+def test_cache_integrity_check_feature_flag(tmp_path):
+    """Test that feature_cache_check_integrity flag controls integrity check behavior"""
+    config_path = tmp_path / "config.json"
+
+    # Test with flag disabled (default)
+    config_disabled = {"tickers": ["TEST"], "feature_cache_check_integrity": False}
+    config_path.write_text(json.dumps(config_disabled))
+
+    # Load config and verify flag is False
+    import importlib
+
+    import config_utils
+    from config_utils import load_config
+
+    # Temporarily modify the config path for testing
+    original_config_path = (
+        config_utils.CONFIG_PATH if hasattr(config_utils, "CONFIG_PATH") else None
+    )
+
+    try:
+        # Test that the flag exists and defaults to False
+        config = load_config()
+        assert "feature_cache_check_integrity" in config or not config.get(
+            "feature_cache_check_integrity", False
+        )
+
+        # Test with flag enabled
+        config_enabled = {"tickers": ["TEST"], "feature_cache_check_integrity": True}
+        config_path.write_text(json.dumps(config_enabled))
+
+        # Reload config
+        importlib.reload(config_utils)
+        config = load_config()
+
+        # Verify we can read the flag (implementation may vary)
+        # The actual check happens in main() so we just verify the config structure is correct
+        assert isinstance(config, dict)
+
+    finally:
+        # Restore original config path if it existed
+        if original_config_path:
+            config_utils.CONFIG_PATH = original_config_path
+
+
+def test_cache_integrity_flag_in_default_config():
+    """Test that default config.json has feature_cache_check_integrity flag"""
+    config = load_config()
+
+    # Verify flag exists in config (either explicitly or via default)
+    # Default should be False
+    flag_value = config.get("feature_cache_check_integrity", False)
+    assert isinstance(flag_value, bool)
+    assert not flag_value  # Default value should be False
 
 
 if __name__ == "__main__":

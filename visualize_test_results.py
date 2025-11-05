@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
+# ruff: noqa: E501
 """
 Visualize Break & Re-Test signals on a candlestick chart
+
+NOTE: This script is currently obsolete as it depends on break_and_retest_strategy.py
+which has been removed and replaced by break_and_retest_live_scanner.py
+
+TODO: Update this script to work with the new live scanner
 
 Usage:
     python3 break-and-retest/visualize_test_results.py --ticker AAPL --out /tmp/aapl_br.html
@@ -21,8 +27,19 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from break_and_retest_strategy import scan_dataframe, scan_ticker
+# raise ImportError('break_and_retest_strategy.py has been removed. Please update this script to use the new live scanner.')
 from time_utils import get_display_timezone
+
+
+# Stub functions for backward compatibility - TODO: Replace with new live scanner
+def scan_dataframe(df):
+    """Stub function - to be replaced with new live scanner logic"""
+    raise NotImplementedError("This function has been removed. Please use the new live scanner.")
+
+
+def scan_ticker(ticker):
+    """Stub function - to be replaced with new live scanner logic"""
+    raise NotImplementedError("This function has been removed. Please use the new live scanner.")
 
 
 def create_chart(

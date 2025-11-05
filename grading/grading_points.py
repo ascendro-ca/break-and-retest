@@ -14,8 +14,8 @@ class PointsGrader(Grader):
     100-point grading system adapter.
 
     Notes:
-    - Pre-entry overall grade is computed from Breakout (30) + Retest (30) only (max 60),
-      scaled to A+/A/B/C thresholds at 90%/80%/70% of 60, respectively.
+        - Pre-entry overall grade is computed from Breakout (30) + Retest (30) only (max 60),
+            thresholds per GRADING_SYSTEMS.md: A+ ≥95%, A ≥86%, B ≥70%, C ≥56% of 60.
     - VWAP/Trend context (+10) and Ignition (+30) are computed for reporting if data is present.
     - Volume proxies:
         * Breakout volume ratio: provided vol_ratio vs 20-SMA (used as 5m avg proxy)
@@ -34,6 +34,35 @@ class PointsGrader(Grader):
             "context_pts": 0.0,
         }
 
+    # ---------- Helpers ----------
+    @staticmethod
+    def _component_symbol(pts: float, max_pts: float = 30.0) -> str:
+        """
+        Map a component score (out of max_pts) to a letter grade symbol using
+        GRADING_SYSTEMS.md thresholds scaled by max.
+
+        Thresholds (percent of max):
+        - A+ ≥ 95%
+        - A  ≥ 86%
+        - B  ≥ 70%
+        - C  ≥ 56%
+        - else D (❌)
+        """
+        a_plus = 0.95 * max_pts
+        a = 0.86 * max_pts
+        b = 0.70 * max_pts
+        c = 0.56 * max_pts
+
+        if pts >= a_plus:
+            return "A+"
+        if pts >= a:
+            return "A"
+        if pts >= b:
+            return "B"
+        if pts >= c:
+            return "C"
+        return "❌"
+
     # ---------- Breakout ----------
     def grade_breakout_candle(
         self,
@@ -46,6 +75,7 @@ class PointsGrader(Grader):
         a_upper_wick_max: float = 0.15,
         b_body_max: float = 0.65,
         or_range: float | None = None,
+        prev_candle: Dict[str, float] | None = None,
     ) -> Tuple[str, str]:
         # New signal: reset state for a fresh scoring round
         self._reset_state()
@@ -54,58 +84,76 @@ class PointsGrader(Grader):
         cls = classify_candle_strength(s)
         base = 0
 
-        # Pattern-based base points (approximate mapping)
+        # Pattern-based base points using detected pattern types per GRADING_SYSTEMS.md
         c_body = float(cls.get("body_pct", 0.0))
         uw = float(cls.get("upper_wick_pct", 0.0))
         lw = float(cls.get("lower_wick_pct", 0.0))
         ctype = str(cls.get("type", "unknown"))
-        # cdir = str(cls.get("direction", "neutral"))  # Reserved for directional validation
+        cdir = str(cls.get("direction", "neutral"))
 
-        # expected_dir = (  # Reserved for future directional matching
-        #     "bullish" if direction == "long" else ("bearish" if direction == "short" else None)
-        # )
-        # dir_match = (expected_dir is None) or (cdir == expected_dir)  # Reserved for future use
+        # Verify directional alignment
+        expected_dir = "bullish" if direction == "long" else "bearish"
+        dir_match = (cdir == expected_dir) or (cdir == "neutral")
 
+        # Map to GRADING_SYSTEMS.md breakout patterns:
+        # 1. Marubozu / Shaved Candle (20 pts)
         if ctype in ("bullish_marubozu", "bearish_marubozu"):
-            base = 20
-        else:
-            # WRB approximation: big body, not full marubozu
-            if c_body >= 0.70:
+            base = 20 if dir_match else 13  # Penalize wrong-direction marubozu
+
+        # 2. Engulfing Candle (18 pts) - true detection using prior 5m candle when provided
+        if prev_candle is not None:
+            try:
+                from candle_patterns import detect_engulfing
+
+                prev_s = pd.Series(prev_candle)
+                engulf = detect_engulfing(prev_s, s)
+                if engulf.get("detected"):
+                    if (direction == "long" and engulf.get("direction") == "bullish") or (
+                        direction == "short" and engulf.get("direction") == "bearish"
+                    ):
+                        base = 18
+            except Exception:
+                pass  # Engulfing detection failed, continue with other patterns
+        if base == 0:  # not engulfing
+            # 3. Wide-Range Breakout Candle (17 pts) - body ≥70%
+            if c_body >= 0.70 and dir_match:
                 base = 17
-            # Belt hold approximation: strong open-close directionality, one small opposite wick
-            elif c_body >= 0.65 and (
-                (direction == "long" and lw <= 0.10) or (direction == "short" and uw <= 0.10)
+            # 4. Belt Hold (15 pts)
+            elif (
+                c_body >= 0.65
+                and dir_match
+                and ((direction == "long" and lw <= 0.10) or (direction == "short" and uw <= 0.10))
             ):
                 base = 15
-            elif c_body >= 0.60:
+            # 5. Other Clean Candle (13 pts)
+            elif c_body >= 0.60 and dir_match:
                 base = 13
+            # 6. Messy/overlapping candle (7-10 pts)
             else:
-                # Messy/overlapping
-                base = 10 if c_body >= 0.40 else 8
+                if c_body >= 0.40:
+                    base = 10
+                elif c_body >= 0.30:
+                    base = 9
+                elif c_body >= 0.20:
+                    base = 8
+                else:
+                    base = 7
 
         # Volume bonus (vol_ratio is vs 20-SMA proxy)
+        # Updated per GRADING_SYSTEMS.md: max 10 points instead of 5
         bonus = 0
         if vol_ratio > 1.5:
-            bonus = 5
+            bonus = 10
         elif vol_ratio >= 1.2:
-            bonus = 3
+            bonus = 5
         elif vol_ratio >= 1.0:
             bonus = 2
 
         pts = min(base + bonus, 30)
         self._state["breakout_pts"] = pts
 
-        # Map to symbol for component visualization
-        # Scaled thresholds (out of 30): A+ ≥28.5, A ≥25.8, B ≥21, C ≥16.8, D <16.8
-        symbol = "❌"  # D grade
-        if pts >= 28.5:
-            symbol = "A+"
-        elif pts >= 25.8:
-            symbol = "A"
-        elif pts >= 21:
-            symbol = "B"
-        elif pts >= 16.8:
-            symbol = "C"
+        # Map to symbol for component visualization per GRADING_SYSTEMS.md (scaled)
+        symbol = self._component_symbol(pts, max_pts=30.0)
 
         desc = (
             f"Breakout score: base {base} + vol {bonus} = {pts}/30 "
@@ -133,47 +181,61 @@ class PointsGrader(Grader):
         lw = float(cls.get("lower_wick_pct", 0.0))
         ctype = str(cls.get("type", "unknown"))
 
-        # Pattern-based base points (1m retest)
+        # Pattern-based base points per GRADING_SYSTEMS.md
         base = 0
-        if direction == "long":
-            if lw >= 0.45 and c_body <= 0.35:  # hammer-like
-                base = 18
-            elif ctype in ("doji", "dragonfly_doji") and lw >= 0.35:
-                base = 15
-            elif c_body <= 0.30:  # tight hold / inside-like
-                base = 12
-            else:
-                base = 9 if lw >= 0.15 else 7
-        else:  # short
-            if uw >= 0.45 and c_body <= 0.35:  # inverted hammer / shooting-star-like
-                base = 18
-            elif ctype in ("doji", "gravestone_doji") and uw >= 0.35:
-                base = 15
-            elif c_body <= 0.30:
-                base = 12
-            else:
-                base = 9 if uw >= 0.15 else 7
 
-        # Volume bonus vs breakout
+        if direction == "long":
+            # 1. Hammer / Inverted Hammer (20 pts)
+            if ctype in ("hammer", "dragonfly_doji", "inverted_hammer_bullish"):
+                base = 20
+            # 2. Pin Bar (18 pts) - sharp rejection wick + tight body
+            elif lw >= 0.50 and c_body <= 0.25:
+                base = 18
+            # 3. Doji w/ long rejection wick (17 pts)
+            elif ctype == "doji" and lw >= 0.35:
+                base = 17
+            # 4. Inside Bar (13 pts) - tight base + support hold
+            elif c_body <= 0.30:
+                base = 13
+            # 5. Other small-wick hold (10-12 pts)
+            elif lw >= 0.15 and c_body <= 0.50:
+                base = 12 if lw >= 0.25 else 10
+            # 6. Wick fails to touch level (5-9 pts)
+            else:
+                base = 9 if lw >= 0.12 else 7 if lw >= 0.08 else 5
+
+        else:  # short
+            # 1. Shooting Star / Gravestone Doji (20 pts) - bearish equivalents
+            if ctype in ("shooting_star", "gravestone_doji", "inverted_hammer_bearish"):
+                base = 20
+            # 2. Pin Bar (18 pts) - sharp rejection wick + tight body
+            elif uw >= 0.50 and c_body <= 0.25:
+                base = 18
+            # 3. Doji w/ long rejection wick (17 pts)
+            elif ctype == "doji" and uw >= 0.35:
+                base = 17
+            # 4. Inside Bar (13 pts) - tight base + resistance hold
+            elif c_body <= 0.30:
+                base = 13
+            # 5. Other small-wick hold (10-12 pts)
+            elif uw >= 0.15 and c_body <= 0.50:
+                base = 12 if uw >= 0.25 else 10
+            # 6. Wick fails to touch level (5-9 pts)
+            else:
+                base = 9 if uw >= 0.12 else 7 if uw >= 0.08 else 5
+
+        # Volume bonus vs breakout (per GRADING_SYSTEMS.md)
         bonus = 0
         if retest_vol_ratio < 0.15:
-            bonus = 5
+            bonus = 10
         elif retest_vol_ratio < 0.30:
-            bonus = 3
+            bonus = 5
 
         pts = min(base + bonus, 30)
         self._state["retest_pts"] = pts
 
-        # Scaled thresholds (out of 30): A+ ≥28.5, A ≥25.8, B ≥21, C ≥16.8, D <16.8
-        symbol = "❌"  # D grade
-        if pts >= 28.5:
-            symbol = "A+"
-        elif pts >= 25.8:
-            symbol = "A"
-        elif pts >= 21:
-            symbol = "B"
-        elif pts >= 16.8:
-            symbol = "C"
+        # Map to symbol for component visualization per GRADING_SYSTEMS.md (scaled)
+        symbol = self._component_symbol(pts, max_pts=30.0)
 
         desc = f"Retest score: base {base} + vol {bonus} = {pts}/30 (type={ctype})"
         return symbol, desc
@@ -206,6 +268,7 @@ class PointsGrader(Grader):
             cls = classify_candle_strength(s)
             c_body = float(cls.get("body_pct", 0.0))
             ctype = str(cls.get("type", "unknown"))
+            cdir = str(cls.get("direction", "neutral"))
         except Exception:
             # Fallback to direct computation if classification fails
             try:
@@ -218,18 +281,39 @@ class PointsGrader(Grader):
             except Exception:
                 c_body = 0.0
             ctype = "unknown"
+            cdir = "neutral"
 
+        # Map detected patterns to points per GRADING_SYSTEMS.md
         base = 0
-        if c_body >= 0.90:
-            base = 20  # marubozu-like
+
+        # 1. Bullish/Bearish Marubozu (20 pts) - strongest ignition
+        if ctype in ("bullish_marubozu", "bearish_marubozu"):
+            base = 20
+
+        # 2. Wide-Range Candle / WRB (18 pts) - body ≥70%
         elif c_body >= 0.70:
-            base = 18  # WRB-like
+            base = 18
+
+        # 3. Engulfing Candle (17 pts) - proxy: body ≥75% with direction
+        elif c_body >= 0.75 and cdir != "neutral":
+            base = 17
+
+        # 4. Belt Hold (15 pts) - body ≥60%
         elif c_body >= 0.60:
-            base = 15  # belt-hold-like
+            base = 15
+
+        # 5. Other momentum candle (12-14 pts) - body ≥45%
         elif c_body >= 0.45:
-            base = 13  # other momentum
+            base = 14 if c_body >= 0.55 else 13 if c_body >= 0.50 else 12
+
+        # 6. Wick or indecisive body (7-10 pts)
         else:
-            base = 9
+            if c_body >= 0.30:
+                base = 10
+            elif c_body >= 0.20:
+                base = 8
+            else:
+                base = 7
 
         bonus = 0
         # ignition_vol_ratio: ignition volume / retest volume (per GRADING_SYSTEMS.md spec)
@@ -245,16 +329,8 @@ class PointsGrader(Grader):
         pts = min(base + bonus, 30)
         self._state["ignition_pts"] = pts
 
-        # Scaled thresholds (out of 30): A+ ≥28.5, A ≥25.8, B ≥21, C ≥16.8, D <16.8
-        symbol = "❌"  # D grade
-        if pts >= 28.5:
-            symbol = "A+"
-        elif pts >= 25.8:
-            symbol = "A"
-        elif pts >= 21:
-            symbol = "B"
-        elif pts >= 16.8:
-            symbol = "C"
+        # Map to symbol for component visualization per GRADING_SYSTEMS.md (scaled)
+        symbol = self._component_symbol(pts, max_pts=30.0)
 
         desc = f"Ignition score: base {base} + vol {bonus} = {pts}/30 (type={ctype})"
         return symbol, desc
@@ -305,10 +381,10 @@ class PointsGrader(Grader):
     def generate_signal_report(self, signal: Dict[str, Any], **kwargs: Any) -> str:
         # Compute context points (if signal has vwap and trend info)
         context_pts = 0
-
-        # VWAP alignment is guaranteed by base breakout filter at Level 0
-        # Award 5 points automatically since all signals have VWAP aligned
-        context_pts = 5
+        # Only award VWAP points if explicitly indicated by the signal
+        vwap_aligned = signal.get("vwap_aligned")  # optional bool
+        if isinstance(vwap_aligned, bool) and vwap_aligned:
+            context_pts += 5
 
         # HTF trend and confluence are not available – leave at 0 unless provided
         trend_align = signal.get("trend_align")  # optional bool

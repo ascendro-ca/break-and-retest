@@ -71,6 +71,7 @@ class TradeSetupPipeline:
         ] = None,
         retest_filter: Optional[Callable[[pd.Series, str, float], bool]] = None,
         ignition_filter: Optional[Callable[[pd.Series, str, float, float], bool]] = None,
+        enable_vwap_check: bool = True,
     ) -> None:
         """
         Initialize the pipeline.
@@ -83,6 +84,7 @@ class TradeSetupPipeline:
             breakout_filter: Optional custom Stage 2 filter
             retest_filter: Optional custom Stage 3 filter
             ignition_filter: Optional custom Stage 4 filter
+            enable_vwap_check: If True, enforce VWAP alignment at retest stage (default: True)
         """
         self.breakout_window_minutes = int(breakout_window_minutes)
         self.retest_lookahead_minutes = int(retest_lookahead_minutes)
@@ -91,6 +93,7 @@ class TradeSetupPipeline:
         self.breakout_filter = breakout_filter
         self.retest_filter = retest_filter
         self.ignition_filter = ignition_filter
+        self.enable_vwap_check = enable_vwap_check
 
     def run(self, session_df_5m: pd.DataFrame, session_df_1m: pd.DataFrame) -> List[Dict]:
         """
@@ -150,6 +153,7 @@ class TradeSetupPipeline:
                 level=brk["level"],
                 retest_lookahead_minutes=self.retest_lookahead_minutes,
                 retest_filter=self.retest_filter,
+                enable_vwap_check=self.enable_vwap_check,
             )
 
             if retest_result is None:
@@ -162,6 +166,7 @@ class TradeSetupPipeline:
                 "breakout_time": brk["time"],
                 "retest_time": retest_result["time"],
                 "breakout_candle": brk["candle"],
+                "prev_breakout_candle": brk.get("prev_candle"),
                 "retest_candle": retest_result["candle"],
             }
 
@@ -215,6 +220,7 @@ def run_pipeline(
     retest_lookahead_minutes: int = 30,
     ignition_lookahead_minutes: int = 30,
     pipeline_level: int = 0,
+    enable_vwap_check: bool = True,
 ) -> List[Dict]:
     """
     Convenience function to run the pipeline with default settings.
@@ -231,6 +237,7 @@ def run_pipeline(
                        Level 0: Candidates only (Stages 1-3, no trades)
                        Level 1: Trade execution with base criteria (Stages 1-3, no ignition)
                        Level 2+: Enhanced filtering, may include Stage 4 (Ignition)
+        enable_vwap_check: If True, enforce VWAP alignment at retest stage (default: True)
 
     Returns:
         List of candidates that passed all required stages
@@ -240,5 +247,6 @@ def run_pipeline(
         retest_lookahead_minutes=retest_lookahead_minutes,
         ignition_lookahead_minutes=ignition_lookahead_minutes,
         pipeline_level=pipeline_level,
+        enable_vwap_check=enable_vwap_check,
     )
     return pipeline.run(session_df_5m, session_df_1m)

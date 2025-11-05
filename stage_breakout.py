@@ -157,7 +157,13 @@ def detect_breakouts(
         if verdict is not None:
             direction, level = verdict
             breakouts.append(
-                {"direction": direction, "level": level, "time": row["Datetime"], "candle": row}
+                {
+                    "direction": direction,
+                    "level": level,
+                    "time": row["Datetime"],
+                    "candle": row,
+                    "prev_candle": prev,
+                }
             )
 
     return breakouts

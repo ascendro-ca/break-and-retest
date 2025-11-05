@@ -9,12 +9,13 @@ Usage:
 """
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import json
 import math
 from pathlib import Path
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
+import re
 
 import pandas as pd
 # Note: yfinance provider removed; keep import out to avoid unused import lint
@@ -25,21 +26,11 @@ from cache_utils import (
     save_day,
     integrity_check_range,
 )
+from config_utils import load_config, add_config_override_argument, apply_config_overrides
 from grading import get_grader
 from time_utils import get_display_timezone, get_timezone_label_for_date
 from trade_setup_pipeline import run_pipeline
 from stage_opening_range import detect_opening_range
-
-
-def load_config():
-    """Load configuration from config.json"""
-    config_path = Path(__file__).parent / "config.json"
-    if config_path.exists():
-        with open(config_path, "r") as f:
-            return json.load(f)
-    else:
-        # Default config if file doesn't exist
-        return {"tickers": ["AAPL", "AMZN", "META", "MSFT", "NVDA", "TSLA", "SPOT", "UBER"]}
 
 
 CONFIG = load_config()
@@ -49,6 +40,7 @@ DEFAULT_LEVERAGE = CONFIG.get("leverage", 2.0)
 DEFAULT_RESULTS_DIR = CONFIG.get("backtest_results_dir", "backtest_results")
 RETEST_VOL_GATE = CONFIG.get("retest_volume_gate_ratio", 0.20)
 BREAKOUT_A_UW_MAX = CONFIG.get("breakout_A_upper_wick_max", 0.15)
+FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get("feature_level0_enable_vwap_check", True)
 BREAKOUT_B_BODY_MAX = CONFIG.get("breakout_B_body_max", 0.65)
 RETEST_B_EPSILON = CONFIG.get("retest_B_level_epsilon_pct", 0.10)
 RETEST_B_SOFT = CONFIG.get("retest_B_structure_soft", True)
@@ -279,8 +271,8 @@ class BacktestEngine:
 
         # Load all needed days
         dfs = []
-        for date in dates_needed:
-            date_str = date.strftime("%Y-%m-%d")
+        for current_date in dates_needed:
+            date_str = current_date.strftime("%Y-%m-%d")
             cached = cache.get_cached_data(symbol, date_str, "1m")
             if cached is not None and not cached.empty:
                 dfs.append(cached)
@@ -394,6 +386,7 @@ class BacktestEngine:
                     breakout_window_minutes=90,
                     retest_lookahead_minutes=30,
                     pipeline_level=0,
+                    enable_vwap_check=FEATURE_LEVEL0_ENABLE_VWAP_CHECK,
                 )
 
                 for c in candidates:
@@ -433,6 +426,9 @@ class BacktestEngine:
                                 if hasattr(breakout_candle, "get")
                                 else None,
                             },
+                            "prev_breakout_candle": c.get("prev_breakout_candle")
+                            if isinstance(c, dict)
+                            else None,
                             "retest_candle": {
                                 "Open": retest_candle.get("Open")
                                 if hasattr(retest_candle, "get")
@@ -467,6 +463,7 @@ class BacktestEngine:
                 breakout_window_minutes=90,
                 retest_lookahead_minutes=30,
                 pipeline_level=self.pipeline_level,
+                enable_vwap_check=FEATURE_LEVEL0_ENABLE_VWAP_CHECK,
             )
 
             for cand in pipeline_candidates:
@@ -483,17 +480,34 @@ class BacktestEngine:
                     ignition_time_raw = cand.get("ignition_time")
                     if not ignition_time_raw:
                         continue  # No ignition detected, skip this signal
-                    entry_time = pd.to_datetime(ignition_time_raw)
+                    ignition_time = pd.to_datetime(ignition_time_raw)
 
-                    # Find the ignition bar to get entry price
-                    ignition_bars = session_df_1m[session_df_1m["Datetime"] == entry_time]
-                    if ignition_bars.empty:
+                    # Find the 1m bar immediately after the ignition candle for entry
+                    next_bars = session_df_1m[session_df_1m["Datetime"] > ignition_time]
+                    if next_bars.empty:
                         continue
-                    entry_bar = ignition_bars.iloc[0]
+                    entry_bar = next_bars.iloc[0]
+                    entry_time = entry_bar["Datetime"]
                     entry = float(entry_bar.get("Open"))
                 else:
-                    # Level 1: Entry at the open of the next 1m candle after retest
-                    next_bars = session_df_1m[session_df_1m["Datetime"] > retest_time]
+                    # Level 1: Wait for first 1m candle after retest that closes above
+                    # (long) or below (short) retest close, then enter on open of next candle
+                    retest_close = float(retest_candle.get("Close", 0.0))
+                    after_retest = session_df_1m[session_df_1m["Datetime"] > retest_time]
+                    ignition_idx = None
+                    breakout_up = direction == "long"
+                    for idx, row in after_retest.iterrows():
+                        close = float(row.get("Close", 0.0))
+                        if (breakout_up and close > retest_close) or (
+                            not breakout_up and close < retest_close
+                        ):
+                            ignition_idx = idx
+                            break
+                    if ignition_idx is None:
+                        continue  # No ignition found, skip
+                    # Get the next bar after ignition for entry
+                    ignition_time = after_retest.loc[ignition_idx, "Datetime"]
+                    next_bars = session_df_1m[session_df_1m["Datetime"] > ignition_time]
                     if next_bars.empty:
                         continue
                     entry_bar = next_bars.iloc[0]
@@ -559,6 +573,7 @@ class BacktestEngine:
                     "vol_retest_1m": retest_candle.get("Volume"),
                     # Grading metadata
                     "breakout_candle": breakout_candle,
+                    "prev_breakout_candle": cand.get("prev_breakout_candle"),
                     "retest_candle": retest_candle,
                     "breakout_body_pct": breakout_body_pct,
                     "breakout_vol_ratio": breakout_vol_ratio,
@@ -676,12 +691,19 @@ class BacktestEngine:
                 level_msg += " (no trades)"
             print(f"Found {len(candidates)} candidates for {symbol} ({level_msg})")
             for c in candidates[:10]:  # print first 10 per symbol for brevity
-                try:
-                    bt = pd.to_datetime(c.get("breakout_time_5m"))
-                    rt = pd.to_datetime(c.get("datetime"))
-                except Exception:
-                    bt = c.get("breakout_time_5m")
-                    rt = c.get("datetime")
+
+                def _fmt_local(ts):
+                    try:
+                        t = pd.to_datetime(ts)
+                        if getattr(t, "tzinfo", None) is None:
+                            t = t.tz_localize("UTC")
+                        t_local = t.tz_convert(self.display_tz)
+                        return t_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+                    except Exception:
+                        return str(ts)
+
+                bt = _fmt_local(c.get("breakout_time_5m"))
+                rt = _fmt_local(c.get("datetime"))
                 print(f"  - {c.get('direction')} | level {c.get('level')} | 5m {bt} -> 1m {rt}")
             return {
                 "symbol": symbol,
@@ -723,6 +745,7 @@ class BacktestEngine:
                 sig.get("direction", None),
                 a_upper_wick_max=BREAKOUT_A_UW_MAX,
                 b_body_max=BREAKOUT_B_BODY_MAX,
+                prev_candle=sig.get("prev_breakout_candle", None),
             )
             retest_grade, retest_desc = self.grader.grade_retest(
                 sig.get("retest_candle", {}),
@@ -774,8 +797,9 @@ class BacktestEngine:
 
         # Level 2+: Apply quality filters based on grades
         if self.pipeline_level >= 2:
-            # Level 2 Quality Filter: Breakout, Retest, and Ignition must be grade C or higher
-            # Reject signals where any component grade is ❌ (D-grade)
+            # Level 2 Quality Filter: Require Breakout and Retest to be >= C.
+            # Continuation/Ignition is post-entry analysis; do not hard-reject on it
+            # for C-level filter. We still track continuation-grade fails for diagnostics.
             pre_filter_count = len(graded_signals)
             filtered_signals = []
 
@@ -791,9 +815,10 @@ class BacktestEngine:
                 if retest_grade == "❌":
                     rejected_retest += 1
                     continue  # Retest failed minimum C criteria
+
+                # Do not reject on continuation here; count for diagnostics only
                 if continuation_grade == "❌":
                     rejected_ignition += 1
-                    continue  # Ignition/Continuation failed minimum C criteria
 
                 # Signal passed Level 2 filters (all three stages at least C grade)
                 filtered_signals.append(s)
@@ -807,9 +832,12 @@ class BacktestEngine:
                 print(f"    Before filter: {pre_filter_count} signals")
                 print(f"    Rejected (breakout ❌): {rejected_breakout}")
                 print(f"    Rejected (retest ❌): {rejected_retest}")
-                print(f"    Rejected (ignition ❌): {rejected_ignition}")
+                print(f"    Continuation graded ❌ (not rejected): {rejected_ignition}")
                 print(f"    Rejected (candle type): {rejected_candle_type}")
-                print(f"    After filter: {filtered_count} signals (passed >= C criteria)")
+                print(
+                    f"    After filter: {filtered_count} signals "
+                    f"(passed >= C criteria on breakout+retest)"
+                )
 
             # Apply min_grade filter if provided (A+/A/B/C overall grade)
             if self.min_grade:
@@ -1029,7 +1057,7 @@ class BacktestEngine:
                         if getattr(ign_ts, "tzinfo", None) is None:
                             ign_ts = ign_ts.tz_localize("UTC")
                         ign_ts_local = ign_ts.tz_convert(self.display_tz)
-                        ign_ts_str = ign_ts_local.strftime("%Y-%m-%d %H:%M:%S ") + self.tz_label
+                        ign_ts_str = ign_ts_local.strftime("%Y-%m-%d %H:%M:%S %Z")
                     except Exception:
                         ign_ts_str = str(ign_ts)
                     info_line = (
@@ -1065,6 +1093,7 @@ class BacktestEngine:
             result["level2_rejections"] = {
                 "breakout_fail": rejected_breakout,
                 "retest_fail": rejected_retest,
+                "ignition_fail": rejected_ignition,
                 "candle_type_fail": rejected_candle_type,
             }
         return result
@@ -1271,6 +1300,95 @@ def generate_markdown_trade_summary(
     return "\n".join(lines)
 
 
+def _convert_times_to_timezone(results: List[Dict], tzinfo, tz_label: str) -> List[Dict]:
+    """Convert datetime-like fields in results to strings in the configured timezone.
+
+    Fields converted (when present):
+    - In signals: datetime, breakout_time_5m, ignition_time
+    - In candidates: datetime, breakout_time_5m
+    - In trades: datetime, exit_time, ignition_time
+
+    Also converts pandas Series objects to dicts for JSON serialization.
+    """
+
+    def to_local_str(ts):
+        try:
+            t = pd.to_datetime(ts)
+            if getattr(t, "tzinfo", None) is None:
+                t = t.tz_localize("UTC")
+            t_local = t.tz_convert(tzinfo)
+            # ISO-8601 with offset for machine-readability
+            return t_local.isoformat(timespec="seconds")
+        except Exception:
+            return str(ts)
+
+    def convert_value(obj):
+        """Recursively convert pandas objects and timestamps for JSON serialization"""
+        if isinstance(obj, pd.Series):
+            return {k: convert_value(v) for k, v in obj.to_dict().items()}
+        elif isinstance(obj, (pd.Timestamp, datetime, date)):
+            return to_local_str(obj)
+        elif isinstance(obj, dict):
+            return {k: convert_value(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_value(item) for item in obj]
+        return obj
+
+    out: List[Dict] = []
+    for res in results:
+        r = dict(res)
+        # Convert signals times
+        sigs = []
+        for s in r.get("signals", []) or []:
+            s2 = dict(s)
+            if "datetime" in s2:
+                s2["datetime"] = to_local_str(s2["datetime"])
+            if "breakout_time_5m" in s2:
+                s2["breakout_time_5m"] = to_local_str(s2["breakout_time_5m"])
+            if "ignition_time" in s2:
+                s2["ignition_time"] = to_local_str(s2["ignition_time"])
+                # Recursively convert all nested objects
+            if "breakout_candle" in s2:
+                s2["breakout_candle"] = convert_value(s2["breakout_candle"])
+            if "retest_candle" in s2:
+                s2["retest_candle"] = convert_value(s2["retest_candle"])
+            if "ignition_candle" in s2:
+                s2["ignition_candle"] = convert_value(s2["ignition_candle"])
+            sigs.append(s2)
+        if sigs:
+            r["signals"] = sigs
+
+        # Convert candidates times
+        cands = []
+        for c in r.get("candidates", []) or []:
+            c2 = dict(c)
+            if "datetime" in c2:
+                c2["datetime"] = to_local_str(c2["datetime"])
+            if "breakout_time_5m" in c2:
+                c2["breakout_time_5m"] = to_local_str(c2["breakout_time_5m"])
+            cands.append(c2)
+        if cands:
+            r["candidates"] = cands
+
+        # Convert trades times
+        trs = []
+        for t in r.get("trades", []) or []:
+            t2 = dict(t)
+            if "datetime" in t2:
+                t2["datetime"] = to_local_str(t2["datetime"])
+            if "exit_time" in t2 and t2["exit_time"] is not None:
+                t2["exit_time"] = to_local_str(t2["exit_time"])
+            if "ignition_time" in t2 and t2["ignition_time"] is not None:
+                t2["ignition_time"] = to_local_str(t2["ignition_time"])
+            trs.append(t2)
+        if trs:
+            r["trades"] = trs
+
+        # Final recursive sweep to convert any remaining nested pandas/datetime/date objects
+        out.append(convert_value(r))
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Backtest Break & Re-Test strategy",
@@ -1286,6 +1404,15 @@ Examples:
   # Custom capital and save results
   python backtest.py --start 2025-10-01 --end 2025-10-31 \
       --initial-capital 50000 --output results.json
+
+  # Override config values (toggle VWAP check off)
+  python backtest.py --start 2025-10-01 --end 2025-10-31 \
+      --config-override feature_level0_enable_vwap_check=false
+
+  # Multiple config overrides
+  python backtest.py --start 2025-10-01 --end 2025-10-31 \
+      --config-override feature_level0_enable_vwap_check=false \
+      --config-override initial_capital=10000
 
 Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         """,
@@ -1385,7 +1512,17 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         ),
     )
 
+    # Add config override support via utility function
+    add_config_override_argument(parser)
+
     args = parser.parse_args()
+
+    # Apply config overrides from command line via utility function
+    apply_config_overrides(CONFIG, args.config_override or [])
+
+    # Update global config-derived constants after overrides
+    global FEATURE_LEVEL0_ENABLE_VWAP_CHECK
+    FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get("feature_level0_enable_vwap_check", True)
 
     # Use default tickers from config if not specified
     symbols = args.symbols if args.symbols else DEFAULT_TICKERS
@@ -1440,23 +1577,26 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     results = []
 
     # Run cache integrity check for the requested symbols/date range before processing
-    try:
-        ic_summary = integrity_check_range(
-            cache_dir=Path(args.cache_dir),
-            symbols=symbols,
-            start_date=start_date,
-            end_date=end_date,
-            intervals=["1m", "5m"],
-            cross_interval=True,
-            skip_weekends=True,
-        )
-        print(
-            "Cache integrity (requested range): "
-            f"checked={ic_summary.get('checked_files')} errors={ic_summary.get('errors')} "
-            f"warnings={ic_summary.get('warnings')} missing={ic_summary.get('missing_files')}"
-        )
-    except Exception as e:
-        print(f"Cache integrity check skipped due to error: {e}")
+    if CONFIG.get("feature_cache_check_integrity", False):
+        try:
+            ic_summary = integrity_check_range(
+                cache_dir=Path(args.cache_dir),
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                intervals=["1m", "5m"],
+                cross_interval=True,
+                skip_weekends=True,
+            )
+            print(
+                "Cache integrity (requested range): "
+                f"checked={ic_summary.get('checked_files')} errors={ic_summary.get('errors')} "
+                f"warnings={ic_summary.get('warnings')} missing={ic_summary.get('missing_files')}"
+            )
+        except Exception as e:
+            print(f"Cache integrity check skipped due to error: {e}")
+    else:
+        print("Cache integrity check disabled (feature_cache_check_integrity=false)")
 
     # Run backtest for each symbol
     for symbol in symbols:
@@ -1499,9 +1639,26 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         results_dir = Path(DEFAULT_RESULTS_DIR)
         results_dir.mkdir(exist_ok=True)
 
-        # Generate default filename if not specified
+        # Always include a timestamp suffix in the configured timezone to ensure unique filenames
+        now_local = datetime.now(tz=display_tz)
+        # Use ISO 8601 format with timezone (sanitized for filename)
+        ts_iso = now_local.isoformat(timespec="seconds")
+        # Replace colons and plus signs for filesystem compatibility
+        ts_str = ts_iso.replace(":", "").replace("+", "")
+
+        # Generate filename (append timestamp for both auto and user-provided names)
         if args.output:
-            output_filename = args.output
+            # Preserve user-provided name but append timestamp before extension if not present
+            user_path = Path(args.output)
+            stem = user_path.stem
+            suffix = user_path.suffix  # includes leading dot or empty
+            # Avoid double-appending if a timestamp suffix already exists in the stem
+            # Updated pattern to match ISO format: _YYYY-MM-DDTHHMMSS-HHMM or _YYYYMMDD_HHMMSS
+            if not re.search(r"_\d{4}-\d{2}-\d{2}T\d{6}-\d{4}$", stem) and not re.search(
+                r"_\d{8}_\d{6}$", stem
+            ):
+                stem = f"{stem}_{ts_str}"
+            output_filename = f"{stem}{suffix}"
         else:
             # Auto-generate filename based on parameters
             symbols_str = "_".join(symbols) if len(symbols) <= 3 else "ALL"
@@ -1509,13 +1666,17 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
             end_str = end_date.replace("-", "")
             level_str = f"level{args.level}"
             grading_str = args.grading_system
-            output_filename = f"{level_str}_{symbols_str}_{start_str}_{end_str}_{grading_str}.json"
+            output_filename = (
+                f"{level_str}_{symbols_str}_{start_str}_{end_str}_{grading_str}_{ts_str}.json"
+            )
 
         # Construct output path in backtest_results directory
         output_path = results_dir / output_filename
 
+        # Convert datetime fields to configured timezone for JSON output
+        results_local = _convert_times_to_timezone(results, display_tz, tz_label)
         with open(output_path, "w") as f:
-            json.dump(results, f, indent=2, default=str)
+            json.dump(results_local, f, indent=2)
         print(f"Results saved to {output_path}")
 
         # Also save Markdown summary next to JSON

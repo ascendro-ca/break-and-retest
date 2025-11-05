@@ -1,9 +1,9 @@
-# ruff: noqa: I001
+# ruff: noqa: I001, E402, F821, E501
 """
 Break & Re-Test Live Scanner (CLI)
 
-Thin CLI wrapper that uses the core scanning logic from
-`break_and_retest_strategy.scan_ticker` and prints graded results.
+**DEPRECATED**: This file is obsolete and non-functional.
+break_and_retest_strategy.py has been removed.
 
 Usage examples:
   python break_and_retest_live_scanner.py --tickers AAPL,MSFT --min-grade A
@@ -15,14 +15,9 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from break_and_retest_strategy import (
-    DEFAULT_RETRY_DELAY,
-    DEFAULT_RETRIES,
-    LOOKBACK,
-    MARKET_OPEN_MINUTES,
-    TIMEFRAME,
-    TICKERS,
-    scan_ticker,
+raise ImportError(
+    "break_and_retest_strategy.py has been removed. "
+    "Please update this script to use the new live scanner logic."
 )
 from time_utils import get_display_timezone
 

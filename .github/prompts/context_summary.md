@@ -1,6 +1,93 @@
 # Break & Retest Strategy - Context Summary
 
-## Recent Work Completed (Nov 3-4, 2025)
+## Recent Work Completed (Nov 4, 2025 - Current Session)
+
+### 1. VWAP Alignment Moved to Retest Stage
+- **Change**: Moved VWAP alignment check from Stage 2 (Breakout) to Stage 3 (Retest)
+- **Rationale**:
+  - Reduces false negatives at breakout detection
+  - Confirms institutional flow alignment at actual entry point (retest)
+  - Better aligns with strategy logic - breakout shows momentum, retest confirms alignment
+- **Implementation**:
+  - Added 0.05% buffer for VWAP alignment tolerance
+  - Long: retest close ≥ VWAP - 0.05%
+  - Short: retest close ≤ VWAP + 0.05%
+- **Code Changes**: Updated `stage_breakout.py` and `stage_retest.py`, added VWAP calculation helper
+
+### 2. Relaxed Base Breakout Criteria (Level 0/1)
+- **Purpose**: Increase candidate pool by allowing edge cases that maintain momentum
+- **Changes**:
+  - **Open tolerance**: ±0.25% for gap continuation cases
+    - Long: open ≤ OR high + 0.25% (allows slight gap above)
+    - Short: open ≥ OR low - 0.25% (allows slight gap below)
+  - **Close tolerance**: ±$0.01 (1-tick) for near-miss closes
+    - Long: close ≥ OR high - $0.01
+    - Short: close ≤ OR low + $0.01
+- **Impact**: Level 1 candidates increased from ~170 to 402 trades
+- **Win Rate**: Maintained at ~40% (quality not diluted by relaxation)
+
+### 3. Backtest Auto-Save Improvements
+- **Default Behavior**: Results now auto-save by default (previously required `--output` flag)
+- **Output Directory**: Saves to `backtest_results/` directory (configurable in config.json)
+- **Filename Generation**: Auto-generates descriptive filenames:
+  - Format: `level{N}_{SYMBOLS}_{START}_{END}_{GRADING}.json`
+  - Example: `level2_AAPL_MSFT_20250701_20251031_points.json`
+- **New Flag**: Added `--console-only` to disable file output when desired
+- **Cleanup**: Fixed nested `backtest_results/` folder issue, consolidated files
+
+### 4. Git Hooks Consolidation
+- **Change**: Moved unit tests from pre-push to pre-commit hook
+- **Implementation**:
+  - Single pre-commit hook now runs `make qa` (format + lint + unit tests)
+  - Removed pre-push hook entirely
+- **Rationale**: Catch issues earlier in the workflow, align with project guidelines
+- **Files Updated**: `.pre-commit-config.yaml`, `Makefile`
+
+### 5. Documentation Synchronization
+- **Files Updated**:
+  - `ARCHITECTURE.md`: Module descriptions, VWAP location change
+  - `STRATEGY_SPEC.md`: VWAP alignment details at retest stage
+  - `STRATEGY_DESIGN.md`: Rationale for VWAP move
+  - `STRATEGY_IMPLEMENTATION.md`: Updated detection pipeline logic
+  - `B_AND_R_STRATEGY.md`: Moved VWAP section to Step 7
+  - `GRADING_SYSTEMS.md`: Clarified VWAP alignment timing
+  - `README.md`: Updated module descriptions
+- **Result**: All documentation now consistent with code implementation
+
+### 6. Test Updates for VWAP Changes
+- **Updated Tests**:
+  - `test_stage_modules.py`: Adjusted for VWAP at retest stage
+  - Added VWAP calculation to retest test fixtures
+  - Removed VWAP requirement from breakout tests
+  - Updated test expectations for relaxed breakout criteria
+- **Test Results**: All 130 unit tests + 20 functional tests passing
+
+### 7. Backtest Results Validation
+- **Level 1 Re-run**: 402 trades identified, ~40% win rate (baseline)
+- **Level 2 Run**: 10 trades, 70% win rate
+- **Grade Distribution (Level 2)**:
+  - C grade: 7 trades
+  - B grade: 3 trades
+  - No A-grade trades in this dataset
+- **Observation**: Quality filter working as designed
+
+### 8. CI/QA Pipeline Enhancement
+- **Coverage Configuration**: Updated `.coveragerc` with additional omissions
+- **Makefile Updates**: Consolidated hooks target (pre-commit only)
+- **Full QA Suite**: `make qa-full` passing all checks:
+  - ✅ Format: 42 files properly formatted
+  - ✅ Lint: No errors or warnings
+  - ✅ Unit Tests: 130 passed, 1 skipped
+  - ✅ Functional Tests: 20 passed
+  - ✅ Coverage: 83.11% (≥80% threshold)
+
+### 9. Git Commit & Push
+- **Commit**: Successfully committed all changes with comprehensive message
+- **Push**: Pushed to `feature/backtestv2` branch
+- **Files Changed**: 19 files (424 insertions, 120 deletions)
+- **New Files**: Added `.github/prompts/` documentation
+
+## Previous Work (Nov 3-4, 2025)
 
 ### 1. Entry Timing Bug Fix (Critical)
 - **Problem**: Backtest was entering trades at Stage 3 (retest) instead of Stage 4 (ignition), causing 77% loss rate
