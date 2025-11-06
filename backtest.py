@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import sys
 from datetime import datetime, timedelta, date
 import json
 import math
@@ -194,6 +195,7 @@ class BacktestEngine:
         pipeline_level: int = 0,
         no_trades: bool = False,
         grading_system: str = "points",
+        min_rr_ratio: float = 2.0,
     ):
         """
         Initialize backtest engine
@@ -228,6 +230,7 @@ class BacktestEngine:
         self.display_tz = display_tzinfo
         self.tz_label = tz_label
         self.retest_vol_threshold = retest_vol_threshold
+        self.min_rr_ratio = min_rr_ratio
 
         # Pipeline level determines filtering strictness and trade behavior
         # Level 0: Candidates only (no trades ever)
@@ -520,16 +523,25 @@ class BacktestEngine:
                     continue
 
                 breakout_up = direction == "long"
-                # Stop below/above retest candle with a 5c buffer
-                stop = (
-                    float(retest_candle.get("Low", entry)) - 0.05
-                    if breakout_up
-                    else float(retest_candle.get("High", entry)) + 0.05
-                )
+                # Stop below/above retest candle with a 0.5% buffer of the breakout distance
+                if breakout_up:
+                    breakout_distance = abs(entry - float(retest_candle.get("Low", entry)))
+                    buffer = 0.005 * breakout_distance  # 0.5% of breakout distance
+                    stop = float(retest_candle.get("Low", entry)) - buffer
+                else:
+                    breakout_distance = abs(entry - float(retest_candle.get("High", entry)))
+                    buffer = 0.005 * breakout_distance  # 0.5% of breakout distance
+                    stop = float(retest_candle.get("High", entry)) + buffer
+                # Ensure stop is not more than 0.5% of entry price away (cap risk per share at 0.5% of entry)
+                max_stop_distance = 0.005 * abs(entry)
+                if breakout_up:
+                    stop = max(stop, entry - max_stop_distance)
+                else:
+                    stop = min(stop, entry + max_stop_distance)
                 risk = abs(entry - stop)
                 if risk == 0 or not pd.notna(risk):
                     continue
-                target = entry + 2 * risk if breakout_up else entry - 2 * risk
+                target = entry + self.min_rr_ratio * risk if breakout_up else entry - self.min_rr_ratio * risk
 
                 # Grading metadata from breakout/retest only (ignition is post-entry)
                 try:
@@ -1016,6 +1028,7 @@ class BacktestEngine:
                 "shares": shares,
                 "pnl": pnl,
                 "outcome": outcome,
+                "risk_amount": risk_per_trade,  # Dollar amount risked per position
                 # Continuation diagnostics (post-entry informational only)
                 **{k: v for k, v in continuation_diag.items() if v is not None},
             }
@@ -1027,6 +1040,7 @@ class BacktestEngine:
                 trade_dict["rr_grade"] = sig["component_grades"].get("rr")
                 trade_dict["context_grade"] = sig["component_grades"].get("context")
                 trade_dict["overall_grade"] = sig.get("overall_grade")
+                trade_dict["rr_ratio"] = sig.get("rr_ratio", 0.0)
 
                 # Add detailed descriptions
                 if "component_descriptions" in sig:
@@ -1215,9 +1229,9 @@ def generate_markdown_trade_summary(
     lines.append(f"_Timezone: {tz_label}_\n")
     lines.append(
         f"| Date ({tz_label}) | Entry Time | Exit Time | Time in trade (min) | "
-        "Symbol | Dir | Entry | Stop | Target | Exit | Outcome | P&L | Shares |"
+        "Symbol | Dir | Entry | Stop | Target | Exit | Outcome | Risk | R/R | P&L | Shares |"
     )
-    lines.append("|---|---|---|---:|---|---:|---:|---:|---:|---:|---|---:|---:|")
+    lines.append("|---|---|---|---:|---|---:|---:|---:|---:|---:|---|---:|---:|---:|")
 
     total = 0
     winners = 0
@@ -1280,6 +1294,8 @@ def generate_markdown_trade_summary(
                     f(tr.get("target")),
                     f(tr.get("exit")),
                     tr.get("outcome", ""),
+                    f(tr.get("risk_amount")),
+                    f(tr.get("rr_ratio", "")),
                     f(tr.get("pnl")),
                     str(tr.get("shares", "")),
                 ]
@@ -1424,12 +1440,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     )
     parser.add_argument("--start", required=False, default=None, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", required=False, default=None, help="End date (YYYY-MM-DD)")
-    parser.add_argument(
-        "--initial-capital",
-        type=float,
-        default=DEFAULT_INITIAL_CAPITAL,
-        help=f"Initial capital (default: {DEFAULT_INITIAL_CAPITAL} from config.json if set)",
-    )
+
     parser.add_argument(
         "--position-size",
         type=float,
@@ -1520,12 +1531,21 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     # Apply config overrides from command line via utility function
     apply_config_overrides(CONFIG, args.config_override or [])
 
-    # Update global config-derived constants after overrides
+    # Update config-derived options and feature flags after overrides
     global FEATURE_LEVEL0_ENABLE_VWAP_CHECK
-    FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get("feature_level0_enable_vwap_check", True)
+    FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get("feature_level0_enable_vwap_check", FEATURE_LEVEL0_ENABLE_VWAP_CHECK)
+
+    # Runtime values resolved from CONFIG (do not mutate module-level defaults here)
+    runtime_results_dir = CONFIG.get("backtest_results_dir", DEFAULT_RESULTS_DIR)
+    runtime_retest_vol_gate = CONFIG.get("retest_volume_gate_ratio", RETEST_VOL_GATE)
+    min_rr_ratio = CONFIG.get("min_rr_ratio", 2.0)
+
+    # If leverage wasn't explicitly provided, allow config override to drive it
+    if "--leverage" not in sys.argv and "leverage" in CONFIG:
+        args.leverage = float(CONFIG["leverage"]) 
 
     # Use default tickers from config if not specified
-    symbols = args.symbols if args.symbols else DEFAULT_TICKERS
+    symbols = args.symbols if args.symbols else CONFIG.get("tickers", DEFAULT_TICKERS)
 
     # Determine date range
     start_date = args.start
@@ -1543,7 +1563,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
 
     print(f"Backtesting symbols: {', '.join(symbols)}")
     print(f"Date range: {start_date} to {end_date}")
-    print(f"Initial capital: ${args.initial_capital:,.2f}")
+    print(f"Initial capital: ${CONFIG.get('initial_capital', DEFAULT_INITIAL_CAPITAL):,.2f}")
     print(f"Leverage: {args.leverage}x")
     print(f"Pipeline Level: {pipeline_level}")
     if args.no_trades and pipeline_level > 0:
@@ -1561,17 +1581,18 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     display_tz, tz_label = get_display_timezone(Path(__file__).parent)
 
     engine = BacktestEngine(
-        initial_capital=args.initial_capital,
+        initial_capital=float(CONFIG.get("initial_capital", DEFAULT_INITIAL_CAPITAL)),
         position_size_pct=args.position_size,
         leverage=args.leverage,
         min_grade=args.min_grade,
         breakout_tier_filter=args.breakout_tier,
         display_tzinfo=display_tz,
         tz_label=tz_label,
-        retest_vol_threshold=RETEST_VOL_GATE,
+        retest_vol_threshold=runtime_retest_vol_gate,
         pipeline_level=pipeline_level,
         no_trades=args.no_trades,
         grading_system=args.grading_system,
+        min_rr_ratio=min_rr_ratio,
     )
 
     results = []
@@ -1636,7 +1657,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     # Save results by default unless --console-only is specified
     if not args.console_only:
         # Create backtest_results directory if it doesn't exist
-        results_dir = Path(DEFAULT_RESULTS_DIR)
+        results_dir = Path(runtime_results_dir)
         results_dir.mkdir(exist_ok=True)
 
         # Always include a timestamp suffix in the configured timezone to ensure unique filenames
