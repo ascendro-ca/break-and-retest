@@ -33,7 +33,6 @@ from time_utils import get_display_timezone, get_timezone_label_for_date
 from trade_setup_pipeline import run_pipeline
 from stage_opening_range import detect_opening_range
 
-
 CONFIG = load_config()
 DEFAULT_TICKERS = CONFIG["tickers"]
 DEFAULT_INITIAL_CAPITAL = CONFIG.get("initial_capital", 7500)
@@ -187,8 +186,7 @@ class BacktestEngine:
         leverage: float = 1.0,
         max_positions: int = 3,
         scan_window_minutes: int = 180,
-        min_grade: Optional[str] = None,
-        breakout_tier_filter: Optional[str] = None,
+        # Removed: min_grade and breakout_tier_filter parameters
         display_tzinfo=None,
         tz_label: str = "UTC",
         retest_vol_threshold: float = 0.15,
@@ -208,9 +206,10 @@ class BacktestEngine:
             leverage: Max notional leverage (1.0 = no leverage).
                       Caps shares by notional <= cash * leverage
             pipeline_level: Pipeline strictness level
-                           Level 0: Candidates only (no trades, Stages 1-3)
-                           Level 1: Trades with base criteria (Stages 1-3, no ignition)
-                           Level 2+: Enhanced filtering (may include Stage 4)
+                - Level 0: Candidates only (no trades, Stages 1-3)
+                - Level 1: Trades with base criteria (Stages 1-3, no ignition)
+                - Level 2: Enhanced filtering – Breakout and RR >= C (Stage 4)
+                - Level 3+: Stricter filtering – components >= C and overall grade >= B
             no_trades: If True, only identify candidates without executing trades (Level 1+ only)
         """
         self.initial_capital = initial_capital
@@ -222,10 +221,7 @@ class BacktestEngine:
         self.positions = []
         self.closed_trades = []
         self.equity_curve = []
-        # Optional minimum grade filter (A+, A, B, C)
-        self.min_grade = min_grade
-        # Optional breakout tier filter (A, B, or C)
-        self.breakout_tier_filter = breakout_tier_filter
+        # Removed filtering attributes (min_grade, breakout_tier_filter)
         # Reporting timezone for printing
         self.display_tz = display_tzinfo
         self.tz_label = tz_label
@@ -326,15 +322,91 @@ class BacktestEngine:
         trading_days = df_5m["Date"].unique()
 
         for day in trading_days:
-            # Get 5-minute data for this day during market hours (09:30-16:00)
+            # Get 5-minute data for this day during regular market hours (09:30-16:00 ET).
+            # Data is stored in UTC; convert to America/New_York for session slicing to avoid
+            # confusion with config display timezone (e.g., PST used only for reporting).
             day_df_5m = df_5m[df_5m["Date"] == day].copy()
-            session_df_5m = day_df_5m[
-                (day_df_5m["Datetime"].dt.strftime("%H:%M") >= "09:30")
-                & (day_df_5m["Datetime"].dt.strftime("%H:%M") < "16:00")
-            ]
+            try:
+                et_tz = ZoneInfo("America/New_York")
+            except Exception:
+                et_tz = None
+
+            # Resolve configured session boundaries (strings "HH:MM")
+            # Prefer new ET session boundary keys with fallback to legacy names
+            sess_start_str = str(CONFIG.get("session_start_et", "09:30")).strip()
+            sess_end_str = str(CONFIG.get("session_end_et", "16:00")).strip()
+
+            # Convert timestamps to ET for hour:minute comparisons (DST-safe)
+            if et_tz is not None:
+                # Handle tz-naive: tests may pass ET-like naive timestamps.
+                # Localize as America/New_York to preserve 09:30–16:00 session window.
+                dt_series = day_df_5m["Datetime"]
+                try:
+                    if dt_series.dt.tz is None:
+                        # Interpret naive timestamps as America/New_York (market local time)
+                        dt_series = dt_series.dt.tz_localize(et_tz)
+                    else:
+                        dt_series = dt_series.dt.tz_convert(et_tz)
+                except Exception:
+                    # Fallback: leave as-is if any localization error
+                    pass
+                local_et = dt_series
+                session_df_5m = day_df_5m[
+                    (local_et.dt.strftime("%H:%M") >= sess_start_str)
+                    & (local_et.dt.strftime("%H:%M") < sess_end_str)
+                ]
+            else:
+                # Fallback: compare as strings in current tz (should be UTC) – less precise
+                session_df_5m = day_df_5m[
+                    (day_df_5m["Datetime"].dt.strftime("%H:%M") >= sess_start_str)
+                    & (day_df_5m["Datetime"].dt.strftime("%H:%M") < sess_end_str)
+                ]
 
             if len(session_df_5m) < 10:
                 continue
+
+            # -------------------------------------------------------------
+            # Session completeness & anchored open handling
+            # -------------------------------------------------------------
+            # Some cached intraday days are truncated (e.g. start mid-session
+            # around 14:30 ET instead of the expected 09:30–09:35 ET first 5m
+            # bar). When that happens the existing logic incorrectly treats
+            # the first available 5m candle as the session "open" and runs the
+            # 90‑minute breakout window from mid‑day, producing false candidates
+            # and trades well beyond the intended early-session window.
+            #
+            # We detect truncation by comparing the first 5m candle's ET time
+            # to the expected opening range bar time. Because 5m resampling
+            # uses label='right', the first 5m bar covering 09:31–09:35 prints
+            # at 09:35 ET. We accept any first bar between 09:30 and 09:40 ET
+            # (allowing a missing initial bar), but if the first bar is later
+            # than 10:00 ET we treat the day as incomplete and skip it rather
+            # than mis-anchor the breakout window.
+            try:
+                first_bar_et = None
+                if et_tz is not None:
+                    fb = session_df_5m.iloc[0]["Datetime"]
+                    # If first bar is tz-naive treat it as local ET.
+                    # Tests often supply naive times.
+                    # Localize to America/New_York (not UTC) to avoid a 5h shift.
+                    if getattr(fb, "tzinfo", None) is None:
+                        fb = fb.tz_localize(et_tz)
+                    else:
+                        fb = fb.astimezone(et_tz)
+                    first_bar_et = fb
+                if first_bar_et is not None:
+                    if first_bar_et.hour > 10 or (
+                        first_bar_et.hour == 10 and first_bar_et.minute > 0
+                    ):
+                        print(
+                            "Skipping {} {} (truncated; first 5m {} ET)".format(
+                                symbol, day, first_bar_et.strftime("%H:%M")
+                            )
+                        )
+                        continue
+            except Exception:
+                # If any conversion error occurs, proceed without the safeguard.
+                pass
 
             # Calculate VWAP for the session
             session_df_5m = session_df_5m.copy()
@@ -346,12 +418,47 @@ class BacktestEngine:
                 session_df_5m["tp_volume"].cumsum() / session_df_5m["Volume"].cumsum()
             )
 
-            # Scan the first 90 minutes of 5-minute data for breakouts (18 bars)
-            start_time = session_df_5m["Datetime"].iloc[0]
-            end_time = start_time + timedelta(minutes=90)
-            scan_df_5m = session_df_5m[
-                (session_df_5m["Datetime"] >= start_time) & (session_df_5m["Datetime"] < end_time)
-            ].copy()
+            # Scan only the configured first N minutes of 5-minute data for
+            # breakouts. Default remains 90 if not present in CONFIG.
+            market_open_minutes = int(CONFIG.get("market_open_minutes", 90))
+            # Anchor breakout scan to the *expected* session open instead of
+            # the first available (which may be mid‑session on truncated days).
+            # Expected open (5m bar label) ~09:35 ET; we'll anchor at 09:30 ET
+            # and still allow the pipeline to define OR from the first bar we pass.
+            if et_tz is not None:
+                sess_date_et = first_bar_et.date() if first_bar_et else day
+                # 09:30 ET anchor in UTC
+                expected_open_et = datetime.combine(sess_date_et, datetime.min.time()).replace(
+                    hour=9, minute=30, tzinfo=et_tz
+                )
+                expected_open_utc = expected_open_et.astimezone(ZoneInfo("UTC"))
+                end_time = expected_open_utc + timedelta(minutes=market_open_minutes)
+
+                # Ensure session_df_5m Datetime is tz-aware UTC for safe comparison.
+                dt_cmp = session_df_5m["Datetime"]
+                try:
+                    if getattr(dt_cmp.dt, "tz", None) is None:
+                        # Treat naive times as ET (already sliced by ET clock) then convert to UTC
+                        dt_cmp = dt_cmp.dt.tz_localize(et_tz).dt.tz_convert(ZoneInfo("UTC"))
+                    else:
+                        dt_cmp = dt_cmp.dt.tz_convert(ZoneInfo("UTC"))
+                    session_df_5m["Datetime"] = dt_cmp
+                except Exception:
+                    # Fallback: conversion failed; assume naive timestamps are UTC and localize
+                    if getattr(session_df_5m["Datetime"].dt, "tz", None) is None:
+                        session_df_5m["Datetime"] = session_df_5m["Datetime"].dt.tz_localize("UTC")
+
+                scan_df_5m = session_df_5m[
+                    (session_df_5m["Datetime"] >= expected_open_utc)
+                    & (session_df_5m["Datetime"] < end_time)
+                ].copy()
+            else:
+                start_time = session_df_5m["Datetime"].iloc[0]
+                end_time = start_time + timedelta(minutes=market_open_minutes)
+                scan_df_5m = session_df_5m[
+                    (session_df_5m["Datetime"] >= start_time)
+                    & (session_df_5m["Datetime"] < end_time)
+                ].copy()
 
             if len(scan_df_5m) < 10:
                 continue
@@ -376,6 +483,37 @@ class BacktestEngine:
                     window_minutes=240,  # Cover full session plus buffer
                 )
 
+            # Normalize 1m to the regular session window [09:30, 16:00) ET so that
+            # Stage 3 (retest) anchors market_open consistently at 09:30 when it
+            # reads session_df_1m.iloc[0]. This avoids early/late pre/post market bars
+            # shifting the 90-minute window.
+            if et_tz is not None and not session_df_1m.empty:
+                # Deterministic tz normalization:
+                # 1) Interpret tz-naive as America/New_York, then convert to UTC
+                # 2) If tz-aware, convert to UTC
+                dt_sr = pd.to_datetime(session_df_1m["Datetime"], errors="coerce")
+                if getattr(dt_sr.dt, "tz", None) is None:
+                    dt_sr_utc = dt_sr.dt.tz_localize(et_tz).dt.tz_convert(ZoneInfo("UTC"))
+                else:
+                    dt_sr_utc = dt_sr.dt.tz_convert(ZoneInfo("UTC"))
+                session_df_1m["Datetime"] = dt_sr_utc
+
+                # Build ET anchors from the same calendar session
+                et_local = dt_sr_utc.dt.tz_convert(et_tz)
+                sess_date_et = et_local.iloc[0].date()
+                expected_open_et = datetime.combine(sess_date_et, datetime.min.time()).replace(
+                    hour=9, minute=30, tzinfo=et_tz
+                )
+                expected_close_et = datetime.combine(sess_date_et, datetime.min.time()).replace(
+                    hour=16, minute=0, tzinfo=et_tz
+                )
+                open_utc = expected_open_et.astimezone(ZoneInfo("UTC"))
+                close_utc = expected_close_et.astimezone(ZoneInfo("UTC"))
+                session_df_1m = session_df_1m[
+                    (session_df_1m["Datetime"] >= open_utc)
+                    & (session_df_1m["Datetime"] < close_utc)
+                ].copy()
+
             if session_df_1m.empty or len(session_df_1m) < 50:
                 # No 1m data available for this day, skip
                 continue
@@ -383,13 +521,14 @@ class BacktestEngine:
             if self.pipeline_level == 0:
                 # Level 0: Base pipeline - Delegate Stage 1-3 detection to shared pipeline
                 # (Ignition detection disabled at Level 0)
+                # Level 0 now uses level0_retest_filter for retest detection (body at/beyond OR)
                 candidates = run_pipeline(
-                    session_df_5m=session_df_5m,
+                    session_df_5m=scan_df_5m,
                     session_df_1m=session_df_1m,
-                    breakout_window_minutes=90,
+                    breakout_window_minutes=market_open_minutes,
                     retest_lookahead_minutes=30,
                     pipeline_level=0,
-                    enable_vwap_check=FEATURE_LEVEL0_ENABLE_VWAP_CHECK,
+                    enable_vwap_check=False,  # VWAP check disabled for Level 0
                 )
 
                 for c in candidates:
@@ -461,12 +600,13 @@ class BacktestEngine:
             or_range = float(or_info.get("high", 0.0)) - float(or_info.get("low", 0.0))
 
             pipeline_candidates = run_pipeline(
-                session_df_5m=session_df_5m,
+                session_df_5m=scan_df_5m,
                 session_df_1m=session_df_1m,
-                breakout_window_minutes=90,
+                breakout_window_minutes=market_open_minutes,
                 retest_lookahead_minutes=30,
                 pipeline_level=self.pipeline_level,
-                enable_vwap_check=FEATURE_LEVEL0_ENABLE_VWAP_CHECK,
+                # VWAP check disabled for all levels (0/1/2+) for now
+                enable_vwap_check=False,
             )
 
             for cand in pipeline_candidates:
@@ -478,6 +618,7 @@ class BacktestEngine:
                 retest_time = pd.to_datetime(cand.get("retest_time"))
 
                 # Level 2+: Entry at ignition (Stage 4); Level 1: Entry at next bar after retest
+                ignition_bar = None  # We'll always try to capture an ignition candle for analytics
                 if self.pipeline_level >= 2:
                     # Wait for ignition before entering (or skip if no ignition detected)
                     ignition_time_raw = cand.get("ignition_time")
@@ -492,6 +633,12 @@ class BacktestEngine:
                     entry_bar = next_bars.iloc[0]
                     entry_time = entry_bar["Datetime"]
                     entry = float(entry_bar.get("Open"))
+                    # For unified schema capture the actual ignition bar (from pipeline if present)
+                    ignition_bar = session_df_1m[session_df_1m["Datetime"] == ignition_time]
+                    if not ignition_bar.empty:
+                        ignition_bar = ignition_bar.iloc[0]
+                    else:
+                        ignition_bar = None
                 else:
                     # Level 1: Wait for first 1m candle after retest that closes above
                     # (long) or below (short) retest close, then enter on open of next candle
@@ -510,6 +657,8 @@ class BacktestEngine:
                         continue  # No ignition found, skip
                     # Get the next bar after ignition for entry
                     ignition_time = after_retest.loc[ignition_idx, "Datetime"]
+                    # Capture ignition bar for Level 1 as well (unified analytics)
+                    ignition_bar = after_retest.loc[ignition_idx]
                     next_bars = session_df_1m[session_df_1m["Datetime"] > ignition_time]
                     if next_bars.empty:
                         continue
@@ -517,8 +666,10 @@ class BacktestEngine:
                     entry_time = entry_bar["Datetime"]
                     entry = float(entry_bar.get("Open"))
 
-                # CRITICAL: Only enter trades within the first 90 minutes of regular market hours
-                # Market opens at 09:30 ET, so 90-minute window ends at 11:00 ET
+                # CRITICAL: Only enter trades within the configured first
+                # market_open_minutes window. Market opens at 09:30 ET; the
+                # window ends at 09:30 + market_open_minutes. This enforces
+                # identical temporal logic for all levels using the config.
                 if entry_time >= end_time:
                     continue
 
@@ -532,7 +683,8 @@ class BacktestEngine:
                     breakout_distance = abs(entry - float(retest_candle.get("High", entry)))
                     buffer = 0.005 * breakout_distance  # 0.5% of breakout distance
                     stop = float(retest_candle.get("High", entry)) + buffer
-                # Ensure stop is not more than 0.5% of entry price away (cap risk per share at 0.5% of entry)
+                # Ensure stop is not more than 0.5% of entry price away
+                # (cap risk per share at 0.5% of entry)
                 max_stop_distance = 0.005 * abs(entry)
                 if breakout_up:
                     stop = max(stop, entry - max_stop_distance)
@@ -541,20 +693,24 @@ class BacktestEngine:
                 risk = abs(entry - stop)
                 if risk == 0 or not pd.notna(risk):
                     continue
-                target = entry + self.min_rr_ratio * risk if breakout_up else entry - self.min_rr_ratio * risk
+                target = (
+                    entry + self.min_rr_ratio * risk
+                    if breakout_up
+                    else entry - self.min_rr_ratio * risk
+                )
 
                 # Grading metadata from breakout/retest only (ignition is post-entry)
                 try:
                     breakout_body_pct = abs(
-                        float(breakout_candle.get("Close")) - float(breakout_candle.get("Open"))
+                        float(breakout_candle["Close"]) - float(breakout_candle["Open"])
                     ) / max(
-                        float(breakout_candle.get("High")) - float(breakout_candle.get("Low")),
+                        float(breakout_candle["High"]) - float(breakout_candle["Low"]),
                         1e-9,
                     )
                 except Exception:
                     breakout_body_pct = 0.0
                 try:
-                    breakout_vol_ratio = float(breakout_candle.get("Volume", 0.0)) / max(
+                    breakout_vol_ratio = float(breakout_candle["Volume"]) / max(
                         float(
                             session_df_5m.loc[
                                 session_df_5m["Datetime"] == breakout_time, "vol_ma"
@@ -565,8 +721,8 @@ class BacktestEngine:
                 except Exception:
                     breakout_vol_ratio = 0.0
                 try:
-                    retest_vol_ratio = float(retest_candle.get("Volume", 0.0)) / max(
-                        float(breakout_candle.get("Volume", 0.0)), 1e-9
+                    retest_vol_ratio = float(retest_candle["Volume"]) / max(
+                        float(breakout_candle["Volume"]), 1e-9
                     )
                 except Exception:
                     retest_vol_ratio = 0.0
@@ -581,8 +737,8 @@ class BacktestEngine:
                     "level": level,
                     "datetime": entry_time,
                     "breakout_time_5m": breakout_time,
-                    "vol_breakout_5m": breakout_candle.get("Volume"),
-                    "vol_retest_1m": retest_candle.get("Volume"),
+                    "vol_breakout_5m": breakout_candle["Volume"],
+                    "vol_retest_1m": retest_candle["Volume"],
                     # Grading metadata
                     "breakout_candle": breakout_candle,
                     "prev_breakout_candle": cand.get("prev_breakout_candle"),
@@ -594,58 +750,69 @@ class BacktestEngine:
                     "or_range": or_range,
                 }
 
-                # If Level 2+, attach ignition info when available
-                if self.pipeline_level >= 2 and "ignition_candle" in cand:
-                    ign = cand.get("ignition_candle")
-                    if ign is not None:
-                        ign_vol = ign.get("Volume") if isinstance(ign, dict) else ign["Volume"]
+                # Unified ignition analytics (Level 1 & 2): attach ignition info if we have a bar
+                # For Level 2 we prefer pipeline-provided ignition_candle (cand['ignition_candle']).
+                # For Level 1 we synthesized 'ignition_bar'.
+                ign_source = None
+                if "ignition_candle" in cand and cand.get("ignition_candle") is not None:
+                    ign_source = cand.get("ignition_candle")
+                elif ignition_bar is not None:
+                    # Build dict from the captured ignition bar (Series)
+                    try:
+                        ign_source = {
+                            "Datetime": ignition_bar.get("Datetime"),
+                            "Open": ignition_bar.get("Open"),
+                            "High": ignition_bar.get("High"),
+                            "Low": ignition_bar.get("Low"),
+                            "Close": ignition_bar.get("Close"),
+                            "Volume": ignition_bar.get("Volume"),
+                        }
+                    except Exception:
+                        ign_source = None
+
+                if ign_source is not None:
+                    ign_vol = ign_source.get("Volume") if isinstance(ign_source, dict) else None
+                    signal.update(
+                        {
+                            "ignition_candle": ign_source,
+                            "vol_ignition_1m": ign_vol,
+                        }
+                    )
+                    # Compute ignition metrics for grading (robust to missing)
+                    try:
+                        ign_open = float(ign_source.get("Open"))
+                        ign_high = float(ign_source.get("High"))
+                        ign_low = float(ign_source.get("Low"))
+                        ign_close = float(ign_source.get("Close"))
+                        ign_range = max(ign_high - ign_low, 1e-9)
+                        ignition_body_pct = abs(ign_close - ign_open) / ign_range
+                        retest_vol_f = float(retest_candle.get("Volume", 0.0))
+                        ignition_vol_ratio = (
+                            float(ign_vol) / retest_vol_f if retest_vol_f > 0 else 0.0
+                        )
+                        # Distance to target measured at ignition close vs target progression
+                        if direction == "long":
+                            denom = target - entry
+                            progress = (ign_close - entry) / denom if denom != 0 else 0.0
+                        else:
+                            denom = entry - target
+                            progress = (entry - ign_close) / denom if denom != 0 else 0.0
+                        distance_to_target = max(0.0, min(1.0, float(progress)))
                         signal.update(
                             {
-                                "ignition_candle": ign,
-                                "vol_ignition_1m": ign_vol,
+                                "ignition_body_pct": ignition_body_pct,
+                                "ignition_vol_ratio": ignition_vol_ratio,
+                                "distance_to_target": distance_to_target,
                             }
                         )
-
-                        # Compute ignition metrics for grading
-                        try:
-                            ign_open = float(ign.get("Open"))
-                            ign_high = float(ign.get("High"))
-                            ign_low = float(ign.get("Low"))
-                            ign_close = float(ign.get("Close"))
-                            ign_range = max(ign_high - ign_low, 1e-9)
-                            ignition_body_pct = abs(ign_close - ign_open) / ign_range
-
-                            # Volume ratio: ignition vs RETEST (not breakout) per spec
-                            retest_vol_f = float(retest_candle.get("Volume", 0.0))
-                            ignition_vol_ratio = (
-                                float(ign_vol) / retest_vol_f if retest_vol_f > 0 else 0.0
-                            )
-
-                            # Distance to target (entry is at ignition open)
-                            if direction == "long":
-                                denom = target - entry
-                                progress = (ign_close - entry) / denom if denom != 0 else 0.0
-                            else:
-                                denom = entry - target
-                                progress = (entry - ign_close) / denom if denom != 0 else 0.0
-                            distance_to_target = max(0.0, min(1.0, float(progress)))
-
-                            signal.update(
-                                {
-                                    "ignition_body_pct": ignition_body_pct,
-                                    "ignition_vol_ratio": ignition_vol_ratio,
-                                    "distance_to_target": distance_to_target,
-                                }
-                            )
-                        except Exception:
-                            # If metrics can't be computed, set defaults
-                            signal.update(
-                                {
-                                    "ignition_body_pct": 0.0,
-                                    "ignition_vol_ratio": 0.0,
-                                    "distance_to_target": 0.0,
-                                }
-                            )
+                    except Exception:
+                        signal.update(
+                            {
+                                "ignition_body_pct": 0.0,
+                                "ignition_vol_ratio": 0.0,
+                                "distance_to_target": 0.0,
+                            }
+                        )
 
                 all_signals.append(signal)
 
@@ -742,26 +909,41 @@ class BacktestEngine:
                 "candidate_count": 0,
             }
 
-        # Compute grades for each signal and optionally filter by min_grade
+        # Compute grades for each signal (no min_grade filtering)
         def compute_grades(sig: Dict) -> Dict:
             entry = sig["entry"]
             stop = sig["stop"]
             target = sig["target"]
             rr_ratio = abs(target - entry) / abs(entry - stop) if entry != stop else 0.0
 
+            # Ensure breakout_candle is a dict
+            breakout_candle_data = sig.get("breakout_candle", {})
+            if hasattr(breakout_candle_data, "to_dict"):
+                breakout_candle_data = breakout_candle_data.to_dict()
+
+            # Ensure prev_candle is a dict
+            prev_candle_data = sig.get("prev_breakout_candle", None)
+            if prev_candle_data is not None and hasattr(prev_candle_data, "to_dict"):
+                prev_candle_data = prev_candle_data.to_dict()
+
             breakout_grade, breakout_desc = self.grader.grade_breakout_candle(
-                sig.get("breakout_candle", {}),
-                sig.get("breakout_vol_ratio", 0.0),
+                breakout_candle_data,
+                sig.get("breakout_vol_ratio", 1.5),
                 sig.get("breakout_body_pct", 0.0),
                 sig.get("level", None),
                 sig.get("direction", None),
                 a_upper_wick_max=BREAKOUT_A_UW_MAX,
                 b_body_max=BREAKOUT_B_BODY_MAX,
-                prev_candle=sig.get("prev_breakout_candle", None),
+                prev_candle=prev_candle_data,
             )
+            # Ensure retest_candle is a dict
+            retest_candle_data = sig.get("retest_candle", {})
+            if hasattr(retest_candle_data, "to_dict"):
+                retest_candle_data = retest_candle_data.to_dict()
+
             retest_grade, retest_desc = self.grader.grade_retest(
-                sig.get("retest_candle", {}),
-                sig.get("retest_vol_ratio", 0.0),
+                retest_candle_data,
+                sig.get("retest_vol_ratio", 0.3),
                 sig.get("level", 0.0),
                 sig.get("direction", "long"),
                 retest_volume_a_max_ratio=0.30,
@@ -769,11 +951,16 @@ class BacktestEngine:
                 b_level_epsilon_pct=RETEST_B_EPSILON,
                 b_structure_soft=RETEST_B_SOFT,
             )
+            # Ensure ignition_candle is a dict
+            ignition_candle_data = sig.get("ignition_candle", {})
+            if hasattr(ignition_candle_data, "to_dict"):
+                ignition_candle_data = ignition_candle_data.to_dict()
+
             continuation_grade, continuation_desc = self.grader.grade_continuation(
-                sig.get("ignition_candle", {}),
-                sig.get("ignition_vol_ratio", 0.0),
-                sig.get("distance_to_target", 0.0),
-                sig.get("ignition_body_pct", 0.0),
+                ignition_candle_data,
+                sig.get("ignition_vol_ratio", 1.0),
+                sig.get("distance_to_target", 0.5),
+                sig.get("ignition_body_pct", 0.6),
             )
             rr_grade, rr_desc = self.grader.grade_risk_reward(rr_ratio)
             market_grade, market_desc = self.grader.grade_market_context("slightly_red")
@@ -792,14 +979,18 @@ class BacktestEngine:
             sig["rr_ratio"] = rr_ratio
             sig["breakout_tier"] = (
                 "A" if breakout_grade == "✅" else ("B" if breakout_grade == "⚠️" else "C")
-            )
+            )  # analytics only
+            # Attach points for Level 3 filtering
+            sig["breakout_points"] = float(self.grader._state.get("breakout_pts", 0.0))
+            sig["retest_points"] = float(self.grader._state.get("retest_pts", 0.0))
+            sig["ignition_points"] = float(self.grader._state.get("ignition_pts", 0.0))
+            sig["context_points"] = float(self.grader._state.get("context_pts", 0.0))
             return sig
 
-        # Compute grades only for Level 2+ (grading is part of enhanced filtering/reporting)
-        if self.pipeline_level >= 2:
-            graded_signals = [compute_grades(dict(sig)) for sig in signals]
-        else:
-            graded_signals = list(signals)
+        # Compute grades for all levels so we can analyze score distributions at Level 1
+        # (Filtering still only applied for Level 2+ below). This enables downstream
+        # exports (e.g., breakout score histograms overlayed with Level 2 pass/fail.)
+        graded_signals = [compute_grades(dict(sig)) for sig in signals]
 
         # Initialize Level 2 rejection counters (included in results for Level 2+)
         rejected_breakout = 0
@@ -808,64 +999,130 @@ class BacktestEngine:
         rejected_candle_type = 0
 
         # Level 2+: Apply quality filters based on grades
+        pre_filter_count = len(graded_signals) if self.pipeline_level >= 2 else 0
         if self.pipeline_level >= 2:
-            # Level 2 Quality Filter: Require Breakout and Retest to be >= C.
-            # Continuation/Ignition is post-entry analysis; do not hard-reject on it
-            # for C-level filter. We still track continuation-grade fails for diagnostics.
-            pre_filter_count = len(graded_signals)
+            print(
+                "DEBUG: Level {} filtering {} graded signals".format(
+                    self.pipeline_level, len(graded_signals)
+                )
+            )
+            # Level 2: Require C or better in each component (reject ❌).
+            # Level 3+: Require C or better in each component AND overall grade B or higher.
             filtered_signals = []
 
             for s in graded_signals:
-                breakout_grade = s.get("component_grades", {}).get("breakout", "❌")
-                retest_grade = s.get("component_grades", {}).get("retest", "❌")
-                continuation_grade = s.get("component_grades", {}).get("continuation", "❌")
+                reject = False
+                if self.pipeline_level == 2:
+                    # Level 2 simplified: require breakout & RR >= C; ignore other components.
+                    component_grades = s.get("component_grades", {})
+                    breakout_ok = component_grades.get("breakout", "❌") != "❌"
+                    rr_ok = component_grades.get("rr", "❌") != "❌"
+                    if not (breakout_ok and rr_ok):
+                        rejected_breakout += (
+                            1  # Count rejections under breakout counter for simplicity
+                        )
+                        reject = True
+                elif self.pipeline_level >= 3:
+                    # Level 3+: require each component >= C and points >= 70.
+                    component_grades = s.get("component_grades", {})
 
-                # ❌ means D-grade (rejected/failed) - exclude these
-                if breakout_grade == "❌":
-                    rejected_breakout += 1
-                    continue  # Breakout failed minimum C criteria
-                if retest_grade == "❌":
-                    rejected_retest += 1
-                    continue  # Retest failed minimum C criteria
+                    # Check each component grade is C or better (not ❌)
+                    breakout_ok = component_grades.get("breakout", "❌") != "❌"
+                    retest_ok = component_grades.get("retest", "❌") != "❌"
+                    continuation_ok = component_grades.get("continuation", "❌") != "❌"
+                    rr_ok = component_grades.get("rr", "❌") != "❌"
+                    context_ok = component_grades.get("market", "❌") != "❌"
 
-                # Do not reject on continuation here; count for diagnostics only
-                if continuation_grade == "❌":
-                    rejected_ignition += 1
+                    # Calculate full points-based overall grade (consistent with reporting)
+                    breakout_pts = s.get("breakout_points", 0)
+                    retest_pts = s.get("retest_points", 0)
+                    ignition_pts = s.get("ignition_points", 0)
+                    context_pts = s.get("context_points", 0)
+                    total_points = breakout_pts + retest_pts + ignition_pts + context_pts
 
-                # Signal passed Level 2 filters (all three stages at least C grade)
+                    # B or higher requires >= 70 points (out of 100)
+                    overall_pass = total_points >= 70
+
+                    # Debug output for Level 3 rejections
+                    if not (
+                        breakout_ok
+                        and retest_ok
+                        and continuation_ok
+                        and rr_ok
+                        and context_ok
+                        and overall_pass
+                    ):
+                        print("  Level 3 REJECTED:")
+                        print(
+                            "    "
+                            f"breakout={component_grades.get('breakout')} "
+                            f"retest={component_grades.get('retest')} "
+                            f"continuation={component_grades.get('continuation')} "
+                            f"rr={component_grades.get('rr')} "
+                            f"market={component_grades.get('market')} "
+                            f"total_pts={total_points}"
+                        )
+
+                    if not (
+                        breakout_ok
+                        and retest_ok
+                        and continuation_ok
+                        and rr_ok
+                        and context_ok
+                        and overall_pass
+                    ):
+                        rejected_breakout += 1  # Reuse counter for overall rejections
+                        reject = True
+
+                if reject:
+                    continue
+
+                # Signal passed filters
                 filtered_signals.append(s)
 
             graded_signals = filtered_signals
 
-            # Print Level 2 filtering stats
-            if pre_filter_count > 0:
-                filtered_count = len(graded_signals)
-                print(f"  Level 2 Quality Filter for {symbol}:")
-                print(f"    Before filter: {pre_filter_count} signals")
-                print(f"    Rejected (breakout ❌): {rejected_breakout}")
-                print(f"    Rejected (retest ❌): {rejected_retest}")
-                print(f"    Continuation graded ❌ (not rejected): {rejected_ignition}")
-                print(f"    Rejected (candle type): {rejected_candle_type}")
+        # Print filtering stats
+        level_label = f"Level {self.pipeline_level}"
+        if pre_filter_count > 0:
+            filtered_count = len(graded_signals)
+            print(f"  {level_label} Quality Filter for {symbol}:")
+            print(f"    Before filter: {pre_filter_count} signals")
+            print(f"    Rejected (breakout fail): {rejected_breakout}")
+            print(f"    Rejected (retest fail): {rejected_retest}")
+            if self.pipeline_level >= 3:
                 print(
-                    f"    After filter: {filtered_count} signals "
-                    f"(passed >= C criteria on breakout+retest)"
-                )
+                    f"    Rejected (component < C or overall < B): {rejected_ignition}"
+                )  # Reuse counter
+            else:
+                print(f"    Continuation graded ❌ (not rejected): {rejected_ignition}")
+            print(f"    Rejected (candle type): {rejected_candle_type}")
+            criteria_desc = (
+                "breakout & RR >= C (retest/context ignored)"
+                if self.pipeline_level == 2
+                else ">= C in all components + >= 70 pts overall"
+            )
+            print(f"    After filter: {filtered_count} signals " f"(passed {criteria_desc})")
 
-            # Apply min_grade filter if provided (A+/A/B/C overall grade)
-            if self.min_grade:
-                order = {"C": 0, "B": 1, "A": 2, "A+": 3}
-                threshold = order.get(self.min_grade, 0)
-                graded_signals = [
-                    s
-                    for s in graded_signals
-                    if order.get(s.get("overall_grade", "C"), 0) >= threshold
-                ]
+        # For level 2, analyze which signals would be rejected in level 3
+        if self.pipeline_level == 2:
+            print(
+                "  Level 2 (simplified) diagnostic vs Level 3 potential rejections:"
+            )
+            overall_rejects_lvl3 = 0
+            for s in graded_signals:
+                breakout_pts = s.get("breakout_points", 0)
+                retest_pts = s.get("retest_points", 0)
+                ignition_pts = s.get("ignition_points", 0)
+                context_pts = s.get("context_points", 0)
+                total_points = breakout_pts + retest_pts + ignition_pts + context_pts
+                if total_points < 70:  # Level 3 threshold
+                    overall_rejects_lvl3 += 1
+            print(
+                "    - Would fail Level 3 (points <70): {}".format(overall_rejects_lvl3)
+            )
 
-            # Apply breakout tier filter if specified
-            if self.breakout_tier_filter:
-                graded_signals = [
-                    s for s in graded_signals if s.get("breakout_tier") == self.breakout_tier_filter
-                ]
+        # Removed: min_grade and breakout_tier filtering
         # Level 0 or 1: Grades are computed but no filtering applied
 
         trades = []
@@ -1038,7 +1295,7 @@ class BacktestEngine:
                 trade_dict["breakout_grade"] = sig["component_grades"].get("breakout")
                 trade_dict["retest_grade"] = sig["component_grades"].get("retest")
                 trade_dict["rr_grade"] = sig["component_grades"].get("rr")
-                trade_dict["context_grade"] = sig["component_grades"].get("context")
+                trade_dict["context_grade"] = sig["component_grades"].get("market")
                 trade_dict["overall_grade"] = sig.get("overall_grade")
                 trade_dict["rr_ratio"] = sig.get("rr_ratio", 0.0)
 
@@ -1456,6 +1713,15 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
             "Caps shares so entry*shares <= cash*leverage"
         ),
     )
+    parser.add_argument(
+        "--initial-capital",
+        type=float,
+        default=None,
+        help=(
+            "Override initial capital (default comes from config.json). "
+            "Example: --initial-capital 25000"
+        ),
+    )
     parser.add_argument("--cache-dir", default="cache", help="Cache directory (default: cache)")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh cached data")
     parser.add_argument(
@@ -1466,16 +1732,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         action="store_true",
         help="Only output to console, do not save files (default: False - saves results)",
     )
-    parser.add_argument(
-        "--min-grade",
-        choices=["A+", "A", "B", "C"],
-        help="Only include signals with this minimum grade or better",
-    )
-    parser.add_argument(
-        "--breakout-tier",
-        choices=["A", "B", "C"],
-        help="Only include signals with this specific breakout tier (filters after grade)",
-    )
+    # Removed CLI args: --min-grade, --breakout-tier
     parser.add_argument(
         "--last-days",
         type=int,
@@ -1503,8 +1760,9 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
             "Pipeline level (0-5, default: 0): "
             "Level 0: Candidates only (Stages 1-3: OR, Breakout, Retest), no trades. "
             "Level 1: Trades with base criteria (Stages 1-3), entry on open after retest. "
-            "Level 2: Quality filter - Breakout and Retest must be grade C or higher (filters ❌). "
-            "Level 3+: Reserved for future (may include Stage 4: Ignition, stricter filters)."
+            "Level 2: Quality filter - Require C or better in each component (reject D-grades). "
+            "Level 3: Stricter filtering - Require C or better in each component "
+            "and overall grade B or higher."
         ),
     )
     parser.add_argument(
@@ -1533,7 +1791,10 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
 
     # Update config-derived options and feature flags after overrides
     global FEATURE_LEVEL0_ENABLE_VWAP_CHECK
-    FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get("feature_level0_enable_vwap_check", FEATURE_LEVEL0_ENABLE_VWAP_CHECK)
+    FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get(
+        "feature_level0_enable_vwap_check",
+        FEATURE_LEVEL0_ENABLE_VWAP_CHECK,
+    )
 
     # Runtime values resolved from CONFIG (do not mutate module-level defaults here)
     runtime_results_dir = CONFIG.get("backtest_results_dir", DEFAULT_RESULTS_DIR)
@@ -1542,7 +1803,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
 
     # If leverage wasn't explicitly provided, allow config override to drive it
     if "--leverage" not in sys.argv and "leverage" in CONFIG:
-        args.leverage = float(CONFIG["leverage"]) 
+        args.leverage = float(CONFIG["leverage"])
 
     # Use default tickers from config if not specified
     symbols = args.symbols if args.symbols else CONFIG.get("tickers", DEFAULT_TICKERS)
@@ -1563,7 +1824,12 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
 
     print(f"Backtesting symbols: {', '.join(symbols)}")
     print(f"Date range: {start_date} to {end_date}")
-    print(f"Initial capital: ${CONFIG.get('initial_capital', DEFAULT_INITIAL_CAPITAL):,.2f}")
+    effective_initial_capital = (
+        args.initial_capital
+        if args.initial_capital is not None
+        else float(CONFIG.get("initial_capital", DEFAULT_INITIAL_CAPITAL))
+    )
+    print(f"Initial capital: ${effective_initial_capital:,.2f}")
     print(f"Leverage: {args.leverage}x")
     print(f"Pipeline Level: {pipeline_level}")
     if args.no_trades and pipeline_level > 0:
@@ -1581,11 +1847,9 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     display_tz, tz_label = get_display_timezone(Path(__file__).parent)
 
     engine = BacktestEngine(
-        initial_capital=float(CONFIG.get("initial_capital", DEFAULT_INITIAL_CAPITAL)),
+        initial_capital=effective_initial_capital,
         position_size_pct=args.position_size,
         leverage=args.leverage,
-        min_grade=args.min_grade,
-        breakout_tier_filter=args.breakout_tier,
         display_tzinfo=display_tz,
         tz_label=tz_label,
         retest_vol_threshold=runtime_retest_vol_gate,

@@ -37,6 +37,21 @@ from typing import Callable, Dict, Optional
 import pandas as pd
 
 
+def _ensure_vwap(df: pd.DataFrame) -> pd.DataFrame:
+    """Add VWAP column if not present"""
+    if "vwap" in df.columns:
+        return df
+    df = df.copy()
+    df["typical_price"] = (df["High"] + df["Low"] + df["Close"]) / 3
+    if "Volume" in df.columns:
+        df["tp_volume"] = df["typical_price"] * df["Volume"]
+        df["vwap"] = df["tp_volume"].cumsum() / df["Volume"].cumsum()
+    else:
+        # If Volume is missing, set VWAP to typical price as a fallback
+        df["vwap"] = df["typical_price"]
+    return df
+
+
 def retest_qualifies_as_ignition(
     retest_candle: pd.Series,
     direction: str,
@@ -109,28 +124,55 @@ def retest_qualifies_as_ignition(
 
 
 def base_ignition_filter(
-    m1: pd.Series, direction: str, retest_high: float, retest_low: float
+    m1: pd.Series,
+    direction: str,
+    retest_high: float,
+    retest_low: float,
+    enable_vwap_check: bool = True,
 ) -> bool:
     """
-    Base ignition criteria (minimal/permissive).
+    Base ignition criteria with optional VWAP alignment.
 
-    For Stage 4 ignition: Ignition must break beyond retest candle (wick or close).
+    VWAP alignment validates institutional flow alignment closer to actual entry timing.
 
     Args:
         m1: 1-minute candle
         direction: 'long' or 'short'
         retest_high: High of the retest candle
         retest_low: Low of the retest candle
+        enable_vwap_check: If True, enforce VWAP alignment (default: True)
 
     Returns:
         True if the candle qualifies as ignition
     """
+    # First check basic ignition criteria
     if direction == "long":
         # For long, ignition must break above retest high (wick or close)
-        return float(m1.get("High", 0.0)) > retest_high
+        basic_check = float(m1.get("High", 0.0)) > retest_high
     else:
         # For short, ignition must break below retest low (wick or close)
-        return float(m1.get("Low", 0.0)) < retest_low
+        basic_check = float(m1.get("Low", 0.0)) < retest_low
+
+    if not basic_check:
+        return False
+
+    # VWAP alignment with 0.05% buffer (optional)
+    if enable_vwap_check:
+        c = float(m1.get("Close", 0.0))
+        vwap_val = float(m1.get("vwap", float("nan")))
+
+        if not pd.isna(vwap_val):
+            vwap_buffer = abs(vwap_val) * 0.0005  # 0.05% = 0.0005
+
+            if direction == "long":
+                vwap_aligned = c >= (vwap_val - vwap_buffer)
+            else:  # short
+                vwap_aligned = c <= (vwap_val + vwap_buffer)
+
+            return vwap_aligned
+
+    # If VWAP check is disabled or VWAP not available, return True (basic check already passed)
+    return True
 
 
 def detect_ignition(
@@ -140,6 +182,7 @@ def detect_ignition(
     direction: str,
     ignition_lookahead_minutes: int = 30,
     ignition_filter: Optional[Callable[[pd.Series, str, float, float], bool]] = None,
+    enable_vwap_check: bool = True,
 ) -> Optional[Dict]:
     """
     Detect ignition after a retest (Stage 4: post-entry confirmation).
@@ -151,12 +194,43 @@ def detect_ignition(
         direction: 'long' or 'short'
         ignition_lookahead_minutes: Minutes after retest to search for ignition
         ignition_filter: Optional custom filter; if None, uses base_ignition_filter
+        enable_vwap_check: If True, enforce VWAP alignment in base filter (default: True)
 
     Returns:
         Dict with keys: time, candle if ignition found, else None
     """
     if session_df_1m is None or session_df_1m.empty:
         return None
+
+    session_df_1m = session_df_1m.copy()
+
+    # ------------------------------------------------------------------
+    # Timezone Normalization (mirrors Stage 3 logic)
+    # ------------------------------------------------------------------
+    # Handle mixed tz-aware vs tz-naive comparisons between session datetimes
+    # and retest_time. Preserve tz-naive outputs when the input data is naive
+    # so existing unit tests remain valid.
+    dt_series = session_df_1m["Datetime"]
+    session_tz = getattr(dt_series.dt, "tz", None)
+    retest_time_adj = retest_time
+    try:
+        if session_tz is None:
+            if retest_time.tzinfo is not None:
+                try:
+                    retest_time_adj = retest_time.tz_convert("America/New_York").tz_localize(None)
+                except Exception:
+                    retest_time_adj = retest_time.tz_localize(None)
+        else:
+            if retest_time.tzinfo is None:
+                retest_time_adj = retest_time.tz_localize("America/New_York").tz_convert("UTC")
+            else:
+                retest_time_adj = retest_time.tz_convert("UTC")
+            session_df_1m["Datetime"] = dt_series.dt.tz_convert("UTC")
+    except Exception:
+        retest_time_adj = retest_time
+
+    # Ensure VWAP is calculated for ignition filtering
+    session_df_1m = _ensure_vwap(session_df_1m)
 
     # Extract retest high/low
     retest_high = float(retest_candle.get("High", 0.0))
@@ -165,13 +239,19 @@ def detect_ignition(
     if retest_high == 0.0 or retest_low == 0.0:
         return None
 
-    filter_fn = ignition_filter or base_ignition_filter
+    # Use custom filter if provided, otherwise use base filter with VWAP check setting
+    if ignition_filter is not None:
+        filter_fn = ignition_filter
+    else:
+        # Create a function that captures the enable_vwap_check parameter
+        def filter_fn(m1, direction, retest_high, retest_low):
+            return base_ignition_filter(m1, direction, retest_high, retest_low, enable_vwap_check)
 
     # Search for ignition starting from the NEXT candle after retest
     # (The retest candle by definition touches/closes on the level,
     #  ignition must break beyond the retest candle's range)
-    window_start = retest_time + timedelta(minutes=1)
-    window_end = retest_time + timedelta(minutes=ignition_lookahead_minutes)
+    window_start = retest_time_adj + timedelta(minutes=1)
+    window_end = retest_time_adj + timedelta(minutes=ignition_lookahead_minutes)
 
     window_1m = session_df_1m[
         (session_df_1m["Datetime"] >= window_start) & (session_df_1m["Datetime"] <= window_end)

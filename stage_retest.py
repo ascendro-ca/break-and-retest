@@ -47,42 +47,50 @@ def base_retest_filter(
     m1: pd.Series, direction: str, level: float, enable_vwap_check: bool = True
 ) -> bool:
     """
-    Base retest criteria with optional VWAP alignment.
-
-    VWAP alignment reduces false negatives and aligns with institutional logic
-    for cleaner breakout-confirmation structure.
+    Base retest criteria.
 
     Args:
         m1: 1-minute candle series
         direction: 'long' or 'short'
         level: The price level being tested
-        enable_vwap_check: If True, enforce VWAP alignment (default: True)
+        enable_vwap_check: If True, enforce VWAP alignment in base filter (default: True)
 
     Returns:
         True if the 1m candle qualifies as a valid retest close
     """
     c = float(m1.get("Close", 0.0))
-    vwap_val = float(m1.get("vwap", float("nan")))
+    vwap = float(m1.get("vwap", 0.0))
 
-    # Check if close is on correct side of level
-    level_check = (direction == "long" and c >= level) or (direction == "short" and c <= level)
+    # VWAP buffer is 0.05%
+    vwap_buffer = vwap * 0.0005
 
-    if not level_check:
+    if direction == "long":
+        # Long: close >= level AND close >= vwap - buffer
+        if c >= level and c >= (vwap - vwap_buffer):
+            return True
+        else:
+            return False
+    elif direction == "short":
+        # Short: close <= level AND close <= vwap + buffer
+        if c <= level and c <= (vwap + vwap_buffer):
+            return True
+        else:
+            return False
+    else:
+        # Unknown direction
         return False
 
-    # VWAP alignment with 0.05% buffer (optional)
-    if enable_vwap_check:
-        vwap_buffer = abs(vwap_val) * 0.0005  # 0.05% = 0.0005
 
-        if direction == "long":
-            vwap_aligned = c >= (vwap_val - vwap_buffer)
-        else:  # short
-            vwap_aligned = c <= (vwap_val + vwap_buffer)
-
-        return vwap_aligned
-
-    # If VWAP check is disabled, just return True (level check already passed)
-    return True
+# Level 0 retest filter: body must be at or beyond the OR level in the direction of the trade
+def level0_retest_filter(m1: pd.Series, direction: str, level: float) -> bool:
+    o = float(m1.get("Open", 0.0))
+    c = float(m1.get("Close", 0.0))
+    if direction == "long":
+        return o >= level and c >= level
+    elif direction == "short":
+        return o <= level and c <= level
+    else:
+        return False
 
 
 def detect_retest(
@@ -113,6 +121,53 @@ def detect_retest(
     if session_df_1m is None or session_df_1m.empty:
         return None
 
+    session_df_1m = session_df_1m.copy()
+
+    # ------------------------------------------------------------------
+    # Timezone Normalization Strategy (robust to mixed tz-aware/naive inputs)
+    # ------------------------------------------------------------------
+    # Unit tests construct tz-naive timestamps (assumed America/New_York). The backtest
+    # pipeline increasingly produces tz-aware UTC timestamps for stage transitions.
+    # Pandas disallows direct comparison between tz-aware and tz-naive datetimes.
+    #
+    # Rules:
+    # 1. If the session data is tz-naive, downcast any tz-aware breakout_time to naive
+    #    America/New_York (convert then drop tz) so tests continue to pass unchanged.
+    # 2. If the session data is tz-aware and breakout_time is naive, localize breakout_time
+    #    to America/New_York then convert both sides to UTC for uniform comparison.
+    # 3. If both are tz-aware (any zone), convert both to UTC.
+    # 4. Preserve the original session dataframe timezone style (naive vs aware) so that
+    #    returned retest timestamp matches caller expectations (tests expect naive).
+    # ------------------------------------------------------------------
+    dt_series = session_df_1m["Datetime"]
+    session_tz = getattr(dt_series.dt, "tz", None)
+
+    breakout_time_adj = breakout_time
+    try:
+        if session_tz is None:
+            # Session is naive
+            if breakout_time.tzinfo is not None:
+                # Convert breakout_time to NY local then drop tz
+                try:
+                    breakout_time_adj = breakout_time.tz_convert("America/New_York").tz_localize(
+                        None
+                    )
+                except Exception:
+                    # If already localized to NY, just drop tz
+                    breakout_time_adj = breakout_time.tz_localize(None)
+        else:
+            # Session is tz-aware
+            if breakout_time.tzinfo is None:
+                # Localize breakout_time to NY first then convert to UTC
+                breakout_time_adj = breakout_time.tz_localize("America/New_York").tz_convert("UTC")
+            else:
+                breakout_time_adj = breakout_time.tz_convert("UTC")
+            # Convert session datetimes to UTC for alignment
+            session_df_1m["Datetime"] = dt_series.dt.tz_convert("UTC")
+    except Exception:
+        # Fallback: leave as-is if any unexpected tz errors occur
+        breakout_time_adj = breakout_time
+
     # Ensure VWAP is calculated for retest filtering
     session_df_1m = _ensure_vwap(session_df_1m)
 
@@ -120,7 +175,7 @@ def detect_retest(
     market_open = session_df_1m.iloc[0]["Datetime"]
 
     # Retest window starts AFTER the 5m breakout candle closes
-    retest_window_start = breakout_time + timedelta(minutes=5)
+    retest_window_start = breakout_time_adj + timedelta(minutes=5)
 
     # Retest window ends at 90 minutes from market open
     retest_window_end = market_open + timedelta(minutes=90)
@@ -133,13 +188,20 @@ def detect_retest(
     if window_1m.empty:
         return None
 
-    # Use custom filter if provided, otherwise use base filter with VWAP check setting
+    # Use provided retest_filter (now unified across all pipeline levels). If none, fall back
+    # to strict level0_retest_filter semantics instead of the previous VWAP + close-only logic.
     if retest_filter is not None:
         filter_fn = retest_filter
     else:
-        # Create a function that captures the enable_vwap_check parameter
+        # strict parity fallback
         def filter_fn(m1, direction, level):
-            return base_retest_filter(m1, direction, level, enable_vwap_check)
+            o = float(m1.get("Open", 0.0))
+            c = float(m1.get("Close", 0.0))
+            if direction == "long":
+                return o >= level and c >= level
+            elif direction == "short":
+                return o <= level and c <= level
+            return False
 
     for _, m1 in window_1m.iterrows():
         if filter_fn(m1, direction, level):

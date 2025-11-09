@@ -11,7 +11,7 @@ ignore = ["T201", "F541"]
 known-third-party = ["plotly", "pandas", "numpy", "yfinance"]
 
 [tool.ruff.lint.per-file-ignores]
-"test_*.py" = ["E402", "F401", "E501"]
+"test_*.py" = ["E402", "F401", "E501", "I001"]
 "backtest.py" = ["I001"]
 "cache_utils.py" = ["I001"]
 "stockdata_retriever.py" = ["I001"]
@@ -32,6 +32,13 @@ omit = [
     "break_and_retest_live_scanner.py",
     "stockdata_retriever.py",
     "backtest.py",
+    "hourly_distribution.py",
+    # Omit standalone analysis / export / maintenance scripts not part of core runtime
+    "compute_funnel_metrics.py",
+    "diagnose_filtering.py",
+    "export_breakout_score_distribution.py",
+    "export_drop_reason_analysis.py",
+    "repair_cache_5m_from_1m.py",
 ]
 
 [tool.coverage.report]
