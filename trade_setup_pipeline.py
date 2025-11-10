@@ -8,16 +8,16 @@ before the next stage runs.
 
 Pipeline Levels:
 - Level 0 (Base): Stages 1-3 only (OR → Breakout → Retest)
-  - Minimal/permissive filters for candidate identification
-  - No trades executed (candidates only)
+    - Uses the strict Level 0 retest filter (body at/beyond OR in trade direction)
+    - No trades executed (candidates only)
 
 - Level 1: Stages 1-3 with base criteria for trade execution
-  - Trades entered on open of 1m candle after retest
-  - Stage 4 (Ignition) NOT used at Level 1
-  - Progressively stricter filtering than Level 0
+    - Uses the SAME retest filter as Level 0 (no additional retest filtering)
+    - Trades entered on open of 1m candle after retest
+    - Stage 4 (Ignition) NOT used at Level 1
 
-- Level 2+: Reserved for future enhanced filtering/grading
-  - May include Stage 4 (Ignition) and additional criteria
+- Level 2+: Enhanced filtering/grading
+    - May include Stage 4 (Ignition) and additional quality criteria
 
 Pipeline Stages:
 1. Opening Range (OR) - Establishes the reference level
@@ -47,7 +47,7 @@ import pandas as pd
 from stage_breakout import detect_breakouts
 from stage_ignition import detect_ignition, retest_qualifies_as_ignition
 from stage_opening_range import detect_opening_range
-from stage_retest import detect_retest
+from stage_retest import detect_retest, level0_retest_filter
 
 
 class TradeSetupPipeline:
@@ -56,7 +56,8 @@ class TradeSetupPipeline:
 
     Pipeline Levels:
     - Level 0: Candidates only (Stages 1-3: OR, Breakout, Retest)
-    - Level 1: Trade execution with base criteria (Stages 1-3, no ignition)
+        - Level 1: Trade execution with base criteria (Stages 1-3, no ignition);
+            Level 1 uses the same retest filter as Level 0
     - Level 2+: Enhanced filtering, may include Stage 4 (Ignition)
     """
 
@@ -84,7 +85,7 @@ class TradeSetupPipeline:
             breakout_filter: Optional custom Stage 2 filter
             retest_filter: Optional custom Stage 3 filter
             ignition_filter: Optional custom Stage 4 filter
-            enable_vwap_check: If True, enforce VWAP alignment at retest stage (default: True)
+            enable_vwap_check: If True, enforce VWAP alignment at ignition stage (default: True)
         """
         self.breakout_window_minutes = int(breakout_window_minutes)
         self.retest_lookahead_minutes = int(retest_lookahead_minutes)
@@ -201,6 +202,7 @@ class TradeSetupPipeline:
                         direction=brk["direction"],
                         ignition_lookahead_minutes=self.ignition_lookahead_minutes,
                         ignition_filter=self.ignition_filter,
+                        enable_vwap_check=self.enable_vwap_check,
                     )
 
                     if ignition_result is not None:
@@ -237,16 +239,24 @@ def run_pipeline(
                        Level 0: Candidates only (Stages 1-3, no trades)
                        Level 1: Trade execution with base criteria (Stages 1-3, no ignition)
                        Level 2+: Enhanced filtering, may include Stage 4 (Ignition)
-        enable_vwap_check: If True, enforce VWAP alignment at retest stage (default: True)
+        enable_vwap_check: If True, enforce VWAP alignment at ignition stage (default: True)
 
     Returns:
         List of candidates that passed all required stages
     """
+    # Use the strict Level 0 retest filter for both Level 0 (candidates)
+    # and Level 1 (trades with base criteria). Level 2+ may add further
+    # quality filters but Stage 3 detection remains consistent.
+    # Unify retest criteria: Level 2+ now also uses the strict Level 0 retest filter.
+    # This removes the previous Level 2 reliance on base_retest_filter (VWAP + close-only).
+    # Rationale: enforce parity across levels and rebuild L2-specific refinements later.
+    retest_filter = level0_retest_filter  # applied for all levels
     pipeline = TradeSetupPipeline(
         breakout_window_minutes=breakout_window_minutes,
         retest_lookahead_minutes=retest_lookahead_minutes,
         ignition_lookahead_minutes=ignition_lookahead_minutes,
         pipeline_level=pipeline_level,
+        retest_filter=retest_filter,
         enable_vwap_check=enable_vwap_check,
     )
     return pipeline.run(session_df_5m, session_df_1m)

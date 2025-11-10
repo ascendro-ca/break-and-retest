@@ -44,6 +44,11 @@ FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get("feature_level0_enable_vwap_check"
 BREAKOUT_B_BODY_MAX = CONFIG.get("breakout_B_body_max", 0.65)
 RETEST_B_EPSILON = CONFIG.get("retest_B_level_epsilon_pct", 0.10)
 RETEST_B_SOFT = CONFIG.get("retest_B_structure_soft", True)
+FEATURE_GRADE_C_FILTERING_ENABLE = CONFIG.get("feature_grade_c_filtering_enable", True)
+FEATURE_GRADE_B_FILTERING_ENABLE = CONFIG.get("feature_grade_b_filtering_enable", True)
+FEATURE_GRADE_A_FILTERING_ENABLE = CONFIG.get("feature_grade_a_filtering_enable", True)
+GRADE_B_MIN_POINTS = CONFIG.get("grade_b_min_points", 70)
+GRADE_A_MIN_POINTS = CONFIG.get("grade_a_min_points", 85)
 
 
 class DataCache:
@@ -194,6 +199,7 @@ class BacktestEngine:
         no_trades: bool = False,
         grading_system: str = "points",
         min_rr_ratio: float = 2.0,
+        console_only: bool = False,
     ):
         """
         Initialize backtest engine
@@ -227,6 +233,8 @@ class BacktestEngine:
         self.tz_label = tz_label
         self.retest_vol_threshold = retest_vol_threshold
         self.min_rr_ratio = min_rr_ratio
+        # Control console verbosity at Level 2: suppress trade-level detail unless --console-only
+        self.console_only = console_only
 
         # Pipeline level determines filtering strictness and trade behavior
         # Level 0: Candidates only (no trades ever)
@@ -992,138 +1000,95 @@ class BacktestEngine:
         # exports (e.g., breakout score histograms overlayed with Level 2 pass/fail.)
         graded_signals = [compute_grades(dict(sig)) for sig in signals]
 
-        # Initialize Level 2 rejection counters (included in results for Level 2+)
-        rejected_breakout = 0
-        rejected_retest = 0
-        rejected_ignition = 0
-        rejected_candle_type = 0
+        # Legacy rejection counters removed (no longer used)
 
-        # Level 2+: Apply quality filters based on grades
-        pre_filter_count = len(graded_signals) if self.pipeline_level >= 2 else 0
-        if self.pipeline_level >= 2:
+        # Level 2: Sequential grade filtering via config toggles (C -> B -> A)
+        pre_filter_count = len(graded_signals) if self.pipeline_level == 2 else 0
+        rejected_c = 0
+        rejected_b = 0
+        rejected_a = 0
+        if self.pipeline_level == 2:
+            debug_tpl = (
+                "DEBUG: Level 2 filtering {n} graded signals | Active filters: "
+                "C={c}, B={b} (min={bmin}), A={a} (min={amin})"
+            )
             print(
-                "DEBUG: Level {} filtering {} graded signals".format(
-                    self.pipeline_level, len(graded_signals)
+                debug_tpl.format(
+                    n=len(graded_signals),
+                    c="on" if FEATURE_GRADE_C_FILTERING_ENABLE else "off",
+                    b="on" if FEATURE_GRADE_B_FILTERING_ENABLE else "off",
+                    bmin=GRADE_B_MIN_POINTS,
+                    a="on" if FEATURE_GRADE_A_FILTERING_ENABLE else "off",
+                    amin=GRADE_A_MIN_POINTS,
                 )
             )
-            # Level 2: Require C or better in each component (reject ❌).
-            # Level 3+: Require C or better in each component AND overall grade B or higher.
-            filtered_signals = []
+            filtered_signals = graded_signals
 
-            for s in graded_signals:
-                reject = False
-                if self.pipeline_level == 2:
-                    # Level 2 simplified: require breakout & RR >= C; ignore other components.
-                    component_grades = s.get("component_grades", {})
-                    breakout_ok = component_grades.get("breakout", "❌") != "❌"
-                    rr_ok = component_grades.get("rr", "❌") != "❌"
-                    if not (breakout_ok and rr_ok):
-                        rejected_breakout += (
-                            1  # Count rejections under breakout counter for simplicity
-                        )
-                        reject = True
-                elif self.pipeline_level >= 3:
-                    # Level 3+: require each component >= C and points >= 70.
-                    component_grades = s.get("component_grades", {})
+            # Grade C filter
+            if FEATURE_GRADE_C_FILTERING_ENABLE:
+                tmp = []
+                for s in filtered_signals:
+                    cg = s.get("component_grades", {})
+                    breakout_ok = cg.get("breakout", "❌") != "❌"
+                    rr_ok = cg.get("rr", "❌") != "❌"
+                    if breakout_ok and rr_ok:
+                        tmp.append(s)
+                    else:
+                        rejected_c += 1
+                filtered_signals = tmp
 
-                    # Check each component grade is C or better (not ❌)
-                    breakout_ok = component_grades.get("breakout", "❌") != "❌"
-                    retest_ok = component_grades.get("retest", "❌") != "❌"
-                    continuation_ok = component_grades.get("continuation", "❌") != "❌"
-                    rr_ok = component_grades.get("rr", "❌") != "❌"
-                    context_ok = component_grades.get("market", "❌") != "❌"
+            # Grade B filter (points threshold)
+            if FEATURE_GRADE_B_FILTERING_ENABLE:
+                tmp = []
+                for s in filtered_signals:
+                    total_points = (
+                        s.get("breakout_points", 0)
+                        + s.get("retest_points", 0)
+                        + s.get("ignition_points", 0)
+                        + s.get("context_points", 0)
+                    )
+                    if total_points >= GRADE_B_MIN_POINTS:
+                        tmp.append(s)
+                    else:
+                        rejected_b += 1
+                filtered_signals = tmp
 
-                    # Calculate full points-based overall grade (consistent with reporting)
-                    breakout_pts = s.get("breakout_points", 0)
-                    retest_pts = s.get("retest_points", 0)
-                    ignition_pts = s.get("ignition_points", 0)
-                    context_pts = s.get("context_points", 0)
-                    total_points = breakout_pts + retest_pts + ignition_pts + context_pts
-
-                    # B or higher requires >= 70 points (out of 100)
-                    overall_pass = total_points >= 70
-
-                    # Debug output for Level 3 rejections
-                    if not (
-                        breakout_ok
-                        and retest_ok
-                        and continuation_ok
-                        and rr_ok
-                        and context_ok
-                        and overall_pass
-                    ):
-                        print("  Level 3 REJECTED:")
-                        print(
-                            "    "
-                            f"breakout={component_grades.get('breakout')} "
-                            f"retest={component_grades.get('retest')} "
-                            f"continuation={component_grades.get('continuation')} "
-                            f"rr={component_grades.get('rr')} "
-                            f"market={component_grades.get('market')} "
-                            f"total_pts={total_points}"
-                        )
-
-                    if not (
-                        breakout_ok
-                        and retest_ok
-                        and continuation_ok
-                        and rr_ok
-                        and context_ok
-                        and overall_pass
-                    ):
-                        rejected_breakout += 1  # Reuse counter for overall rejections
-                        reject = True
-
-                if reject:
-                    continue
-
-                # Signal passed filters
-                filtered_signals.append(s)
+            # Grade A filter (higher points threshold)
+            if FEATURE_GRADE_A_FILTERING_ENABLE:
+                tmp = []
+                for s in filtered_signals:
+                    total_points = (
+                        s.get("breakout_points", 0)
+                        + s.get("retest_points", 0)
+                        + s.get("ignition_points", 0)
+                        + s.get("context_points", 0)
+                    )
+                    if total_points >= GRADE_A_MIN_POINTS:
+                        tmp.append(s)
+                    else:
+                        rejected_a += 1
+                filtered_signals = tmp
 
             graded_signals = filtered_signals
 
-        # Print filtering stats
-        level_label = f"Level {self.pipeline_level}"
-        if pre_filter_count > 0:
-            filtered_count = len(graded_signals)
-            print(f"  {level_label} Quality Filter for {symbol}:")
+            # Diagnostics summary
+            print(f"  Level 2 Quality Filter for {symbol}:")
             print(f"    Before filter: {pre_filter_count} signals")
-            print(f"    Rejected (breakout fail): {rejected_breakout}")
-            print(f"    Rejected (retest fail): {rejected_retest}")
-            if self.pipeline_level >= 3:
-                print(
-                    f"    Rejected (component < C or overall < B): {rejected_ignition}"
-                )  # Reuse counter
+            if FEATURE_GRADE_C_FILTERING_ENABLE:
+                print(f"    Rejected (Grade C gate): {rejected_c}")
             else:
-                print(f"    Continuation graded ❌ (not rejected): {rejected_ignition}")
-            print(f"    Rejected (candle type): {rejected_candle_type}")
-            criteria_desc = (
-                "breakout & RR >= C (retest/context ignored)"
-                if self.pipeline_level == 2
-                else ">= C in all components + >= 70 pts overall"
-            )
-            print(f"    After filter: {filtered_count} signals " f"(passed {criteria_desc})")
+                print("    Grade C gate: disabled")
+            if FEATURE_GRADE_B_FILTERING_ENABLE:
+                print(f"    Rejected (Grade B gate < {GRADE_B_MIN_POINTS} pts): {rejected_b}")
+            else:
+                print("    Grade B gate: disabled")
+            if FEATURE_GRADE_A_FILTERING_ENABLE:
+                print(f"    Rejected (Grade A gate < {GRADE_A_MIN_POINTS} pts): {rejected_a}")
+            else:
+                print("    Grade A gate: disabled")
+            print(f"    After filter: {len(graded_signals)} signals")
 
-        # For level 2, analyze which signals would be rejected in level 3
-        if self.pipeline_level == 2:
-            print(
-                "  Level 2 (simplified) diagnostic vs Level 3 potential rejections:"
-            )
-            overall_rejects_lvl3 = 0
-            for s in graded_signals:
-                breakout_pts = s.get("breakout_points", 0)
-                retest_pts = s.get("retest_points", 0)
-                ignition_pts = s.get("ignition_points", 0)
-                context_pts = s.get("context_points", 0)
-                total_points = breakout_pts + retest_pts + ignition_pts + context_pts
-                if total_points < 70:  # Level 3 threshold
-                    overall_rejects_lvl3 += 1
-            print(
-                "    - Would fail Level 3 (points <70): {}".format(overall_rejects_lvl3)
-            )
-
-        # Removed: min_grade and breakout_tier filtering
-        # Level 0 or 1: Grades are computed but no filtering applied
+        # Removed: previous Level 3+ logic consolidated into Level 2 grade toggles
 
         trades = []
 
@@ -1307,7 +1272,8 @@ class BacktestEngine:
             trades.append(trade_dict)
 
             # Generate and print grading report (Level 2+ only)
-            if self.pipeline_level >= 2:
+            # Print per-trade grading block only for Level 2 when console-only is active
+            if self.pipeline_level >= 2 and self.console_only:
                 report = self.grader.generate_signal_report(
                     sig,
                     retest_volume_a_max_ratio=0.30,
@@ -1358,14 +1324,21 @@ class BacktestEngine:
             "signals": graded_signals,
             "trades": trades,
             "candidate_count": candidate_count,
+            "filter_config": {
+                "grade_c": FEATURE_GRADE_C_FILTERING_ENABLE,
+                "grade_b": FEATURE_GRADE_B_FILTERING_ENABLE,
+                "grade_a": FEATURE_GRADE_A_FILTERING_ENABLE,
+                "grade_b_min_points": GRADE_B_MIN_POINTS,
+                "grade_a_min_points": GRADE_A_MIN_POINTS,
+            },
         }
-        # Attach Level 2 rejection counters for downstream comparisons
-        if self.pipeline_level >= 2:
-            result["level2_rejections"] = {
-                "breakout_fail": rejected_breakout,
-                "retest_fail": rejected_retest,
-                "ignition_fail": rejected_ignition,
-                "candle_type_fail": rejected_candle_type,
+        if self.pipeline_level == 2:
+            result["level2_filtering_stats"] = {
+                "pre_filter_count": pre_filter_count,
+                "rejected_c": rejected_c,
+                "rejected_b": rejected_b,
+                "rejected_a": rejected_a,
+                "post_filter_count": len(graded_signals),
             }
         return result
 
@@ -1730,7 +1703,12 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     parser.add_argument(
         "--console-only",
         action="store_true",
-        help="Only output to console, do not save files (default: False - saves results)",
+        help=(
+            "Only output to console, do not save files. "
+            "At Level 2: trade-level rows are printed only if this flag is set; "
+            "without it, trade details are suppressed in console and only written to file. "
+            "Default: False (saves results)."
+        ),
     )
     # Removed CLI args: --min-grade, --breakout-tier
     parser.add_argument(
@@ -1857,6 +1835,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         no_trades=args.no_trades,
         grading_system=args.grading_system,
         min_rr_ratio=min_rr_ratio,
+        console_only=args.console_only,
     )
 
     results = []
@@ -1912,11 +1891,23 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     # Display results
     print(format_results(results))
 
-    # Print Markdown trade summary (controlled by --one-per-day flag; default: all entries)
+    # Generate Markdown trade summary (controlled by --one-per-day flag; default: all entries)
     md_summary = generate_markdown_trade_summary(
         results, tzinfo=display_tz, tz_label=tz_label, one_per_day=args.one_per_day
     )
-    print(md_summary)
+
+    # Level 2 trade-level console logging rule:
+    # - If --console-only provided: print trade summary (current behavior)
+    # - Else (saving to file): suppress trade-level rows (still save them to file below)
+    if not (pipeline_level == 2 and not args.console_only):
+        print(md_summary)
+    else:
+        # Provide a compact notice so users know trades were captured and where to find them
+        suppression_msg = (
+            "\n[Level 2] Trade details suppressed (use --console-only to display). "
+            "Will be saved to file.\n"
+        )
+        print(suppression_msg)
 
     # Save results by default unless --console-only is specified
     if not args.console_only:

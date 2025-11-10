@@ -40,7 +40,8 @@ def test_grade_breakout_candle_weak():
     # this setup is minimally acceptable and should not be auto-rejected.
     assert grade in ["C", "❌"]
     if grade == "C":
-        assert "Minimal" in desc or "relaxed" in desc
+        # Accept pattern-based descriptions or legacy descriptions
+        assert "Minimal" in desc or "relaxed" in desc or "strength" in desc or "body >=" in desc
     else:
         assert "Weak" in desc
 
@@ -48,24 +49,23 @@ def test_grade_breakout_candle_weak():
 def test_grade_retest_long_perfect():
     """Test perfect long retest grading"""
     retest_candle = {"Open": 100, "High": 101, "Low": 99, "Close": 100.5}
-    retest_vol_ratio = 0.10  # Light volume (< 15% threshold)
     level = 100.0
     direction = "long"
 
-    grade, desc = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+    grade, desc = grade_retest(retest_candle, level, direction)
 
-    assert grade == "✅"
-    assert "rejection" in desc.lower()
+    # With A/B disabled, perfect structures map to C-grade
+    assert grade == "C"
+    assert "grade" in desc.lower() or "near" in desc.lower() or "touched" in desc.lower()
 
 
 def test_grade_retest_high_volume_rejected():
     """High retest volume (>60%) no longer rejects - passes as C-grade."""
     retest_candle = {"Open": 100, "High": 101, "Low": 99.9, "Close": 100.9}
-    retest_vol_ratio = 0.80  # > 60%
     level = 100.0
     direction = "long"
 
-    grade, desc = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+    grade, desc = grade_retest(retest_candle, level, direction)
 
     # With no volume constraint for C-grade, high volume retests now pass
     assert grade in ["✅", "⚠️", "C"]
@@ -74,35 +74,32 @@ def test_grade_retest_high_volume_rejected():
 def test_grade_retest_volume_boundary_a():
     """Retest volume at 30% still eligible for A if structure is A-quality."""
     retest_candle = {"Open": 100, "High": 101, "Low": 99.9, "Close": 100.9}
-    retest_vol_ratio = 0.30  # boundary A
     level = 100.0
     direction = "long"
 
-    grade, _ = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+    grade, _ = grade_retest(retest_candle, level, direction)
 
-    assert grade in ["✅", "⚠️"]  # structure dependent but not rejected by volume
+    assert grade in ["C", "✅", "⚠️"]  # now C-only mode
 
 
 def test_grade_retest_volume_boundary_b():
     """Retest volume at 60% is eligible for B, but not A."""
     retest_candle = {"Open": 100, "High": 101, "Low": 99.8, "Close": 100.6}
-    retest_vol_ratio = 0.60  # boundary B
     level = 100.0
     direction = "long"
 
-    grade, _ = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+    grade, _ = grade_retest(retest_candle, level, direction)
 
-    assert grade in ["⚠️", "❌"]  # cannot be A at this volume
+    assert grade in ["C", "⚠️", "❌"]  # now C-only mode
 
 
 def test_grade_retest_short_weak():
     """Test weak short retest grading"""
     retest_candle = {"Open": 100, "High": 101, "Low": 99, "Close": 101}
-    retest_vol_ratio = 0.10  # Light volume
     level = 100.0
     direction = "short"
 
-    grade, desc = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+    grade, desc = grade_retest(retest_candle, level, direction)
 
     assert grade in ["❌", "⚠️"]
 
@@ -111,24 +108,21 @@ def test_grade_retest_short_perfect():
     """Test perfect short retest grading (A-grade)."""
     # Resistance level 100.0; wick should touch/pierce above, close near low with strong body
     retest_candle = {"Open": 100.2, "High": 100.05, "Low": 99.5, "Close": 99.53}
-    retest_vol_ratio = 0.10
     level = 100.0
     direction = "short"
 
-    grade, desc = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+    grade, desc = grade_retest(retest_candle, level, direction)
 
-    assert grade == "✅"
-    assert "A-grade" in desc or "A-grade" in desc
+    assert grade == "C"
 
 
 def test_grade_retest_short_b_boundary():
     """Short retest at volume boundary (60%) - now passes as C-grade."""
     retest_candle = {"Open": 100.2, "High": 100.4, "Low": 99.7, "Close": 99.9}
-    retest_vol_ratio = 0.60
     level = 100.0
     direction = "short"
 
-    grade, _ = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+    grade, _ = grade_retest(retest_candle, level, direction)
 
     # With relaxed C-grade criteria, this should pass as C
     assert grade in ["⚠️", "C"]
@@ -138,13 +132,12 @@ def test_grade_retest_short_inverted_hammer_alt():
     """Short A-grade via inverted-hammer alternative path."""
     # Design candle with long upper wick, small lower wick, and close below level
     retest_candle = {"Open": 100.0, "High": 100.8, "Low": 99.6, "Close": 99.7}
-    retest_vol_ratio = 0.10
     level = 100.0
     direction = "short"
 
-    grade, desc = grade_retest(retest_candle, retest_vol_ratio, level, direction)
+    grade, desc = grade_retest(retest_candle, level, direction)
 
-    assert grade == "✅"
+    assert grade == "C"
 
 
 def test_grade_risk_reward_excellent():

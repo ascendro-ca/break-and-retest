@@ -283,12 +283,9 @@ def test_multitimeframe_breakout_detection(sample_ohlcv_data_5m, sample_ohlcv_da
         assert signal["risk"] is None
 
 
-def test_level_1_no_grading_applied(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
-    """Test that Level 1 uses base criteria only, no grading filters"""
-    # Level 1: Base pipeline + trades (Stages 1-3), no grading
-    engine = BacktestEngine(
-        initial_capital=7500, position_size_pct=0.01, pipeline_level=1, min_grade=None
-    )
+def test_level_1_grading_analytics(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
+    """Test that Level 1 applies grading (for analytics) without any quality filtering."""
+    engine = BacktestEngine(initial_capital=7500, position_size_pct=0.01, pipeline_level=1)
 
     result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
 
@@ -303,11 +300,12 @@ def test_level_1_no_grading_applied(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
         assert signal["target"] is not None
         assert signal["risk"] is not None
 
-        # Grading fields should NOT be present (no compute_grades called)
-        assert "overall_grade" not in signal
-        assert "breakout_tier" not in signal
-        assert "breakout_grade" not in signal
-        assert "retest_grade" not in signal
+    # Grading metadata present (analytics only, no filtering at Level 1)
+    assert "overall_grade" in signal
+    assert "breakout_tier" in signal
+    assert "component_grades" in signal
+    # Ensure overall_grade is one of expected values
+    assert signal["overall_grade"] in {"A+", "A", "B", "C"}
 
 
 def test_level_1_position_sizing_risk_based(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
@@ -337,13 +335,11 @@ def test_level_1_position_sizing_risk_based(sample_ohlcv_data_5m, sample_ohlcv_d
         assert 0.004 <= risk_pct <= 0.006  # 0.4% to 0.6% tolerance
 
 
-def test_level_2_grading_applied(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
-    """Test that Level 2 applies grading and filters"""
-    # Level 2: Enhanced pipeline with grading
+def test_level_2_grading_simplified_filter(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
+    """Test that Level 2 applies grading and only filters on breakout & RR quality (simplified)."""
     engine = BacktestEngine(
         initial_capital=7500,
         pipeline_level=2,
-        min_grade="B",  # Filter for B-grade or better
     )
 
     result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
@@ -352,12 +348,34 @@ def test_level_2_grading_applied(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
     if len(result["signals"]) > 0:
         signal = result["signals"][0]
 
-        # Grading fields SHOULD be present at Level 2
+        # Grading fields present
         assert "overall_grade" in signal
-        # min_grade filter should have removed C-grade signals
-        grade_order = {"C": 0, "B": 1, "A": 2, "A+": 3}
-        if signal.get("overall_grade"):
-            assert grade_order.get(signal["overall_grade"], 0) >= grade_order["B"]
+        # Simplified filter does not enforce overall grade threshold (no min_grade) so any overall_grade allowed
+
+
+def test_level_2_points_filtering_with_toggles(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
+    """Level 2 with toggles: C gate (breakout & rr) + B gate (points >=70)."""
+    engine = BacktestEngine(
+        initial_capital=7500,
+        pipeline_level=2,
+    )
+
+    result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
+
+    # Check that signals passed the Level 2 gates according to defaults (C and B enabled)
+    for signal in result["signals"]:
+        component_grades = signal.get("component_grades", {})
+        # Grade C gate: require breakout and rr not ❌
+        assert component_grades.get("breakout", "❌") != "❌"
+        assert component_grades.get("rr", "❌") != "❌"
+
+        # Grade B gate: total points >= 70
+        breakout_pts = signal.get("breakout_points", 0)
+        retest_pts = signal.get("retest_points", 0)
+        ignition_pts = signal.get("ignition_points", 0)
+        context_pts = signal.get("context_points", 0)
+        total_points = breakout_pts + retest_pts + ignition_pts + context_pts
+        assert total_points >= 70, f"Signal has {total_points} points, expected >=70"
 
 
 def test_level_0_vs_level_1_differences(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
@@ -370,8 +388,8 @@ def test_level_0_vs_level_1_differences(sample_ohlcv_data_5m, sample_ohlcv_data_
     engine_1 = BacktestEngine(initial_capital=7500, pipeline_level=1)
     result_1 = engine_1.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
 
-    # Both should detect same number of candidates
-    assert len(result_0["signals"]) == len(result_1["signals"])
+    # Level 1 should have fewer or equal candidates due to trade execution filters
+    assert len(result_1["signals"]) <= len(result_0["signals"])
 
     if len(result_0["signals"]) > 0:
         sig_0 = result_0["signals"][0]
@@ -387,9 +405,11 @@ def test_level_0_vs_level_1_differences(sample_ohlcv_data_5m, sample_ohlcv_data_
         assert sig_1["stop"] is not None
         assert sig_1["target"] is not None
 
-        # Neither should have grading at Level 0 or 1
-        assert "overall_grade" not in sig_0
-        assert "overall_grade" not in sig_1
+    # Level 0: candidate mode retains no grading metadata
+    assert "overall_grade" not in sig_0
+    # Level 1: grading computed for analytics (no quality filtering)
+    assert "overall_grade" in sig_1
+    assert sig_1["overall_grade"] in {"A+", "A", "B", "C"}
 
 
 def test_cache_integrity_check_feature_flag(tmp_path):

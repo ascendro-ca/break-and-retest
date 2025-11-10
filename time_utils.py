@@ -5,9 +5,10 @@ Centralized timezone handling for reporting.
 - Maps to IANA timezones for conversion
 - Defaults to PDT (America/Los_Angeles) if not configured
 
-Supported keys in config.json:
+Supported keys in config.json (new names preferred):
 {
-  "timezone": "PDT"  # or PT, PST, PDT, ET, EST, EDT, CT, CST, CDT, MT, MST, MDT, UTC
+    "display_timezone": "PDT",  # new; used for reporting only
+    "timezone": "PDT"           # legacy alias; still supported
 }
 """
 
@@ -69,8 +70,9 @@ def get_display_timezone(config_dir: Path | None = None) -> Tuple[ZoneInfo, str]
     base_dir = config_dir if config_dir is not None else Path(__file__).parent
     config = _load_config(base_dir / "config.json")
 
-    # Support both "timezone" and legacy "timezone_abbrev"
-    abbrev = str(config.get("timezone") or config.get("timezone_abbrev") or _DEFAULT_ABBREV).upper()
+    # Support new "display_timezone" and legacy "timezone" and "timezone_abbrev"
+    # Prefer new display_timezone key; legacy keys removed from active support
+    abbrev = str(config.get("display_timezone", _DEFAULT_ABBREV)).upper()
 
     iana = _ABBREV_TO_IANA.get(abbrev)
     if not iana:

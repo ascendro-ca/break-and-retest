@@ -4,20 +4,20 @@ Stage 2: Breakout Detection
 
 Detects when price breaks beyond the opening range on a 5-minute candle.
 
-Base Criteria (always applied at Level 0/1):
+Base Criteria (always applied at all levels):
 - Breakout candle is NOT the first 5m candle of the session
-- Breakout candle OPEN is inside OR or within small tolerance (gap continuation):
-  - Long: open ≤ OR high + 0.25% buffer (allows slight gap above)
-  - Short: open ≥ OR low - 0.25% buffer (allows slight gap below)
 - Breakout candle CLOSE beyond OR level with 1-tick tolerance:
   - Long: close ≥ OR high - $0.01
   - Short: close ≤ OR low + $0.01
+
+Note: Open position is not checked - breakouts are allowed regardless of where the candle opens
+      (including gap continuations and breakouts from outside OR).
 
 Note: VWAP alignment has been moved to Stage 3 (Retest) to reduce false negatives
       and align with institutional logic for cleaner breakout-confirmation structure.
 
 Note: Volume confirmation (Volume ≥ 1.0× 20-period SMA) has been moved to
-    Grade C criteria and is no longer enforced at the base filter for Level 0/1.
+    Grade C criteria and is no longer enforced at the base filter for any level.
 
 Grading (optional, via config/CLI):
 - Body strength: % of candle that is body vs wick
@@ -58,52 +58,32 @@ def base_breakout_filter(
     row: pd.Series, prev: pd.Series, or_high: float, or_low: float
 ) -> Optional[Tuple[str, float]]:
     """
-    Base breakout criteria (minimal/permissive with tolerance for gap continuations).
+    Base breakout criteria (permissive - only requires close proximity to OR level).
 
-    Allows:
-    1. Open inside OR with 0.25% tolerance (gap continuation cases)
-    2. Close beyond OR level with 1-tick ($0.01) tolerance
+    Allows breakouts regardless of open position (including gap continuations).
+    Only requires close beyond OR level with 1-tick ($0.01) tolerance.
 
-    Note: VWAP alignment moved to retest stage for cleaner breakout detection.
+    Note: Open position is not checked for any level - all pipeline levels use the same
+          permissive breakout detection to maximize candidate identification.
 
     Returns:
         (direction, level) if breakout valid, else None
     """
-    # Base (Level 0/1) relaxed criteria with tolerance
-    open_raw = row.get("Open")
-    try:
-        open_val = float(open_raw) if open_raw is not None else float("nan")
-    except Exception:
-        open_val = float("nan")
+    # Base (permissive) criteria - only check close proximity to OR level
     close_val = float(row["Close"])
 
     # Tolerance parameters
     TICK_BUFFER = 0.01  # $0.01 tolerance for close
-    OPEN_GAP_PCT = 0.0025  # 0.25% tolerance for open (gap continuation)
 
     # 1) Not the first 5m candle – guaranteed by iteration in detect_breakouts (i>=1)
 
-    # 2) Open must be inside OR with tolerance for gap continuations
-    if pd.notna(open_val):
-        or_high_buffer = or_high * (1 + OPEN_GAP_PCT)
-        or_low_buffer = or_low * (1 - OPEN_GAP_PCT)
-        opened_inside_or_long = open_val <= or_high_buffer
-        opened_inside_or_short = open_val >= or_low_buffer
-    else:
-        # If open is missing, allow (for compatibility with unit tests)
-        opened_inside_or_long = True
-        opened_inside_or_short = True
-
-    # 3) Close beyond OR level with 1-tick tolerance
+    # Only require close beyond OR level with 1-tick tolerance
     close_beyond_long = close_val >= (or_high - TICK_BUFFER)
     close_beyond_short = close_val <= (or_low + TICK_BUFFER)
 
-    brk_long = opened_inside_or_long and close_beyond_long
-    brk_short = opened_inside_or_short and close_beyond_short
-
-    if brk_long:
+    if close_beyond_long:
         return ("long", or_high)
-    if brk_short:
+    if close_beyond_short:
         return ("short", or_low)
     return None
 

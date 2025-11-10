@@ -29,10 +29,11 @@ Don't make assumptions - verify first
 7. When I ask to run pre-commit, checks this includes unit tests, linting, code coverage, functional tests
 8. Maintain all main s/w dev workflow operations in the Makefile. Prefer running these workflow operations using "make" operations over running specific commands unless specific commands are warranted.
 9. Over-arching tasks that we're working on are in todo.md
-10. Maintain a history of what we've worked on in each chat thread in the context_summary.md
-11. Start Terminal commands by default in ~/Development/python/break-and-retest folder in a Python venv
+10. Start Terminal commands by default in ~/Development/python/break-and-retest folder in a Python venv. Files referenced here should be assumed to be relative to this project folder.
+11. Maintain a history of what we've worked on in each chat thread in the context_summary.md
 12. Use the Markdown documents in this project for specifications (*.md files in this project) when you don't have enough information, and if you still can't find the info you're looking for ask me when in doubt.
 13. Before making any code changes first explain to me why you want to make them and how they will improve the code. Let me give the "okay" before you make the code changes.
+14. Do not use parenthesis characters in MermaidJS diagrams, they cause syntax errors.
 
 Core Theme
 Take action directly using tools, wait for explicit approval on commits, and don't create unnecessary documentation files.

@@ -137,7 +137,9 @@ md.append(
 )
 md.append(
     "| Avg Win | ${:.2f} | ${:.2f} | ${:.2f} |".format(
-        l1_stats["avg_win"], l2_stats["avg_win"], l2_stats["avg_win"] - l1_stats["avg_win"],
+        l1_stats["avg_win"],
+        l2_stats["avg_win"],
+        l2_stats["avg_win"] - l1_stats["avg_win"],
     )
 )
 md.append(

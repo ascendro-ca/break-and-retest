@@ -66,8 +66,8 @@ def load_config():
         "tickers": ["AAPL", "AMZN", "META", "MSFT", "NVDA", "TSLA", "SPOT", "UBER"],
         "timeframe_5m": "5m",
         "lookback": "2d",
-        "session_start": "09:30",
-        "session_end": "16:00",
+        "session_start_et": "09:30",
+        "session_end_et": "16:00",
         "market_open_minutes": 90,
     }
 
@@ -105,8 +105,8 @@ CONFIG = load_config()
 TICKERS = CONFIG["tickers"]
 TIMEFRAME = CONFIG["timeframe_5m"]
 LOOKBACK = CONFIG["lookback"]
-SESSION_START = CONFIG["session_start"]
-SESSION_END = CONFIG["session_end"]
+SESSION_START = CONFIG.get("session_start_et", "09:30")
+SESSION_END = CONFIG.get("session_end_et", "16:00")
 MARKET_OPEN_MINUTES = CONFIG["market_open_minutes"]
 RETEST_VOL_GATE = CONFIG.get("retest_volume_gate_ratio", 0.20)
 BREAKOUT_A_UW_MAX = CONFIG.get("breakout_A_upper_wick_max", 0.15)

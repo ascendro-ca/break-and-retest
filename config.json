@@ -14,11 +14,17 @@
   "timeframe_5m": "5m",
   "timeframe_1m": "1m",
   "lookback": "2d",
-  "session_start": "09:30",
-  "session_end": "16:00",
+  "session_start_et": "09:30",
+  "session_end_et": "16:00",
   "market_open_minutes": 90,
-  "timezone": "PST",
+  "display_timezone": "PST",
   "backtest_results_dir": "backtest_results",
+  "min_rr_ratio": 2.0,
   "feature_level0_enable_vwap_check": true,
-  "feature_cache_check_integrity": false
+  "feature_cache_check_integrity": false,
+  "feature_grade_c_filtering_enable": true,
+  "feature_grade_b_filtering_enable": true,
+  "feature_grade_a_filtering_enable": false,
+  "grade_b_min_points": 70,
+  "grade_a_min_points": 85
 }

@@ -75,17 +75,7 @@ pierce_depth_pct = abs(min(wick_distance_to_level, 0)) / candle_range
 ✅ Same performance metrics (60% win rate, +$8,991.58)
 
 ### Filter Behavior
-When you use different `--min-grade` filters, you'll now see different results:
-
-**Before (old grading):**
-- `--min-grade A`: Would keep only "perfect" setups (vague criteria)
-- `--min-grade B`: Would keep moderate setups (vague criteria)
-- `--min-grade C`: Would keep weak setups (vague criteria)
-
-**After (new grading):**
-- `--min-grade A`: Keeps only clean "tap and go" retests (pierce ≤ 10%)
-- `--min-grade B`: Allows moderate pierce (10-30%), still good setups
-- `--min-grade C`: No longer applicable for near-miss; no-touch is rejected
+Level-based filtering has been simplified. At Level 2, filtering is currently based on breakout quality and risk/reward only; retest/context/continuation grades are informational.
 
 ## Example Output Comparison
 
@@ -131,25 +121,11 @@ Interpretation:
 
 ## How to Use Going Forward
 
-### 1. Run Backtests with Different Grade Filters
-
-**Test high-quality setups only:**
+- Run backtests by level without grade flags; example:
 ```bash
-python backtest.py --last-days 90 --min-grade A --breakout-tier B
+python backtest.py --last-days 90 --level 2
 ```
-Expected: Fewer trades, but higher win rate (A-grade retests only)
-
-**Test all acceptable setups:**
-```bash
-python backtest.py --last-days 90 --min-grade B --breakout-tier B
-```
-Expected: Moderate trade count, good win rate (A+B grade retests)
-
-**Note on near-misses:**
-```bash
-python backtest.py --last-days 90 --min-grade C --breakout-tier B
-```
-Expected: Most trades, but includes weak retests that need confluence
+Level 2 requires ignition and filters by breakout and R/R only.
 
 ### 2. Live Scanner Behavior
 
@@ -210,16 +186,9 @@ To adjust these, modify `config.json` or pass as CLI arguments.
 
 ## Next Steps
 
-1. **Run extended backtests** (60-90 days) to measure impact:
-   ```bash
-   python backtest.py --last-days 90 --min-grade A --breakout-tier B
-   python backtest.py --last-days 90 --min-grade B --breakout-tier B
-   ```
+1. **Run extended backtests** (60-90 days) to measure impact at Level 2.
 
-2. **Compare win rates** across grade filters:
-   - Hypothesis: A-grade retests should have highest win rate
-   - B-grade retests should be close, still profitable
-   - Near-miss retests are excluded; only A/B touch-based retests are considered
+2. **Compare win rates** across breakout quality and R/R buckets.
 
 3. **Monitor live scanner** for quality:
    - Watch for A-grade setups (highest confidence)

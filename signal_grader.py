@@ -14,6 +14,17 @@ accept/reject a setup before entry.
 
 from typing import Any, Dict, Tuple
 
+import pandas as pd
+
+try:
+    from candle_patterns import detect_pattern
+
+    CANDLE_PATTERNS_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    # Record availability but fail fast at usage sites per requirements
+    CANDLE_PATTERNS_AVAILABLE = False
+    detect_pattern = None  # type: ignore
+
 
 def grade_breakout_candle(
     candle: Dict[str, float],
@@ -71,13 +82,9 @@ def grade_breakout_candle(
     is_red = c < o
 
     # Level checks: if not provided, treat as satisfied to preserve tests
-    level_ok_long = True
-    level_ok_short = True
+    # Level checks (placeholder for future refinement)
     if level is not None and direction is not None:
-        if direction == "long":
-            level_ok_long = c >= level  # A requires strictly >, B allows >=
-        else:
-            level_ok_short = c <= level  # A requires strictly <, B allows <=
+        pass  # Simplified: not enforcing explicit level comparisons currently
 
     # Legacy compatibility: if no level/direction context, allow classic strong mapping
     if level is None and direction is None:
@@ -85,7 +92,7 @@ def grade_breakout_candle(
             return "✅", "Strong candle + high vol"
 
     # Compute body relative to OR range if provided (fallback to candle range)
-    body_pct_or = (body_abs / or_range) if (or_range is not None and or_range > 0) else None
+    # body_pct_or retained only for potential future analytics; not used in grading logic.
 
     # Map the A/B/C criteria to ✅/⚠️/❌ and mirror for bearish
     def bull_A():
@@ -113,15 +120,35 @@ def grade_breakout_candle(
         )
 
     def bull_C():
-        # C-Grade (Minimal Breakout) LONG (Relaxed)
+        # C-Grade (Minimal Breakout) LONG (pattern-based)
         # Requirements:
-        # - Body >= 15% of OR range (fallback: 15% of candle range)
-        # - Volume ≥ 0.7× 20-bar MA
-        # No constraints on wicks
-        body_gate = (body_pct_or is not None and body_pct_or >= 0.15) or (
-            body_pct_or is None and body_p >= 0.15
-        )
-        return body_gate and vol_ratio >= 0.70
+        # - detect_pattern() indicates bullish strength on the candle
+        if not CANDLE_PATTERNS_AVAILABLE:
+            raise ImportError(
+                "candle_patterns is required for Grade C breakout evaluation (long); import failed."
+            )
+        try:
+            candle_df = pd.DataFrame([{"Open": o, "High": h, "Low": low_, "Close": c}])
+            pattern_names = [
+                "hammer",
+                "shooting_star",
+                "engulfing",
+                "doji",
+                "marubozu",
+                "spinning_top",
+                "inverted_hammer",
+                "dragonfly_doji",
+                "gravestone_doji",
+            ]
+            for pname in pattern_names:
+                result = detect_pattern(candle_df, pname).iloc[0]  # type: ignore[misc]
+                if result >= 100:
+                    return True, f"C-grade: pattern {pname} detected (bullish {result})"
+        except Exception as e:
+            # Fail fast per requirement
+            raise ImportError(f"pattern detection error for Grade C (long): {e}") from e
+        # No pattern match -> not C via pattern path
+        return False
 
     def bear_A():
         # A-Grade (Strong Breakdown) SHORT (mirror)
@@ -146,135 +173,111 @@ def grade_breakout_candle(
         )
 
     def bear_C():
-        # C-Grade (Minimal Breakdown) SHORT (Relaxed)
+        # C-Grade (Minimal Breakdown) SHORT ( pattern-based)
         # Requirements:
-        # - Body >= 15% of OR range (fallback: 15% of candle range)
-        # - Volume ≥ 0.7× 20-bar MA
-        # No constraints on wicks
-        body_gate = (body_pct_or is not None and body_pct_or >= 0.15) or (
-            body_pct_or is None and body_p >= 0.15
-        )
-        return body_gate and vol_ratio >= 0.70
+        # - detect_pattern() indicates bearish strength on the candle
+        if not CANDLE_PATTERNS_AVAILABLE:
+            raise ImportError("candle_patterns required for C-grade (short); import failed.")
+        try:
+            candle_df = pd.DataFrame([{"Open": o, "High": h, "Low": low_, "Close": c}])
+            pattern_names = [
+                "hammer",
+                "shooting_star",
+                "engulfing",
+                "doji",
+                "marubozu",
+                "spinning_top",
+                "inverted_hammer",
+                "dragonfly_doji",
+                "gravestone_doji",
+            ]
+            for pname in pattern_names:
+                result = detect_pattern(candle_df, pname).iloc[0]  # type: ignore[misc]
+                if result <= -100:
+                    return True, f"C-grade: pattern {pname} detected (bearish {result})"
+        except Exception as e:
+            # Fail fast per requirement
+            raise ImportError(f"pattern detection error for Grade C (short): {e}") from e
+        # No pattern match -> not C via pattern path
+        return False
 
     if direction == "short":
         if bear_A():
             return "✅", "Strong candle + high vol"
         if bear_B():
             return "⚠️", "Solid candle + good vol"
-        # C-grade: relaxed thresholds
-        if bear_C():
-            return "C", "Minimal breakout (body >= 15% of OR) + relaxed volume (>= 0.7x)"
-        return "❌", "Weak breakout (body < 15% of OR or vol < 0.7x)"
+        # C-grade: pattern-based
+        c_result = bear_C()
+        if isinstance(c_result, tuple):
+            is_c_grade, c_desc = c_result
+            if is_c_grade:
+                return "C", c_desc
+        elif c_result:
+            return "C", "C-grade: pattern detected"
     else:
         # default to long if direction None
         if bull_A():
             return "✅", "Strong candle + high vol"
         if bull_B():
             return "⚠️", "Solid candle + good vol"
-        # C-grade: relaxed thresholds
-        if bull_C():
-            return "C", "Minimal breakout (body >= 15% of OR) + relaxed volume (>= 0.7x)"
-        return "❌", "Weak breakout (body < 15% of OR or vol < 0.7x)"
+        # C-grade: pattern-based
+        c_result = bull_C()
+        if isinstance(c_result, tuple):
+            is_c_grade, c_desc = c_result
+            if is_c_grade:
+                return "C", c_desc
+        elif c_result:
+            return "C", "C-grade: pattern detected"
 
-    # If nothing matched, fallback to a reasonable mapping
-    if (
-        body_p >= 0.50
-        and vol_ratio >= 1.5
-        and (
-            (direction == "long" and level_ok_long)
-            or (direction == "short" and level_ok_short)
-            or direction is None
-        )
-    ):
-        return "✅", "Solid candle + good vol"
-    if body_p >= 0.40 or vol_ratio >= 1.2:
-        return "⚠️", "Adequate candle/vol"
-    # C-grade: relaxed thresholds (fallback path)
-    body_gate = (body_pct_or is not None and body_pct_or >= 0.15) or (
-        body_pct_or is None and body_p >= 0.15
-    )
-    if body_gate and vol_ratio >= 0.70:
-        return "C", "Minimal breakout (body >= 15% of OR) + relaxed volume (>= 0.7x)"
-    return "❌", "Weak breakout (body < 15% of OR or vol < 0.7x)"
+    # If nothing matched, apply simplified fallback C criteria per direction
+    # Long: any bullish candle qualifies as minimal breakout (open <= close)
+    # Short: any bearish candle qualifies as minimal breakdown (close <= open)
+    if direction == "short":
+        if c <= o:
+            return "C", "Minimal breakdown (fallback): any bearish candle"
+        return "❌", "Weak breakout (fallback): not a bearish candle"
+    else:  # default to long
+        if c >= o:
+            return "C", "Minimal breakout (fallback): any bullish candle"
+        return "❌", "Weak breakout (fallback): not a bullish candle"
 
 
 def grade_retest(
     retest_candle: Dict[str, float],
-    retest_vol_ratio: float,
     level: float,
     direction: str,
-    *,
-    retest_volume_a_max_ratio: float = 0.30,
-    retest_volume_b_max_ratio: float = 0.60,
-    b_level_epsilon_pct: float = 0.10,
-    b_structure_soft: bool = True,
 ) -> Tuple[str, str]:
     """
-    Grade the retest candle quality based on Scarface Rules precision criteria.
+    Grade the retest candle quality.
 
-    A-grade: "Tap and Go" - Wick touches/pierces level, closes just above (Long) or below (Short)
-    B-grade: Pierces slightly but closes on correct side (shows some selling/buying pressure)
-    C-grade: Comes close (within 1-2 candle widths) but doesn't touch - needs context confluence
+    Simplified mode: Only C-grade is produced (A/B disabled).
+    Hard reject:
+    - Fail if the close does not hold on the correct side of the level (no epsilon tolerance).
+    Otherwise, return C with a brief reason (touched level or near miss).
 
     Args:
         retest_candle: OHLCV data for retest candle
-        retest_vol_ratio: Volume ratio vs breakout volume
         level: The price level being tested
         direction: 'long' or 'short'
-        retest_vol_threshold: Max acceptable retest vol ratio (default 0.15)
-        b_level_epsilon_pct: For B-tier, allow close within this % of level (default 0.10%)
-        b_structure_soft: If True, soften A/B boundaries to accept marginal structure as ⚠️
 
     Returns:
         (grade, description) tuple
     """
     high = float(retest_candle["High"])
     low = float(retest_candle["Low"])
-    open_ = float(retest_candle.get("Open", (high + low) / 2))
+    # Note: open price not used in simplified C-only grading
     close = float(retest_candle["Close"])
 
-    # Volume gates (vs breakout volume):
-    # - A requires retest_vol_ratio ≤ retest_volume_a_max_ratio (default 30%)
-    # - B requires retest_vol_ratio ≤ retest_volume_b_max_ratio (default 60%)
-    # - C has no volume constraint
-    # We'll check volume later for A/B grades, not here at top level
+    # Volume and structural metrics not considered for C-grade (A/B disabled)
 
     rng = max(high - low, 0.0)
     if rng <= 0:
         return "❌", "Invalid retest candle (no range)"
 
-    body = abs(close - open_)
-    upper_wick = high - max(open_, close)
-    lower_wick = min(open_, close) - low
+    # Structure metrics not used in C-only mode; keep minimal state
 
-    body_pct = body / rng if rng > 0 else 0.0
-    upper_wick_pct = upper_wick / rng if rng > 0 else 0.0
-    lower_wick_pct = lower_wick / rng if rng > 0 else 0.0
-
-    is_green = close > open_
-    is_red = close < open_
-
-    # Helpers
-    close_near_high = (high - close) <= 0.1 * rng
-    close_near_low = (close - low) <= 0.1 * rng
-
-    def within(x: float, a: float, b: float) -> bool:
-        return (x >= a) and (x <= b)
-
-    # Level epsilon for B-tier tolerance
-    eps = level * (b_level_epsilon_pct / 100.0) if b_level_epsilon_pct > 0 else 0.0
-
-    # ===== SCARFACE RULES: RETEST PRECISION CRITERIA =====
-    # Measure distance from level to assess "tap quality"
-    # - A-grade: Wick touches or slightly pierces level
-    # - B-grade: Pierces more but closes on correct side (some pressure)
-    # - C-grade: Comes within 1-2 candle widths but doesn't touch
-
-    # ===== SCARFACE RULES: RETEST PRECISION CRITERIA =====
-    # Measure distance from level to assess "tap quality"
-    # - A-grade: Wick touches or slightly pierces level
-    # - B-grade: Pierces more but closes on correct side (some pressure)
-    # - C-grade: Comes within 1-2 candle widths but doesn't touch
+    # ===== Simplified C-only grading =====
+    # Measure distance from level to provide descriptive C-grade context
 
     # Level rejection checks (must respect the reclaimed/broken level)
     if direction == "long":
@@ -282,182 +285,32 @@ def grade_retest(
         wick_distance_to_level = low - level  # negative if wick went below level
         wick_touches_level = low <= level  # True if wick touched or pierced level
 
-        # Close must hold above level (with epsilon tolerance for B-grade)
-        close_above = close > level
-        close_above_with_eps = close >= (level - eps)  # B-tier allows small miss
-
-        if not close_above_with_eps:
+        # Close must hold strictly above level
+        if close < level:
             return "❌", "Retest failed: close did not hold above level"
 
-        # Track if we used epsilon tolerance
-        used_epsilon = (not close_above) and close_above_with_eps
-
-        # Calculate distance as percentage of candle range for C-grade assessment
-        # C-grade: Comes within 1-2 candle widths (100-200% of range) but doesn't touch
+        # Calculate distance as percentage of candle range for description
         distance_in_candle_widths = abs(wick_distance_to_level) / rng if rng > 0 else 999
-
-        # ===== A-GRADE: "TAP AND GO" =====
-        # Wick touches/pierces level, small wick (clean rejection), closes just above level
-        # Requirements:
-        # - Wick must touch or pierce the level
-        # - If it pierces, should be minimal (< 10% of range below level)
-        # - Close near the high (< 10% from high)
-        # - Body strong (≥ 60%)
-        # - Green candle showing buying strength
-        pierce_depth_pct = abs(min(wick_distance_to_level, 0)) / rng if rng > 0 else 0
-        # clean tap helper (no longer used directly; left for clarity)
-        # clean_tap = wick_touches_level and pierce_depth_pct <= 0.10
-
-        bull_A = (
-            is_green
-            and wick_touches_level
-            and pierce_depth_pct <= 0.10  # Minimal pierce (< 10% of range)
-            and close_near_high  # Close near high (within 10%)
-            and body_pct >= 0.60  # Strong body
-            and close_above  # Must close strictly above (A-grade = precision)
-        )
-        # Apply A-volume gate
-        if bull_A and retest_vol_ratio > retest_volume_a_max_ratio:
-            bull_A = False  # Downgrade: cannot be A if volume too high
-
-        # ===== B-GRADE: PIERCES BUT CLOSES ABOVE =====
-        # Wick pierces below level more significantly but close still holds above
-        # Shows some selling pressure but buyers defended
-        # Requirements:
-        # - Wick must touch/pierce the level
-        # - Pierce can be deeper (10-30% of range below level)
-        # - Close above level (can use epsilon tolerance)
-        # - Body moderate (40-70%)
-        # - Green or balanced candle
-        moderate_pierce = wick_touches_level and 0.10 < pierce_depth_pct <= 0.30
-
-        bull_B = (
-            (is_green or body_pct <= 0.20)  # Green or doji-ish
-            and wick_touches_level
-            and moderate_pierce  # Moderate pierce (10-30% of range)
-            and close_above_with_eps  # B-tier can use epsilon
-            and body_pct >= 0.40  # Moderate body
-        )
-
-        # Optional: Classic hammer-style (legacy support)
-        hammer_alt = (
-            is_green
-            and wick_touches_level
-            and lower_wick_pct >= 0.45  # Long lower wick
-            and body_pct >= 0.15
-            and upper_wick_pct <= 0.30
-            and close >= (low + 0.45 * rng)
-            and close_above
-        )
-
-        # Return grade based on criteria
-        if bull_A:
-            return "✅", f"A-grade: clean rejection (pierce {pierce_depth_pct*100:.1f}%)"
-
-        if hammer_alt:
-            return "✅", "A-grade hammer: long lower-wick rejection, strong buying"
-
-        if bull_B:
-            suffix = " (eps)" if used_epsilon else ""
-            return "⚠️", f"B-grade: deeper pierce ({pierce_depth_pct*100:.1f}%), close held{suffix}"
-
-        # C-GRADE: No additional constraints for retest
-        # Accept any retest candle regardless of distance, structure, or close position
-        # Only hard reject if volume is excessive (>60% of breakout)
+        # Return simplified C-grade descriptions
         if not wick_touches_level:
-            # Accept near misses as C-grade (no distance limit)
             return "C", f"C-grade: near miss ({distance_in_candle_widths:.1f}x widths from level)"
-
-        # Touched level but didn't match A/B criteria - accept as C-grade
-        if wick_touches_level:
-            return "C", "C-grade: touched level"
-
-        # Should not reach here, but fallback to C-grade
-        return "C", "C-grade: minimal retest"
+        return "C", "C-grade: touched level"
 
     else:  # short
         # Measure how close the wick came to the level (SHORT: upper wick tests resistance)
         wick_distance_to_level = high - level  # positive if wick went above level
         wick_touches_level = high >= level  # True if wick touched or pierced level
 
-        # Close must hold below level (with epsilon tolerance for B-grade)
-        close_below = close < level
-        close_below_with_eps = close <= (level + eps)  # B-tier allows small miss
-
-        if not close_below_with_eps:
+        # Close must hold strictly below level
+        if close > level:
             return "❌", "Retest failed: close did not hold below level"
 
-        # Track if we used epsilon tolerance
-        used_epsilon = (not close_below) and close_below_with_eps
-
-        # Calculate distance as percentage of candle range for C-grade assessment
+        # Calculate distance as percentage of candle range for description
         distance_in_candle_widths = abs(wick_distance_to_level) / rng if rng > 0 else 999
-
-        # ===== A-GRADE: "TAP AND GO" (SHORT) =====
-        # Wick touches/pierces resistance level, clean rejection, closes just below level
-        pierce_depth_pct = max(wick_distance_to_level, 0) / rng if rng > 0 else 0
-        # clean tap helper (no longer used directly)
-        # clean_tap = wick_touches_level and pierce_depth_pct <= 0.10
-
-        bear_A = (
-            is_red
-            and wick_touches_level
-            and pierce_depth_pct <= 0.10  # Minimal pierce (< 10% of range)
-            and close_near_low  # Close near low (within 10%)
-            and body_pct >= 0.60  # Strong body
-            and close_below  # Must close strictly below (A-grade = precision)
-        )
-        # Apply A-volume gate (short)
-        if bear_A and retest_vol_ratio > retest_volume_a_max_ratio:
-            bear_A = False
-
-        # ===== B-GRADE: PIERCES BUT CLOSES BELOW (SHORT) =====
-        # Wick pierces above resistance more significantly but close still holds below
-        moderate_pierce = wick_touches_level and 0.10 < pierce_depth_pct <= 0.30
-
-        bear_B = (
-            (is_red or body_pct <= 0.20)  # Red or doji-ish
-            and wick_touches_level
-            and moderate_pierce  # Moderate pierce (10-30% of range)
-            and close_below_with_eps  # B-tier can use epsilon
-            and body_pct >= 0.40  # Moderate body
-        )
-
-        # Optional: Inverted hammer-style (legacy support)
-        inverted_hammer_alt = (
-            is_red
-            and wick_touches_level
-            and upper_wick_pct >= 0.45  # Long upper wick
-            and body_pct >= 0.15
-            and lower_wick_pct <= 0.30
-            and close <= (high - 0.45 * rng)
-            and close_below
-        )
-
-        # Return grade based on criteria
-        if bear_A:
-            return "✅", f"A-grade: clean rejection (pierce {pierce_depth_pct*100:.1f}%)"
-
-        if inverted_hammer_alt:
-            return "✅", "A-grade inverted-hammer: long upper-wick rejection, strong selling"
-
-        if bear_B:
-            suffix = " (eps)" if used_epsilon else ""
-            return "⚠️", f"B-grade: deeper pierce ({pierce_depth_pct*100:.1f}%), close held{suffix}"
-
-        # C-GRADE: No additional constraints for retest (SHORT)
-        # Accept any retest candle regardless of distance, structure, or close position
-        # Only hard reject if volume is excessive (>60% of breakout)
+        # Return simplified C-grade descriptions
         if not wick_touches_level:
-            # Accept near misses as C-grade (no distance limit)
             return "C", f"C-grade: near miss ({distance_in_candle_widths:.1f}x widths from level)"
-
-        # Touched level but didn't match A/B criteria - accept as C-grade
-        if wick_touches_level:
-            return "C", "C-grade: touched level"
-
-        # Should not reach here, but fallback to C-grade
-        return "C", "C-grade: minimal retest"
+        return "C", "C-grade: touched level"
 
 
 def grade_continuation(
@@ -652,7 +505,6 @@ def generate_signal_report(
     retest_volume_b_max_ratio: float = 0.60,
     a_upper_wick_max: float = 0.15,
     b_body_max: float = 0.65,
-    b_level_epsilon_pct: float = 0.10,
     b_structure_soft: bool = True,
 ) -> str:
     """
@@ -688,16 +540,10 @@ def generate_signal_report(
         or_range=signal.get("or_range"),
     )
 
-    retest_vol_ratio = signal.get("retest_vol_ratio", 0.3)
     retest_grade, retest_desc = grade_retest(
         signal.get("retest_candle", {}),
-        retest_vol_ratio,
         level,
         direction,
-        retest_volume_a_max_ratio=retest_volume_a_max_ratio,
-        retest_volume_b_max_ratio=retest_volume_b_max_ratio,
-        b_level_epsilon_pct=b_level_epsilon_pct,
-        b_structure_soft=b_structure_soft,
     )
 
     ignition_vol_ratio = signal.get("ignition_vol_ratio", 1.0)

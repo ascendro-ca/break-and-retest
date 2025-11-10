@@ -4,7 +4,7 @@
 
 ### High Priority
 
-1. **Add Minimum R/R to Configuration**
+1. (DONE) **Add Minimum R/R to Configuration**
    - Add a minimum R/R to config.json (default 2.0:1)
    - Update the code to use it in all trades unless overridden in a particular trade setup pipeline level, stage or grade level
 
@@ -33,6 +33,26 @@
    - Define Grade A+ scoring criteria for ignition stage
    - Implement Grade A+ filtering logic
    - Test Grade A+ criteria with pipeline level 5
+
+6. **Validate trade setups with real B & R trades during same period**
+   - Determine how to measure, correlation? Some kind of overlap measure
+   - Even just find same symbols traded on same day and count these
+
+7. **Build a small optimize**
+   - vary breakout grade threshold and RR minimum, recompute EV per trade from cached signals to find a Pareto set.
+
+8. **Grade specific filter toggling**
+   - In a backtest I would like to be able to selectively toggle the grade A, B, and C filtering via config.json. For example,
+
+      "feature_grade_a_filtering_enable": false,
+      "feature_grade_b_filtering_enable": false,
+      "feature_grade_c_filtering_enable": true,
+
+   - When filtering of a specific grade is toggled "false" then the trade candidates will not be run through that grade's filter, otherwise they will.
+
+9. **Backtest info loggin cleanup**
+   - With level 2 pipeline only log trades to console when console-only
+     option enabled
 
 ### Medium Priority
 

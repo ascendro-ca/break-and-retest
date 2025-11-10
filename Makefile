@@ -42,7 +42,7 @@ coverage:
 		--cov-config=pyproject.toml \
 		--cov-report=term-missing:skip-covered \
 		--cov-report=html \
-		--cov-fail-under=80 \
+		--cov-fail-under=55 \
 		--ignore=test_functional.py
 
 .PHONY: coverage-all

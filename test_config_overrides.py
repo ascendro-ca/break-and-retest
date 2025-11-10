@@ -1,4 +1,5 @@
 import copy
+
 import pytest
 
 from config_utils import apply_config_overrides, parse_config_value
@@ -13,10 +14,10 @@ def base_config():
         "timeframe_5m": "5m",
         "timeframe_1m": "1m",
         "lookback": "2d",
-        "session_start": "09:30",
-        "session_end": "16:00",
+        "session_start_et": "09:30",
+        "session_end_et": "16:00",
         "market_open_minutes": 90,
-        "timezone": "PST",
+        "display_timezone": "PST",
         "backtest_results_dir": "backtest_results",
         "feature_level0_enable_vwap_check": True,
         "feature_cache_check_integrity": False,
@@ -32,9 +33,9 @@ def base_config():
         ("timeframe_5m", "10m", "10m"),
         ("timeframe_1m", "1m", "1m"),
         ("lookback", "5d", "5d"),
-        ("session_start", "08:30", "08:30"),
-        ("session_end", "17:00", "17:00"),
-        ("timezone", "UTC", "UTC"),
+        ("session_start_et", "08:30", "08:30"),
+        ("session_end_et", "17:00", "17:00"),
+        ("display_timezone", "UTC", "UTC"),
         ("backtest_results_dir", "results_alt", "results_alt"),
         ("feature_level0_enable_vwap_check", "false", False),
         ("feature_cache_check_integrity", "true", True),

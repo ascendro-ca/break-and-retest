@@ -15,7 +15,7 @@ def test_get_display_timezone_default(tmp_path: Path):
 
 def test_get_display_timezone_config_pst(tmp_path: Path):
     cfg = tmp_path / "config.json"
-    cfg.write_text('{"timezone": "PST"}')
+    cfg.write_text('{"display_timezone": "PST"}')
     tz, label = get_display_timezone(tmp_path)
     assert label == "PST"
     assert tz.key == "America/Los_Angeles"
@@ -23,7 +23,7 @@ def test_get_display_timezone_config_pst(tmp_path: Path):
 
 def test_get_display_timezone_invalid(tmp_path: Path):
     cfg = tmp_path / "config.json"
-    cfg.write_text('{"timezone": "INVALID"}')
+    cfg.write_text('{"display_timezone": "INVALID"}')
     tz, label = get_display_timezone(tmp_path)
     # Fallback to default mapping (PDT) or UTC safeguard
     assert label in {"PDT", "UTC"}
@@ -33,7 +33,7 @@ def test_get_display_timezone_invalid(tmp_path: Path):
 def test_get_display_timezone_est(tmp_path: Path):
     """Test Eastern timezone mapping"""
     cfg = tmp_path / "config.json"
-    cfg.write_text('{"timezone": "EST"}')
+    cfg.write_text('{"display_timezone": "EST"}')
     tz, label = get_display_timezone(tmp_path)
     assert label == "EST"
     assert tz.key == "America/New_York"
@@ -42,7 +42,7 @@ def test_get_display_timezone_est(tmp_path: Path):
 def test_get_display_timezone_cst(tmp_path: Path):
     """Test Central timezone mapping"""
     cfg = tmp_path / "config.json"
-    cfg.write_text('{"timezone": "CST"}')
+    cfg.write_text('{"display_timezone": "CST"}')
     tz, label = get_display_timezone(tmp_path)
     assert label == "CST"
     assert tz.key == "America/Chicago"
@@ -51,7 +51,7 @@ def test_get_display_timezone_cst(tmp_path: Path):
 def test_get_display_timezone_mst(tmp_path: Path):
     """Test Mountain timezone mapping"""
     cfg = tmp_path / "config.json"
-    cfg.write_text('{"timezone": "MST"}')
+    cfg.write_text('{"display_timezone": "MST"}')
     tz, label = get_display_timezone(tmp_path)
     assert label == "MST"
     assert tz.key == "America/Denver"
@@ -60,7 +60,7 @@ def test_get_display_timezone_mst(tmp_path: Path):
 def test_get_display_timezone_utc(tmp_path: Path):
     """Test UTC timezone mapping"""
     cfg = tmp_path / "config.json"
-    cfg.write_text('{"timezone": "UTC"}')
+    cfg.write_text('{"display_timezone": "UTC"}')
     tz, label = get_display_timezone(tmp_path)
     assert label == "UTC"
     assert tz.key == "UTC"

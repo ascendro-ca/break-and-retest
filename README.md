@@ -1,3 +1,20 @@
+### Timezone & Session Configuration
+
+Config keys have been renamed for clarity. New names distinguish the Eastern market session (fixed U.S. equities clock) from the display timezone used for reports.
+
+| Purpose | New Key | Legacy Key | Example |
+|---------|---------|------------|---------|
+| Regular session start (Eastern Time) | `session_start_et` | `session_start` | `09:30` |
+| Regular session end (Eastern Time) | `session_end_et` | `session_end` | `16:00` |
+| Reporting/display timezone | `display_timezone` | `timezone`, `timezone_abbrev` | `PST` |
+
+Behavior:
+- Data is stored and processed internally in UTC.
+- Session slicing converts timestamps to America/New_York and applies `session_start_et` / `session_end_et`.
+- Output serialization & Markdown summaries convert to `display_timezone` (Pacific, Eastern, etc.).
+- Legacy keys remain supported; if both new and old are present the new ones take precedence.
+
+Update any custom scripts or overrides to use the new key names going forward.
 # Break & Re-Test Strategy
 
 A comprehensive trading system for detecting and trading Opening Range breakouts with retest confirmations on intraday timeframes.
@@ -44,7 +61,7 @@ This system solves these problems by:
 Multi-stage algorithmic detection with progressive filtering:
 - **Stage 1: Opening Range** — Identifies consolidation in first 5-30 minutes
 - **Stage 2: Breakout** — Detects 5-minute breakout
-  - Base (Level 0/1): Open inside OR; Close ≥ OR high (long) or ≤ OR low (short); VWAP-aligned (Close > VWAP for long, < VWAP for short); not the first 5m candle
+  - Base (Level 0/1): Open inside OR; Close ≥ OR high (long) or ≤ OR low (short); not the first 5m candle
   - Note: Volume baseline is not enforced at base; it is enforced at Grade C (vol ≥ 1.0× 20-bar MA) when grading is used
 - **Stage 3: Retest** — Finds 1-minute retest patterns (pullback + bounce)
 - **Stage 4: Ignition** — Validates continuation after entry
@@ -80,14 +97,14 @@ Memory-efficient historical testing with on-demand 1-minute data loading:
 ```bash
 python backtest.py --symbols AAPL MSFT \
   --start 2025-07-01 --end 2025-10-31 \
-  --level 2 --min-grade C \
+  --level 2 \
   --output backtest_results/my_test.json
 ```
 
 Features:
 - Multi-symbol support with per-symbol and aggregate statistics
 - Configurable capital allocation, position sizing, and leverage
-- Pipeline level filtering (0/1/2+) with grade thresholds
+- Pipeline level filtering (0/1/2+) with simplified criteria
 - Cache-only data access (populate with `stockdata_retriever.py`)
 - JSON output for downstream analysis
 
@@ -225,7 +242,6 @@ python backtest.py \
   --initial-capital 50000 \
   --position-size 0.05 \
   --level 2 \
-  --min-grade C \
   --output backtest_results/q1_2025_level2.json
 ```
 
@@ -235,13 +251,11 @@ python backtest.py \
 - `--initial-capital`: Starting capital (default: 7500)
 - `--position-size`: Position size as % of capital (default: 0.1 = 10%)
 - `--leverage`: Max notional leverage (default: 1.0 = no leverage)
-- `--level`: Pipeline level (0=candidates, 1=all trades, 2+=graded filtering)
-- `--min-grade`: Minimum overall grade (A+/A/B/C)
-- `--breakout-tier`: Filter by breakout component grade (A/B/C)
+- `--level`: Pipeline level (0=candidates, 1=all trades, 2+=quality filtering)
 - `--output`: Save results to JSON file
 - `--force-refresh`: Clear cache before run
 
-**Level 2 Filtering**: At `--level 2`, signals are filtered by overall grade. `--min-grade C` accepts setups graded A, B, or C overall. Remember: **C-grade is a minimum quality threshold**, not a weakness requirement. A C-grade setup can have A-grade components (e.g., strong breakout + weaker retest). All candle strength types (1=marubozu → 5=doji) are accepted as long as direction aligns with the trade (bullish for long, bearish for short).
+**Level 2 Filtering**: At `--level 2`, signals are filtered by breakout quality and risk/reward only; retest/context/continuation grades are informational. Ignition is required for entry timing.
 
 **Example Output**:
 ```
@@ -379,7 +393,7 @@ pytest --cov=. --cov-report=html
 ### Core Pipeline Modules
 - **`stage_opening_range.py`** — Stage 1: Opening Range detection
 - **`stage_breakout.py`** — Stage 2: 5-minute breakout with volume confirmation
-- **`stage_retest.py`** — Stage 3: 1-minute retest pattern detection with VWAP alignment (0.05% buffer)
+- **`stage_retest.py`** — Stage 3: 1-minute retest pattern detection
 - **`stage_ignition.py`** — Stage 4: Post-entry continuation validation
 - **`trade_setup_pipeline.py`** — Orchestrates all 4 stages and pipeline levels
 
