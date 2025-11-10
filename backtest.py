@@ -28,10 +28,14 @@ from cache_utils import (
     integrity_check_range,
 )
 from config_utils import load_config, add_config_override_argument, apply_config_overrides
-from grading import get_grader
+from grading.profile_loader import load_profile
+from grading.breakout_grader import grade_breakout as profile_grade_breakout
+from grading.retest_grader import grade_retest as profile_grade_retest
+from grading.ignition_grader import grade_ignition as profile_grade_ignition
 from time_utils import get_display_timezone, get_timezone_label_for_date
 from trade_setup_pipeline import run_pipeline
 from stage_opening_range import detect_opening_range
+from candle_patterns import classify_candle_strength
 
 CONFIG = load_config()
 DEFAULT_TICKERS = CONFIG["tickers"]
@@ -44,11 +48,108 @@ FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get("feature_level0_enable_vwap_check"
 BREAKOUT_B_BODY_MAX = CONFIG.get("breakout_B_body_max", 0.65)
 RETEST_B_EPSILON = CONFIG.get("retest_B_level_epsilon_pct", 0.10)
 RETEST_B_SOFT = CONFIG.get("retest_B_structure_soft", True)
-FEATURE_GRADE_C_FILTERING_ENABLE = CONFIG.get("feature_grade_c_filtering_enable", True)
-FEATURE_GRADE_B_FILTERING_ENABLE = CONFIG.get("feature_grade_b_filtering_enable", True)
-FEATURE_GRADE_A_FILTERING_ENABLE = CONFIG.get("feature_grade_a_filtering_enable", True)
-GRADE_B_MIN_POINTS = CONFIG.get("grade_b_min_points", 70)
-GRADE_A_MIN_POINTS = CONFIG.get("grade_a_min_points", 85)
+# Deprecated grade filtering feature flags (feature_grade_[c|b|a|aplus]_filtering_enable) and
+# points thresholds were removed as part of grading simplification. Profiles are now
+# name-only shells; all Level 2 signals pass through without gating. Retest A+ evaluation
+# retained strictly for analytics (non-filtering). Any attempt to access the legacy
+# FEATURE_GRADE_* variables will now raise an AttributeError if relied upon externally.
+
+
+def evaluate_retest_aplus(
+    retest_candle: Dict,
+    *,
+    level: float,
+    direction: str,
+    breakout_time,
+    retest_time,
+    breakout_volume: float,
+    retest_volume: float,
+) -> Dict[str, object]:
+    """Evaluate A+ retest criteria per docs/features/grade_a_plus_criteria.md.
+
+    Returns a dict: { 'passed': bool, 'reason': str }
+    """
+    try:
+        # Basic OHLC extraction
+        high_ = float(retest_candle.get("High"))
+        low_ = float(retest_candle.get("Low"))
+        close_ = float(retest_candle.get("Close"))
+    except Exception:
+        return {"passed": False, "reason": "invalid_retest_candle"}
+
+    rng = max(high_ - low_, 1e-9)
+
+    # 1) Timing: retest occurs within 1–5 minutes after breakout close
+    try:
+        bt = pd.to_datetime(breakout_time)
+        rt = pd.to_datetime(retest_time)
+        if getattr(bt, "tzinfo", None) is None:
+            bt = bt.tz_localize("UTC")
+        if getattr(rt, "tzinfo", None) is None:
+            rt = rt.tz_localize("UTC")
+        delta_min = abs((rt - bt).total_seconds()) / 60.0
+        if not (1.0 <= delta_min <= 5.0):
+            return {"passed": False, "reason": f"timing_outside:{delta_min:.1f}m"}
+    except Exception:
+        # If timestamps are missing, fail safe (spec requires timing)
+        return {"passed": False, "reason": "missing_timestamps"}
+
+    # 2) Interaction with level: tap/slight pierce within <= 15% of 1m range
+    interaction_ok = False
+    if direction == "long":
+        # Must reach near or through level (OR high) but not deep; measure distance
+        dist = max(0.0, level - low_)
+        interaction_ok = (level >= low_ - 1e-9) and (dist <= 0.15 * rng)
+        # Close should be above level (hold)
+        if close_ < level - 1e-9:
+            return {"passed": False, "reason": "close_wrong_side"}
+    else:
+        dist = max(0.0, high_ - level)
+        interaction_ok = (level <= high_ + 1e-9) and (dist <= 0.15 * rng)
+        if close_ > level + 1e-9:
+            return {"passed": False, "reason": "close_wrong_side"}
+
+    if not interaction_ok:
+        return {"passed": False, "reason": "no_clean_tap"}
+
+    # 3) Volume: retest volume light relative to breakout (<= 30%)
+    try:
+        if breakout_volume <= 0:
+            return {"passed": False, "reason": "no_breakout_volume"}
+        vol_ratio = retest_volume / breakout_volume
+        if vol_ratio > 0.30 + 1e-9:
+            return {"passed": False, "reason": f"heavy_retest_vol:{vol_ratio:.2f}"}
+    except Exception:
+        return {"passed": False, "reason": "volume_calc_error"}
+
+    # 4) First touch only: enforced upstream; assume single retest candle provided
+
+    # 5) Candle pattern checks via classifier (TA-Lib-powered features inside classify)
+    cls = classify_candle_strength(pd.Series(retest_candle))
+    ctype = str(cls.get("type", "unknown"))
+    # Accepted bullish for long: hammer, dragonfly_doji, bullish engulfing proxy via type checks,
+    # inside bar/ tight base is less strict, but we'll allow hammer/dragonfly/doji/inside variants.
+    if direction == "long":
+        allowed = {
+            "hammer",
+            "dragonfly_doji",
+            "normal_bullish",
+            "spinning_top_bullish",
+            "doji",
+        }
+    else:
+        allowed = {
+            "shooting_star",
+            "gravestone_doji",
+            "normal_bearish",
+            "spinning_top_bearish",
+            "doji",
+        }
+    if ctype not in allowed:
+        return {"passed": False, "reason": f"pattern:{ctype}"}
+
+    # Passed all checks
+    return {"passed": True, "reason": "ok"}
 
 
 class DataCache:
@@ -241,8 +342,11 @@ class BacktestEngine:
         # Level 1+: Can execute trades (unless no_trades=True)
         self.pipeline_level = int(pipeline_level)
         self.no_trades = no_trades if pipeline_level > 0 else True  # Level 0 always no trades
-        # Grading system
-        self.grader = get_grader(grading_system)
+        # Profile-based grading (simplified). Points grader removed.
+        self.grade_profile_name = None
+        self.grade_profile = None
+        # Removed points-based continuation grader; use profile ignition metrics only
+        self.grader = None
 
     def _load_1m_window(
         self, symbol: str, center_time: pd.Timestamp, window_minutes: int = 90
@@ -628,25 +732,59 @@ class BacktestEngine:
                 # Level 2+: Entry at ignition (Stage 4); Level 1: Entry at next bar after retest
                 ignition_bar = None  # We'll always try to capture an ignition candle for analytics
                 if self.pipeline_level >= 2:
-                    # Wait for ignition before entering (or skip if no ignition detected)
-                    ignition_time_raw = cand.get("ignition_time")
-                    if not ignition_time_raw:
-                        continue  # No ignition detected, skip this signal
-                    ignition_time = pd.to_datetime(ignition_time_raw)
-
-                    # Find the 1m bar immediately after the ignition candle for entry
-                    next_bars = session_df_1m[session_df_1m["Datetime"] > ignition_time]
-                    if next_bars.empty:
-                        continue
-                    entry_bar = next_bars.iloc[0]
-                    entry_time = entry_bar["Datetime"]
-                    entry = float(entry_bar.get("Open"))
-                    # For unified schema capture the actual ignition bar (from pipeline if present)
-                    ignition_bar = session_df_1m[session_df_1m["Datetime"] == ignition_time]
-                    if not ignition_bar.empty:
-                        ignition_bar = ignition_bar.iloc[0]
+                    # Entry logic at Level 2 (parity with Level 1):
+                    # require the first 1m close beyond the retest close,
+                    # then enter on the open of the next bar. Ignition is
+                    # attached for analytics only (not gating) for all
+                    # name-only profiles (c, b, a, aplus).
+                    if self.grade_profile_name in {
+                        "c",
+                        "b",
+                        "a",
+                        "aplus",
+                    }:
+                        retest_close = float(retest_candle.get("Close", 0.0))
+                        after_retest = session_df_1m[session_df_1m["Datetime"] > retest_time]
+                        ignition_idx = None
+                        breakout_up = direction == "long"
+                        for idx, row in after_retest.iterrows():
+                            close = float(row.get("Close", 0.0))
+                            if (breakout_up and close > retest_close) or (
+                                not breakout_up and close < retest_close
+                            ):
+                                ignition_idx = idx
+                                break
+                        if ignition_idx is None:
+                            # No confirmation -> skip (parity with Level 1)
+                            continue
+                        ignition_time = after_retest.loc[ignition_idx, "Datetime"]
+                        ignition_bar = after_retest.loc[ignition_idx]
+                        next_bars = session_df_1m[session_df_1m["Datetime"] > ignition_time]
+                        if next_bars.empty:
+                            continue
+                        entry_bar = next_bars.iloc[0]
+                        entry_time = entry_bar["Datetime"]
+                        entry = float(entry_bar.get("Open"))
                     else:
-                        ignition_bar = None
+                        # Non-Grade-C profiles: require ignition (Stage 4) as usual
+                        ignition_time_raw = cand.get("ignition_time")
+                        if not ignition_time_raw:
+                            continue
+                        ignition_time = pd.to_datetime(ignition_time_raw)
+                        # Find the 1m bar immediately after the ignition candle for entry
+                        next_bars = session_df_1m[session_df_1m["Datetime"] > ignition_time]
+                        if next_bars.empty:
+                            continue
+                        entry_bar = next_bars.iloc[0]
+                        entry_time = entry_bar["Datetime"]
+                        entry = float(entry_bar.get("Open"))
+                        # For unified schema capture the actual ignition bar
+                        # (prefer pipeline-provided if present)
+                        ignition_bar = session_df_1m[session_df_1m["Datetime"] == ignition_time]
+                        if not ignition_bar.empty:
+                            ignition_bar = ignition_bar.iloc[0]
+                        else:
+                            ignition_bar = None
                 else:
                     # Level 1: Wait for first 1m candle after retest that closes above
                     # (long) or below (short) retest close, then enter on open of next candle
@@ -744,6 +882,8 @@ class BacktestEngine:
                     "risk": risk,
                     "level": level,
                     "datetime": entry_time,
+                    # Preserve retest timing for A+ evaluation
+                    "retest_time": retest_time,
                     "breakout_time_5m": breakout_time,
                     "vol_breakout_5m": breakout_candle["Volume"],
                     "vol_retest_1m": retest_candle["Volume"],
@@ -917,176 +1057,103 @@ class BacktestEngine:
                 "candidate_count": 0,
             }
 
-        # Compute grades for each signal (no min_grade filtering)
-        def compute_grades(sig: Dict) -> Dict:
-            entry = sig["entry"]
-            stop = sig["stop"]
-            target = sig["target"]
-            rr_ratio = abs(target - entry) / abs(entry - stop) if entry != stop else 0.0
+        # Ensure default grade profile 'c' loaded for analytics and default filtering
+        if self.pipeline_level == 2 and self.grade_profile is None:
+            try:
+                self.grade_profile_name = "c"
+                self.grade_profile = load_profile("c")
+            except Exception:
+                self.grade_profile_name = None
+                self.grade_profile = None
 
-            # Ensure breakout_candle is a dict
-            breakout_candle_data = sig.get("breakout_candle", {})
-            if hasattr(breakout_candle_data, "to_dict"):
-                breakout_candle_data = breakout_candle_data.to_dict()
+        # Minimal analytics grading for Level 1 & 2: attach component_grades and overall_grade
+        def attach_basic_grades(sig: Dict) -> Dict:
+            # RR symbol mapping (match legacy thresholds)
+            entry = sig.get("entry")
+            stop = sig.get("stop")
+            target = sig.get("target")
+            try:
+                rr_ratio = abs(target - entry) / abs(entry - stop) if entry != stop else 0.0
+            except Exception:
+                rr_ratio = 0.0
+            rr_symbol = "✅" if rr_ratio >= 2.0 else ("⚠️" if rr_ratio >= 1.5 else "❌")
 
-            # Ensure prev_candle is a dict
-            prev_candle_data = sig.get("prev_breakout_candle", None)
-            if prev_candle_data is not None and hasattr(prev_candle_data, "to_dict"):
-                prev_candle_data = prev_candle_data.to_dict()
-
-            breakout_grade, breakout_desc = self.grader.grade_breakout_candle(
-                breakout_candle_data,
-                sig.get("breakout_vol_ratio", 1.5),
-                sig.get("breakout_body_pct", 0.0),
-                sig.get("level", None),
-                sig.get("direction", None),
-                a_upper_wick_max=BREAKOUT_A_UW_MAX,
-                b_body_max=BREAKOUT_B_BODY_MAX,
-                prev_candle=prev_candle_data,
+            # Breakout/retest pass using C profile for analytics
+            prof = self.grade_profile or load_profile("c")
+            bo_ok, _ = profile_grade_breakout(
+                sig.get("breakout_candle", {}), sig.get("breakout_vol_ratio", 0.0), prof
             )
-            # Ensure retest_candle is a dict
-            retest_candle_data = sig.get("retest_candle", {})
-            if hasattr(retest_candle_data, "to_dict"):
-                retest_candle_data = retest_candle_data.to_dict()
-
-            retest_grade, retest_desc = self.grader.grade_retest(
-                retest_candle_data,
-                sig.get("retest_vol_ratio", 0.3),
-                sig.get("level", 0.0),
-                sig.get("direction", "long"),
-                retest_volume_a_max_ratio=0.30,
-                retest_volume_b_max_ratio=0.60,
-                b_level_epsilon_pct=RETEST_B_EPSILON,
-                b_structure_soft=RETEST_B_SOFT,
+            rt_ok, _ = profile_grade_retest(
+                sig.get("retest_candle", {}),
+                level=float(sig.get("level", 0.0)),
+                direction=str(sig.get("direction", "long")),
+                breakout_time=sig.get("breakout_time_5m"),
+                retest_time=sig.get("retest_time"),
+                breakout_volume=float(sig.get("vol_breakout_5m", 0.0)),
+                retest_volume=float(sig.get("vol_retest_1m", 0.0)),
+                breakout_candle=sig.get("breakout_candle", {}),
+                profile=prof,
             )
-            # Ensure ignition_candle is a dict
-            ignition_candle_data = sig.get("ignition_candle", {})
-            if hasattr(ignition_candle_data, "to_dict"):
-                ignition_candle_data = ignition_candle_data.to_dict()
-
-            continuation_grade, continuation_desc = self.grader.grade_continuation(
-                ignition_candle_data,
-                sig.get("ignition_vol_ratio", 1.0),
-                sig.get("distance_to_target", 0.5),
-                sig.get("ignition_body_pct", 0.6),
-            )
-            rr_grade, rr_desc = self.grader.grade_risk_reward(rr_ratio)
-            market_grade, market_desc = self.grader.grade_market_context("slightly_red")
-
-            grades = {
-                "breakout": breakout_grade,
-                "retest": retest_grade,
-                "continuation": continuation_grade,
-                "rr": rr_grade,
-                "market": market_grade,
+            sig["component_grades"] = {
+                "breakout": "✅" if bo_ok else "❌",
+                "retest": "✅" if rt_ok else "❌",
+                "rr": rr_symbol,
+                "market": "⚠️",
             }
-            overall = self.grader.calculate_overall_grade(grades)
-            # Attach fields to signal
-            sig["overall_grade"] = overall
-            sig["component_grades"] = grades
+            # Legacy compatibility: provide breakout_tier (was A/B/C previously)
+            # Using fixed 'C' when breakout passes under default profile; 'none' otherwise.
+            sig["breakout_tier"] = "C" if bo_ok else "none"
+            sig["overall_grade"] = {"aplus": "A+", "a": "A", "b": "B", "c": "C"}.get(
+                self.grade_profile_name or "c", "C"
+            )
             sig["rr_ratio"] = rr_ratio
-            sig["breakout_tier"] = (
-                "A" if breakout_grade == "✅" else ("B" if breakout_grade == "⚠️" else "C")
-            )  # analytics only
-            # Attach points for Level 3 filtering
-            sig["breakout_points"] = float(self.grader._state.get("breakout_pts", 0.0))
-            sig["retest_points"] = float(self.grader._state.get("retest_pts", 0.0))
-            sig["ignition_points"] = float(self.grader._state.get("ignition_pts", 0.0))
-            sig["context_points"] = float(self.grader._state.get("context_pts", 0.0))
+            # Retain retest_aplus analytics for compatibility
+            aplus_eval = evaluate_retest_aplus(
+                sig.get("retest_candle", {}),
+                level=float(sig.get("level", 0.0)),
+                direction=str(sig.get("direction", "long")),
+                breakout_time=sig.get("breakout_time_5m"),
+                retest_time=sig.get("retest_time"),
+                breakout_volume=float(sig.get("vol_breakout_5m", 0.0)),
+                retest_volume=float(sig.get("vol_retest_1m", 0.0)),
+            )
+            sig["retest_aplus"] = bool(aplus_eval.get("passed", False))
+            sig["retest_aplus_reason"] = aplus_eval.get("reason", "")
             return sig
 
-        # Compute grades for all levels so we can analyze score distributions at Level 1
-        # (Filtering still only applied for Level 2+ below). This enables downstream
-        # exports (e.g., breakout score histograms overlayed with Level 2 pass/fail.)
-        graded_signals = [compute_grades(dict(sig)) for sig in signals]
+        graded_signals = [attach_basic_grades(dict(sig)) for sig in signals]
 
         # Legacy rejection counters removed (no longer used)
 
-        # Level 2: Sequential grade filtering via config toggles (C -> B -> A)
+        # Level 2: Apply selected grade profile (single profile chosen via --grade)
         pre_filter_count = len(graded_signals) if self.pipeline_level == 2 else 0
-        rejected_c = 0
-        rejected_b = 0
-        rejected_a = 0
-        if self.pipeline_level == 2:
-            debug_tpl = (
-                "DEBUG: Level 2 filtering {n} graded signals | Active filters: "
-                "C={c}, B={b} (min={bmin}), A={a} (min={amin})"
-            )
+        if self.pipeline_level == 2 and self.grade_profile is not None:
+            profile_name = self.grade_profile.get("name", "unknown")
             print(
-                debug_tpl.format(
-                    n=len(graded_signals),
-                    c="on" if FEATURE_GRADE_C_FILTERING_ENABLE else "off",
-                    b="on" if FEATURE_GRADE_B_FILTERING_ENABLE else "off",
-                    bmin=GRADE_B_MIN_POINTS,
-                    a="on" if FEATURE_GRADE_A_FILTERING_ENABLE else "off",
-                    amin=GRADE_A_MIN_POINTS,
-                )
+                f"DEBUG: Level 2 applying name-only profile '{profile_name}' (no gating) "
+                f"to {len(graded_signals)} signals"
             )
-            filtered_signals = graded_signals
-
-            # Grade C filter
-            if FEATURE_GRADE_C_FILTERING_ENABLE:
-                tmp = []
-                for s in filtered_signals:
-                    cg = s.get("component_grades", {})
-                    breakout_ok = cg.get("breakout", "❌") != "❌"
-                    rr_ok = cg.get("rr", "❌") != "❌"
-                    if breakout_ok and rr_ok:
-                        tmp.append(s)
-                    else:
-                        rejected_c += 1
-                filtered_signals = tmp
-
-            # Grade B filter (points threshold)
-            if FEATURE_GRADE_B_FILTERING_ENABLE:
-                tmp = []
-                for s in filtered_signals:
-                    total_points = (
-                        s.get("breakout_points", 0)
-                        + s.get("retest_points", 0)
-                        + s.get("ignition_points", 0)
-                        + s.get("context_points", 0)
-                    )
-                    if total_points >= GRADE_B_MIN_POINTS:
-                        tmp.append(s)
-                    else:
-                        rejected_b += 1
-                filtered_signals = tmp
-
-            # Grade A filter (higher points threshold)
-            if FEATURE_GRADE_A_FILTERING_ENABLE:
-                tmp = []
-                for s in filtered_signals:
-                    total_points = (
-                        s.get("breakout_points", 0)
-                        + s.get("retest_points", 0)
-                        + s.get("ignition_points", 0)
-                        + s.get("context_points", 0)
-                    )
-                    if total_points >= GRADE_A_MIN_POINTS:
-                        tmp.append(s)
-                    else:
-                        rejected_a += 1
-                filtered_signals = tmp
-
-            graded_signals = filtered_signals
-
-            # Diagnostics summary
-            print(f"  Level 2 Quality Filter for {symbol}:")
-            print(f"    Before filter: {pre_filter_count} signals")
-            if FEATURE_GRADE_C_FILTERING_ENABLE:
-                print(f"    Rejected (Grade C gate): {rejected_c}")
-            else:
-                print("    Grade C gate: disabled")
-            if FEATURE_GRADE_B_FILTERING_ENABLE:
-                print(f"    Rejected (Grade B gate < {GRADE_B_MIN_POINTS} pts): {rejected_b}")
-            else:
-                print("    Grade B gate: disabled")
-            if FEATURE_GRADE_A_FILTERING_ENABLE:
-                print(f"    Rejected (Grade A gate < {GRADE_A_MIN_POINTS} pts): {rejected_a}")
-            else:
-                print("    Grade A gate: disabled")
-            print(f"    After filter: {len(graded_signals)} signals")
+            # Name-only profiles: treat all stage checks as pass (baseline Level 1 parity)
+            for s in graded_signals:
+                s["grade_profile"] = profile_name
+                s["stage_results"] = {
+                    "breakout": {"pass": True, "reason": "profile_shell"},
+                    "retest": {"pass": True, "reason": "profile_shell"},
+                    "ignition": {"pass": True, "reason": "profile_shell"},
+                }
+                mapping = {"aplus": "A+", "a": "A", "b": "B", "c": "C"}
+                s["overall_grade"] = mapping.get(profile_name, "C")
+                s["component_grades"] = {
+                    "breakout": "✅",
+                    "retest": "✅",
+                    "rr": "✅",  # RR handled separately
+                    "market": "⚠️",
+                }
+            # Optional A+ gate retained (user may still toggle); filters only by retest_aplus flag
+            # A+ retest analytics retained; no filtering applied (feature flag removed).
+            print(f"  Level 2 profile shell '{profile_name}' (no gating) for {symbol}:")
+            print(f"    Before shell pass-through: {pre_filter_count} signals")
+            print(f"    After shell pass-through: {len(graded_signals)} signals")
 
         # Removed: previous Level 3+ logic consolidated into Level 2 grade toggles
 
@@ -1109,18 +1176,42 @@ class BacktestEngine:
             if shares == 0:
                 continue
 
-            # Load 1m data for this trade: from entry time forward for a reasonable window
-            # to track exits. Load up to 1 day (390 market minutes) or until we find an exit.
-            future_bars = self._load_1m_window(
-                symbol=symbol,
-                center_time=entry_datetime + timedelta(minutes=195),  # Mid-day from entry
-                window_minutes=200,  # Cover rest of session plus next day if needed
-            )
-
-            # Filter to bars after entry
-            if not future_bars.empty:
+            # Load 1m data for this trade: prefer inline 1m (tests) else cache window
+            if getattr(self, "_inline_df_1m", None) is not None:
+                # Use provided inline 1m data and filter to bars after entry
+                future_bars = self._inline_df_1m.copy()
+                future_bars["Datetime"] = pd.to_datetime(future_bars["Datetime"], errors="coerce")
+                # Normalize to UTC to match entry_datetime tz-awareness
+                try:
+                    et_tz = ZoneInfo("America/New_York")
+                except Exception:
+                    et_tz = None
+                dt_sr = future_bars["Datetime"]
+                try:
+                    if getattr(dt_sr.dt, "tz", None) is None and et_tz is not None:
+                        future_bars["Datetime"] = dt_sr.dt.tz_localize(et_tz).dt.tz_convert(
+                            ZoneInfo("UTC")
+                        )
+                    elif getattr(dt_sr.dt, "tz", None) is not None:
+                        future_bars["Datetime"] = dt_sr.dt.tz_convert(ZoneInfo("UTC"))
+                except Exception:
+                    # Fallback: if localization fails, interpret as UTC-naive then localize
+                    if getattr(future_bars["Datetime"].dt, "tz", None) is None:
+                        future_bars["Datetime"] = future_bars["Datetime"].dt.tz_localize("UTC")
                 future_bars = future_bars[future_bars["Datetime"] > entry_datetime].copy()
                 future_bars = future_bars.sort_values("Datetime")
+            else:
+                # Fallback to cached window around the entry time
+                future_bars = self._load_1m_window(
+                    symbol=symbol,
+                    center_time=entry_datetime + timedelta(minutes=195),  # Mid-day from entry
+                    window_minutes=200,  # Cover rest of session plus next day if needed
+                )
+
+                # Filter to bars after entry
+                if not future_bars.empty:
+                    future_bars = future_bars[future_bars["Datetime"] > entry_datetime].copy()
+                    future_bars = future_bars.sort_values("Datetime")
 
             if future_bars.empty:
                 # No data after signal - skip this trade
@@ -1174,8 +1265,8 @@ class BacktestEngine:
                 # Clamp between 0 and 1 for reporting
                 distance_to_target = max(0.0, min(1.0, float(progress)))
 
-                # Grade continuation (post-entry analysis only)
-                cont_grade, cont_desc = self.grader.grade_continuation(
+                # Grade continuation using profile ignition thresholds (reuse ignition pass concept)
+                ign_ok, ign_reason = profile_grade_ignition(
                     {
                         "Open": ignition_open,
                         "High": ignition_high,
@@ -1183,10 +1274,13 @@ class BacktestEngine:
                         "Close": ignition_close,
                         "Volume": ignition_vol,
                     },
-                    ignition_vol_ratio,
-                    distance_to_target,
-                    ignition_body_pct,
+                    ignition_body_pct=ignition_body_pct,
+                    ignition_vol_ratio=ignition_vol_ratio,
+                    progress=distance_to_target,
+                    profile=self.grade_profile or load_profile("c"),
                 )
+                cont_grade = "✅" if ign_ok else "❌"
+                cont_desc = f"ignition_profile_eval:{ign_reason}"
 
                 continuation_diag.update(
                     {
@@ -1274,37 +1368,14 @@ class BacktestEngine:
             # Generate and print grading report (Level 2+ only)
             # Print per-trade grading block only for Level 2 when console-only is active
             if self.pipeline_level >= 2 and self.console_only:
-                report = self.grader.generate_signal_report(
-                    sig,
-                    retest_volume_a_max_ratio=0.30,
-                    retest_volume_b_max_ratio=0.60,
-                    a_upper_wick_max=BREAKOUT_A_UW_MAX,
-                    b_body_max=BREAKOUT_B_BODY_MAX,
-                    b_level_epsilon_pct=RETEST_B_EPSILON,
-                    b_structure_soft=RETEST_B_SOFT,
-                )
                 print("\n" + "=" * 70)
-                print(report)
-                # Print continuation diagnostics at exit for information purposes
-                if continuation_diag["continuation_grade"] is not None:
-                    # Format ignition time in reporting timezone
-                    ign_ts = continuation_diag["ignition_time"]
-                    try:
-                        ign_ts = pd.to_datetime(ign_ts)
-                        if getattr(ign_ts, "tzinfo", None) is None:
-                            ign_ts = ign_ts.tz_localize("UTC")
-                        ign_ts_local = ign_ts.tz_convert(self.display_tz)
-                        ign_ts_str = ign_ts_local.strftime("%Y-%m-%d %H:%M:%S %Z")
-                    except Exception:
-                        ign_ts_str = str(ign_ts)
-                    info_line = (
-                        f"Continuation (post-entry): {continuation_diag['continuation_desc']} "
-                        f"{continuation_diag['continuation_grade']} | "
-                        f"progress={continuation_diag['distance_to_target']:.0%}, "
-                        f"ign_vol_ratio={continuation_diag['ignition_vol_ratio']:.2f} at "
-                        f"{ign_ts_str}"
-                    )
-                    print(info_line)
+                print(f"{symbol} Profile {self.grade_profile_name or 'n/a'} Trade Summary")
+                sr = sig.get("stage_results", {})
+                b_pass = sr.get("breakout", {}).get("pass", True)
+                r_pass = sr.get("retest", {}).get("pass", True)
+                i_pass = sr.get("ignition", {}).get("pass", True)
+                print(f"Breakout pass={b_pass} Retest pass={r_pass} Ignition pass={i_pass}")
+                print(f"RR={sig.get('rr_ratio', 0.0):.2f} Overall={sig.get('overall_grade', 'C')}")
                 print("=" * 70 + "\n")
 
         # Calculate statistics
@@ -1325,19 +1396,19 @@ class BacktestEngine:
             "trades": trades,
             "candidate_count": candidate_count,
             "filter_config": {
-                "grade_c": FEATURE_GRADE_C_FILTERING_ENABLE,
-                "grade_b": FEATURE_GRADE_B_FILTERING_ENABLE,
-                "grade_a": FEATURE_GRADE_A_FILTERING_ENABLE,
-                "grade_b_min_points": GRADE_B_MIN_POINTS,
-                "grade_a_min_points": GRADE_A_MIN_POINTS,
+                "grade_profile": self.grade_profile_name,
+                "profile_breakout": self.grade_profile.get("breakout")
+                if self.grade_profile
+                else None,
+                "profile_retest": self.grade_profile.get("retest") if self.grade_profile else None,
+                "profile_ignition": self.grade_profile.get("ignition")
+                if self.grade_profile
+                else None,
             },
         }
-        if self.pipeline_level == 2:
+        if self.pipeline_level == 2 and self.grade_profile is not None:
             result["level2_filtering_stats"] = {
                 "pre_filter_count": pre_filter_count,
-                "rejected_c": rejected_c,
-                "rejected_b": rejected_b,
-                "rejected_a": rejected_a,
                 "post_filter_count": len(graded_signals),
             }
         return result
@@ -1745,9 +1816,18 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     )
     parser.add_argument(
         "--grading-system",
-        choices=["points"],
-        default="points",
-        help="Grading system (default: points - 100-point scoring system)",
+        choices=["profile"],
+        default="profile",
+        help="Grading system (profile-based: breakout/retest/ignition thresholds)",
+    )
+    parser.add_argument(
+        "--grade",
+        choices=["aplus", "a", "b", "c"],
+        default="c",
+        help=(
+            "Grade profile to apply at Level 2 filtering. One profile active at a time. "
+            "Defaults to 'c'."
+        ),
     )
     parser.add_argument(
         "--no-trades",
@@ -1837,6 +1917,16 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         min_rr_ratio=min_rr_ratio,
         console_only=args.console_only,
     )
+    # Load grade profile if provided and Level 2
+    if pipeline_level == 2 and args.grade:
+        try:
+            engine.grade_profile_name = args.grade
+            engine.grade_profile = load_profile(args.grade)
+            print(f"Loaded grade profile: {args.grade}")
+        except Exception as e:
+            print(f"Failed to load grade profile '{args.grade}': {e}")
+            engine.grade_profile_name = None
+            engine.grade_profile = None
 
     results = []
 

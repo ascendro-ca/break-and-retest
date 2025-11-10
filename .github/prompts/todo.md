@@ -41,14 +41,8 @@
 7. **Build a small optimize**
    - vary breakout grade threshold and RR minimum, recompute EV per trade from cached signals to find a Pareto set.
 
-8. **Grade specific filter toggling**
-   - In a backtest I would like to be able to selectively toggle the grade A, B, and C filtering via config.json. For example,
-
-      "feature_grade_a_filtering_enable": false,
-      "feature_grade_b_filtering_enable": false,
-      "feature_grade_c_filtering_enable": true,
-
-   - When filtering of a specific grade is toggled "false" then the trade candidates will not be run through that grade's filter, otherwise they will.
+8. (REMOVED) **Grade specific filter toggling**
+   - Deprecated. Grade-based filtering flags were removed; Level 2 uses name-only profiles for analytics only.
 
 9. **Backtest info loggin cleanup**
    - With level 2 pipeline only log trades to console when console-only

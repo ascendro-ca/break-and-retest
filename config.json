@@ -22,9 +22,12 @@
   "min_rr_ratio": 2.0,
   "feature_level0_enable_vwap_check": true,
   "feature_cache_check_integrity": false,
-  "feature_grade_c_filtering_enable": true,
-  "feature_grade_b_filtering_enable": true,
-  "feature_grade_a_filtering_enable": false,
-  "grade_b_min_points": 70,
-  "grade_a_min_points": 85
+  "profile_overrides": {
+    "c": {
+      "breakout": {
+        "min_body_pct": 0.0,
+        "min_volume_ratio": 0.0
+      }
+    }
+  }
 }

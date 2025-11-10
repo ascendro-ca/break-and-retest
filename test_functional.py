@@ -65,71 +65,11 @@ def python_exe():
 
 
 class TestScannerCLI:
-    """Test the break_and_retest_live_scanner.py CLI"""
+    """Legacy live scanner tests removed (script slated for rebuild)."""
 
-    def test_scanner_help(self, python_exe):
-        """Test scanner --help displays usage"""
-        result = subprocess.run(
-            [python_exe, "break_and_retest_live_scanner.py", "--help"],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0
-        assert "usage:" in result.stdout.lower()
-        assert "--tickers" in result.stdout
-        assert "--min-grade" in result.stdout
-
-    def test_scanner_dry_run(self, python_exe):
-        """Test scanner runs without errors (no real market data needed)"""
-        # Note: This may return empty signals due to data/timing, but should not crash
-        result = subprocess.run(
-            [python_exe, "break_and_retest_live_scanner.py", "--tickers", "AAPL"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        # Should exit successfully even if no signals found
-        assert result.returncode == 0
-
-    def test_scanner_with_grade_filter(self, python_exe):
-        """Test scanner with minimum grade filter"""
-        result = subprocess.run(
-            [
-                python_exe,
-                "break_and_retest_live_scanner.py",
-                "--tickers",
-                "AAPL",
-                "--min-grade",
-                "A",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        # Should exit successfully
-        assert result.returncode == 0
-        # If signals found, should show Scarface Rules grading
-        if "Scarface Rules" in result.stdout:
-            assert "Grade: A" in result.stdout or "Grade: A+" in result.stdout
-
-    def test_scanner_with_scarface_grading(self, python_exe):
-        """Test scanner outputs Scarface Rules grading"""
-        result = subprocess.run(
-            [python_exe, "break_and_retest_live_scanner.py", "--tickers", "AAPL"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        # Should exit successfully
-        assert result.returncode == 0
-        # Check for grading components if signals found
-        if "Level:" in result.stdout:
-            # Should have grading output
-            assert (
-                "Breakout:" in result.stdout
-                or "Retest:" in result.stdout
-                or "Grade:" in result.stdout
-            )
+    def test_live_scanner_removed(self):
+        script = Path("break_and_retest_live_scanner.py")
+        assert not script.exists(), "Legacy live scanner script should be removed pending rebuild"
 
 
 class TestBacktestEngine:
@@ -313,76 +253,13 @@ class TestContinuousScanner:
         assert script.exists(), "Scanner script not found"
         assert os.access(script, os.X_OK), "Scanner script not executable"
 
-        @pytest.mark.slow
-        def test_scanner_script_once(self, python_exe):
-            """Test scanner script with --once flag (may wait up to 60s for aligned minute)"""
-            result = subprocess.run(
-                ["./find_break_and_retest.sh", "--once"],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            # Should exit successfully after one run
-            assert result.returncode == 0
 
+class TestSignalGradingRemoved:
+    """Verify legacy signal_grader module is not importable (profile-only grading)."""
 
-class TestSignalGrading:
-    """Test signal_grader.py module functionality"""
-
-    def test_signal_grader_import(self):
-        """Test signal_grader module can be imported"""
-        try:
-            import signal_grader
-
-            assert hasattr(signal_grader, "generate_signal_report")
-            assert hasattr(signal_grader, "grade_breakout_candle")
-            assert hasattr(signal_grader, "calculate_overall_grade")
-        except ImportError as e:
-            pytest.fail(f"Failed to import signal_grader: {e}")
-
-    def test_signal_grading_integration(self):
-        """Test signal grading with a mock signal"""
-        from signal_grader import generate_signal_report
-
-        mock_signal = {
-            "ticker": "TEST",
-            "direction": "long",
-            "level": 100.0,
-            "entry": 100.5,
-            "stop": 99.5,
-            "target": 102.5,
-            "breakout_body_pct": 0.75,
-            "breakout_vol_ratio": 2.5,
-            "retest_vol_ratio": 0.3,
-            "ignition_vol_ratio": 1.2,
-            "distance_to_target": 0.6,
-            "ignition_body_pct": 0.7,
-            "breakout_candle": {
-                "Open": 99,
-                "High": 100.5,
-                "Low": 99,
-                "Close": 100.5,
-            },
-            "retest_candle": {
-                "Open": 100.5,
-                "High": 100.6,
-                "Low": 100.0,
-                "Close": 100.2,
-            },
-            "ignition_candle": {
-                "Open": 100.2,
-                "High": 101.5,
-                "Low": 100.2,
-                "Close": 101.4,
-            },
-        }
-
-        report = generate_signal_report(mock_signal)
-
-        assert "TEST" in report
-        assert "Scarface Rules" in report
-        assert "Grade:" in report
-        assert "Level:" in report
+    def test_signal_grader_not_importable(self):
+        with pytest.raises(ModuleNotFoundError):
+            __import__("signal_grader")
 
 
 class TestConfiguration:

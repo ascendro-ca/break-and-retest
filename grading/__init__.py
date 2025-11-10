@@ -1,16 +1,20 @@
+"""Grading package public exports for profile-based stage graders.
+
+Legacy points and monolithic signal grading modules have been removed.
+Use the discrete stage graders together with profile thresholds loaded
+via `grading.profile_loader.load_profile()`.
+"""
+
 from __future__ import annotations
 
-from typing import Dict
+from .breakout_grader import grade_breakout  # noqa: F401
+from .ignition_grader import grade_ignition  # noqa: F401
+from .profile_loader import load_profile  # noqa: F401
+from .retest_grader import grade_retest  # noqa: F401
 
-from .base import Grader
-from .grading_points import PointsGrader
-
-_GRADERS: Dict[str, Grader] = {
-    "points": PointsGrader(),
-}
-
-
-def get_grader(name: str = "points") -> Grader:
-    """Factory to retrieve a grader by name (case-insensitive)."""
-    key = (name or "points").strip().lower()
-    return _GRADERS.get(key, _GRADERS["points"])  # default fallback
+__all__ = [
+    "grade_breakout",
+    "grade_retest",
+    "grade_ignition",
+    "load_profile",
+]

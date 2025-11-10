@@ -20,7 +20,8 @@ omit =
     conftest.py
     first_trade_analysis.py
     break_and_retest_detection.py
-    signal_grader.py
+    # legacy modules removed
+    # signal_grader.py
 
 [report]
 exclude_lines =
