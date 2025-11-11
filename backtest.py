@@ -32,6 +32,12 @@ from grading.profile_loader import load_profile
 from grading.breakout_grader import grade_breakout as profile_grade_breakout
 from grading.retest_grader import grade_retest as profile_grade_retest
 from grading.ignition_grader import grade_ignition as profile_grade_ignition
+from grading.breakout_grader import score_breakout
+from grading.retest_grader import score_retest
+from grading.ignition_grader import score_ignition
+from grading.trend_grader import score_trend
+
+# Removed unused module-level imports of grader modules; scoring functions already imported.
 from time_utils import get_display_timezone, get_timezone_label_for_date
 from trade_setup_pipeline import run_pipeline
 from stage_opening_range import detect_opening_range
@@ -44,7 +50,6 @@ DEFAULT_LEVERAGE = CONFIG.get("leverage", 2.0)
 DEFAULT_RESULTS_DIR = CONFIG.get("backtest_results_dir", "backtest_results")
 RETEST_VOL_GATE = CONFIG.get("retest_volume_gate_ratio", 0.20)
 BREAKOUT_A_UW_MAX = CONFIG.get("breakout_A_upper_wick_max", 0.15)
-FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get("feature_level0_enable_vwap_check", True)
 BREAKOUT_B_BODY_MAX = CONFIG.get("breakout_B_body_max", 0.65)
 RETEST_B_EPSILON = CONFIG.get("retest_B_level_epsilon_pct", 0.10)
 RETEST_B_SOFT = CONFIG.get("retest_B_structure_soft", True)
@@ -626,6 +631,19 @@ class BacktestEngine:
                     & (session_df_1m["Datetime"] < close_utc)
                 ].copy()
 
+            # Compute 1m VWAP over the session for contextual checks
+            if not session_df_1m.empty:
+                session_df_1m = session_df_1m.copy()
+                session_df_1m["typical_price"] = (
+                    session_df_1m["High"] + session_df_1m["Low"] + session_df_1m["Close"]
+                ) / 3
+                session_df_1m["tp_volume"] = (
+                    session_df_1m["typical_price"] * session_df_1m["Volume"]
+                )
+                session_df_1m["vwap"] = (
+                    session_df_1m["tp_volume"].cumsum() / session_df_1m["Volume"].cumsum()
+                )
+
             if session_df_1m.empty or len(session_df_1m) < 50:
                 # No 1m data available for this day, skip
                 continue
@@ -646,6 +664,33 @@ class BacktestEngine:
                 for c in candidates:
                     breakout_candle = c.get("breakout_candle", {})
                     retest_candle = c.get("retest_candle", {})
+                    # Attach VWAP snapshots when possible
+                    try:
+                        bt = pd.to_datetime(c.get("breakout_time"))
+                        vwap5_val = (
+                            float(
+                                session_df_5m.loc[session_df_5m["Datetime"] == bt, "vwap"].iloc[0]
+                            )
+                            if not session_df_5m.empty
+                            else None
+                        )
+                        if hasattr(breakout_candle, "__setitem__"):
+                            breakout_candle["vwap"] = vwap5_val
+                    except Exception:
+                        pass
+                    try:
+                        rt = pd.to_datetime(c.get("retest_time"))
+                        vwap1_val = (
+                            float(
+                                session_df_1m.loc[session_df_1m["Datetime"] == rt, "vwap"].iloc[0]
+                            )
+                            if not session_df_1m.empty
+                            else None
+                        )
+                        if hasattr(retest_candle, "__setitem__"):
+                            retest_candle["vwap"] = vwap1_val
+                    except Exception:
+                        pass
                     all_signals.append(
                         {
                             "ticker": symbol,
@@ -679,6 +724,9 @@ class BacktestEngine:
                                 "Volume": breakout_candle.get("Volume")
                                 if hasattr(breakout_candle, "get")
                                 else None,
+                                "vwap": breakout_candle.get("vwap")
+                                if hasattr(breakout_candle, "get")
+                                else None,
                             },
                             "prev_breakout_candle": c.get("prev_breakout_candle")
                             if isinstance(c, dict)
@@ -697,6 +745,9 @@ class BacktestEngine:
                                 if hasattr(retest_candle, "get")
                                 else None,
                                 "Volume": retest_candle.get("Volume")
+                                if hasattr(retest_candle, "get")
+                                else None,
+                                "vwap": retest_candle.get("vwap")
                                 if hasattr(retest_candle, "get")
                                 else None,
                             },
@@ -728,6 +779,28 @@ class BacktestEngine:
                 breakout_candle = cand.get("breakout_candle", {})
                 retest_candle = cand.get("retest_candle", {})
                 retest_time = pd.to_datetime(cand.get("retest_time"))
+
+                # Attach VWAP snapshots to the OHLC dicts for trend grading
+                try:
+                    if hasattr(breakout_candle, "__setitem__") and not session_df_5m.empty:
+                        vwap5_val = float(
+                            session_df_5m.loc[
+                                session_df_5m["Datetime"] == breakout_time, "vwap"
+                            ].iloc[0]
+                        )
+                        breakout_candle["vwap"] = vwap5_val
+                except Exception:
+                    pass
+                try:
+                    if hasattr(retest_candle, "__setitem__") and not session_df_1m.empty:
+                        vwap1_val = float(
+                            session_df_1m.loc[
+                                session_df_1m["Datetime"] == retest_time, "vwap"
+                            ].iloc[0]
+                        )
+                        retest_candle["vwap"] = vwap1_val
+                except Exception:
+                    pass
 
                 # Level 2+: Entry at ignition (Stage 4); Level 1: Entry at next bar after retest
                 ignition_bar = None  # We'll always try to capture an ignition candle for analytics
@@ -1119,21 +1192,78 @@ class BacktestEngine:
             )
             sig["retest_aplus"] = bool(aplus_eval.get("passed", False))
             sig["retest_aplus_reason"] = aplus_eval.get("reason", "")
+            # --------------------------------------------------
+            # Points-based scoring (stub) – no filtering applied
+            # --------------------------------------------------
+            try:
+                breakout_pts = score_breakout(
+                    sig.get("breakout_candle", {}),
+                    sig.get("breakout_vol_ratio", 0.0),
+                    prof,
+                    direction=str(sig.get("direction", None)),
+                )
+            except Exception:
+                breakout_pts = 0
+            try:
+                retest_pts = score_retest(
+                    sig.get("retest_candle", {}),
+                    level=float(sig.get("level", 0.0)),
+                    direction=str(sig.get("direction", "long")),
+                    breakout_time=sig.get("breakout_time_5m"),
+                    retest_time=sig.get("retest_time"),
+                    breakout_volume=float(sig.get("vol_breakout_5m", 0.0)),
+                    retest_volume=float(sig.get("vol_retest_1m", 0.0)),
+                    breakout_candle=sig.get("breakout_candle", {}),
+                    profile=prof,
+                )
+            except Exception:
+                retest_pts = 0
+            try:
+                ignition_pts = score_ignition(
+                    sig.get("ignition_candle", {}),
+                    ignition_body_pct=float(sig.get("ignition_body_pct", 0.0)),
+                    ignition_vol_ratio=float(sig.get("ignition_vol_ratio", 0.0)),
+                    progress=float(sig.get("distance_to_target", 0.0)),
+                    profile=prof,
+                )
+            except Exception:
+                ignition_pts = 0
+            try:
+                trend_pts = score_trend(sig, prof)
+            except Exception:
+                trend_pts = 0
+            total_points = breakout_pts + retest_pts + ignition_pts + trend_pts
+            # Letter mapping (aligned with GRADING_SYSTEMS.md)
+            # 95–100 A+, 86–94 A, 70–85 B, 56–69 C, <55 D
+            if total_points >= 95:
+                points_letter = "A+"
+            elif total_points >= 86:
+                points_letter = "A"
+            elif total_points >= 70:
+                points_letter = "B"
+            elif total_points >= 56:
+                points_letter = "C"
+            else:
+                points_letter = "D"
+            sig["points"] = {
+                "breakout": breakout_pts,
+                "retest": retest_pts,
+                "ignition": ignition_pts,
+                "trend": trend_pts,
+                "total": total_points,
+                "letter": points_letter,
+            }
             return sig
 
         graded_signals = [attach_basic_grades(dict(sig)) for sig in signals]
 
         # Legacy rejection counters removed (no longer used)
 
-        # Level 2: Apply selected grade profile (single profile chosen via --grade)
+        # Level 2: Apply selected grade profile and enforce total points threshold per --grade
         pre_filter_count = len(graded_signals) if self.pipeline_level == 2 else 0
         if self.pipeline_level == 2 and self.grade_profile is not None:
             profile_name = self.grade_profile.get("name", "unknown")
-            print(
-                f"DEBUG: Level 2 applying name-only profile '{profile_name}' (no gating) "
-                f"to {len(graded_signals)} signals"
-            )
-            # Name-only profiles: treat all stage checks as pass (baseline Level 1 parity)
+            # Name-only profiles: stage checks pass, but we now gate by total points threshold
             for s in graded_signals:
                 s["grade_profile"] = profile_name
                 s["stage_results"] = {
@@ -1149,13 +1279,33 @@ class BacktestEngine:
                     "rr": "✅",  # RR handled separately
                     "market": "⚠️",
                 }
-            # Optional A+ gate retained (user may still toggle); filters only by retest_aplus flag
-            # A+ retest analytics retained; no filtering applied (feature flag removed).
-            print(f"  Level 2 profile shell '{profile_name}' (no gating) for {symbol}:")
-            print(f"    Before shell pass-through: {pre_filter_count} signals")
-            print(f"    After shell pass-through: {len(graded_signals)} signals")
 
-        # Removed: previous Level 3+ logic consolidated into Level 2 grade toggles
+            # Shell profiles (name-only) provide labeling parity.
+            # Simplified gating: no special handling for global-disabled state.
+
+            # Points-based gating always runs at Level 2. Disabled component filters
+            # award their max points (legacy behavior), so we keep the denominator
+            # at the full maximum (100) to preserve parity when everything is disabled.
+            full_max = 100.0  # 30 + 30 + 30 + 10
+            grade_min_pct = {"c": 0.56, "b": 0.70, "a": 0.86, "aplus": 0.95}
+            min_pct = grade_min_pct.get(profile_name, 0.56)
+            min_points = min_pct * full_max
+
+            def _total_points(sig: Dict) -> float:
+                pts = sig.get("points", {})
+                return (
+                    float(pts.get("breakout", 0.0))
+                    + float(pts.get("retest", 0.0))
+                    + float(pts.get("ignition", 0.0))
+                    + float(pts.get("trend", 0.0))
+                )
+
+            before = len(graded_signals)
+            graded_signals = [s for s in graded_signals if _total_points(s) >= min_points]
+            after = len(graded_signals)
+            # Lint-safe split over two prints
+            print(f"Level 2 gating grade={profile_name} threshold>={min_points:.2f}/100")
+            print(f"signals {before}->{after}")
 
         trades = []
 
@@ -1722,13 +1872,13 @@ Examples:
   python backtest.py --start 2025-10-01 --end 2025-10-31 \
       --initial-capital 50000 --output results.json
 
-  # Override config values (toggle VWAP check off)
+  # Override config values example
   python backtest.py --start 2025-10-01 --end 2025-10-31 \
-      --config-override feature_level0_enable_vwap_check=false
+      --config-override initial_capital=10000
 
   # Multiple config overrides
   python backtest.py --start 2025-10-01 --end 2025-10-31 \
-      --config-override feature_level0_enable_vwap_check=false \
+      --config-override leverage=1.5 \
       --config-override initial_capital=10000
 
 Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
@@ -1848,11 +1998,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     apply_config_overrides(CONFIG, args.config_override or [])
 
     # Update config-derived options and feature flags after overrides
-    global FEATURE_LEVEL0_ENABLE_VWAP_CHECK
-    FEATURE_LEVEL0_ENABLE_VWAP_CHECK = CONFIG.get(
-        "feature_level0_enable_vwap_check",
-        FEATURE_LEVEL0_ENABLE_VWAP_CHECK,
-    )
+    # no-op: removed legacy VWAP Level 0 flag
 
     # Runtime values resolved from CONFIG (do not mutate module-level defaults here)
     runtime_results_dir = CONFIG.get("backtest_results_dir", DEFAULT_RESULTS_DIR)

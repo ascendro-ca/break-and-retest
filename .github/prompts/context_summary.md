@@ -326,13 +326,13 @@ This project implements a 100-point grading system for breakout, retest, and ign
 - **Initial Capital**: Read from CONFIG after overrides, passed to BacktestEngine
 - **Leverage**: If --leverage not provided, uses CONFIG["leverage"] after overrides
 - **Other Values**: retest_volume_gate_ratio, backtest_results_dir now respect overrides
-- **Feature Flags**: FEATURE_LEVEL0_ENABLE_VWAP_CHECK updated post-override
+
 
 #### 3. test_config_overrides.py (New Module)
 - **Parametrized Tests**: Validate all config.json keys are overridable:
   - Numbers: initial_capital (int), leverage (float), market_open_minutes (int)
   - Strings: timeframe_5m, timeframe_1m, lookback, session_*, timezone, backtest_results_dir
-  - Booleans: feature_level0_enable_vwap_check, feature_cache_check_integrity
+  - Booleans: feature_cache_check_integrity
 - **Edge Cases**: Whitespace trimming, invalid format, type coercion
 - **Coverage**: Documents hyphen vs underscore behavior (initial-capital ≠ initial_capital)
 
@@ -347,7 +347,7 @@ python backtest.py --symbols AAPL --start 2025-10-01 --end 2025-10-31 \
 python backtest.py --start 2025-01-01 --end 2025-10-31 \
     --config-override initial_capital=50000 \
     --config-override leverage=3.0 \
-    --config-override feature_level0_enable_vwap_check=false
+
 ```
 
 ### Technical Details
@@ -382,7 +382,7 @@ python backtest.py --symbols AAPL TSLA --start 2025-01-01 --end 2025-10-31 \
 
 # Toggle feature flags
 python backtest.py --symbols META --start 2025-06-01 --end 2025-06-30 \
-    --config-override feature_level0_enable_vwap_check=false
+
 
 # Change timezone and results directory
 python backtest.py --symbols NVDA --start 2025-01-01 --end 2025-12-31 \

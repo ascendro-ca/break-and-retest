@@ -71,7 +71,7 @@ def apply_config_overrides(
 
     Example:
         >>> config = load_config()
-        >>> overrides = ["feature_level0_enable_vwap_check=false", "initial_capital=10000"]
+    >>> overrides = ["initial_capital=10000"]
         >>> apply_config_overrides(config, overrides)
     """
     if not overrides:
@@ -125,7 +125,7 @@ def add_config_override_argument(parser):
         help=(
             "Override config values (can be used multiple times). "
             "Format: KEY=VALUE. Boolean values: true/false. "
-            "Examples: --config-override feature_level0_enable_vwap_check=false "
+            "Examples: --config-override initial_capital=10000 "
             "--config-override initial_capital=10000"
         ),
     )

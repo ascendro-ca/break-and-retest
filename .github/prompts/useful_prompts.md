@@ -21,7 +21,7 @@ Summarize what we've worked on in this chat thread and add it to `context_summar
 > python backtest.py --symbols AAPL NVDA TSLA UBER --start 2025-01-01 --end 2025-10-31 --level 2
 > python backtest.py --symbols AAPL NVDA TSLA UBER --start 2025-01-01 --end 2025-10-31 --level 2 --config-override initial_capital=30000
 
-> python backtest.py --symbols AAPL NVDA TSLA UBER --start 2025-01-01 --end 2025-10-31 --level 2 --config-override initial_capital=30000 --config-override feature_level0_enable_vwap_check=false
+> python backtest.py --symbols AAPL NVDA TSLA UBER --start 2025-01-01 --end 2025-10-31 --level 2 --config-override initial_capital=30000
 
 > python backtest.py --symbols AAPL NVDA TSLA UBER --start 2025-01-01 --end 2025-10-31 --level 1 --config-override initial_capital=30000
 

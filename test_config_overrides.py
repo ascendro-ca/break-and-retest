@@ -19,7 +19,6 @@ def base_config():
         "market_open_minutes": 90,
         "display_timezone": "PST",
         "backtest_results_dir": "backtest_results",
-        "feature_level0_enable_vwap_check": True,
         "feature_cache_check_integrity": False,
     }
 
@@ -37,7 +36,6 @@ def base_config():
         ("session_end_et", "17:00", "17:00"),
         ("display_timezone", "UTC", "UTC"),
         ("backtest_results_dir", "results_alt", "results_alt"),
-        ("feature_level0_enable_vwap_check", "false", False),
         ("feature_cache_check_integrity", "true", True),
     ],
 )
