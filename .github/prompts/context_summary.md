@@ -1,5 +1,36 @@
 # Break & Retest Strategy - Context Summary
 
+## Session: Trend grader fix and A+/A gating restored (Nov 10, 2025)
+
+### What we tackled
+- Level 2 A/A+ backtests showed zero trades after removing a temporary engine-side safeguard; total points capped at 85 because Trend contributed 0 when all trend sub-filters were disabled.
+
+### Diagnosis
+- Instrumented the backtest to inspect trend filter states and point distribution.
+- Found Trend points stuck at 0 and exceptions: "ValueError: The truth value of a Series is ambiguous…" originating in `grading/trend_grader.py` where pandas Series were involved in `or {}` truth checks.
+
+### Fixes implemented
+- `grading/trend_grader.py`:
+  - Added robust early return: if all trend sub-filters are disabled, return full 10/10 context points.
+  - Replaced ambiguous truth checks with explicit None/keys handling; normalized extraction of breakout/retest dictionaries and direction casing to avoid pandas Series ambiguity.
+  - Preserved semantics: disabled sub-filters award their max; final score clamped to [0..10].
+- `backtest.py`:
+  - Removed temporary diagnostics and the prior engine-layer compensating fix so behavior is fully localized to the grader.
+
+### Validation
+- Re-ran a focused backtest (e.g., AAPL, 2025-01-01 to 2025-01-15):
+  - Trend filters all disabled → Trend points = 10 consistently.
+  - A/A+ gating no longer suppresses trades; signals preserved and trades executed (e.g., 105→105).
+- Lint and tests: cleaned debug imports (resolved E402), hooks green; full tests previously green and unaffected by the change.
+
+### Git
+- Committed and pushed to `feature/backtestv2` (short hash example: 2d4ffb8).
+
+### Follow-ups (optional)
+- Add a unit test asserting: when all trend sub-filters disabled, `score_trend` returns 10/10.
+- Introduce a config-driven debug flag to emit compact trend diagnostics without tripping lint.
+- Reduce console verbosity for A+ summaries via logging level or CLI flag.
+
 ## Recent Work Completed (Nov 4, 2025 - Current Session)
 
 ### 1. VWAP Alignment Moved to Retest Stage

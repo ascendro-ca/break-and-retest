@@ -69,7 +69,7 @@ def score_trend(signal: Dict, profile: Dict | None = None) -> int:
 
     # Early short-circuit: all sub-filters disabled => full 10
     try:
-        ft = FILTERS or {}
+        ft = FILTERS if isinstance(FILTERS, dict) else {}
         if (
             not bool(ft.get("filter_trend_htf_stub", True))
             and not bool(ft.get("filter_trend_vwap_breakout", True))
