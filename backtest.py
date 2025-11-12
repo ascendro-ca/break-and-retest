@@ -21,6 +21,7 @@ import time  # Added for runtime measurement
 from collections import OrderedDict
 
 import pandas as pd
+import numpy as np
 # Note: yfinance provider removed; keep import out to avoid unused import lint
 
 from cache_utils import (
@@ -503,6 +504,11 @@ class BacktestEngine:
             session_df_5m["vwap"] = (
                 session_df_5m["tp_volume"].cumsum() / session_df_5m["Volume"].cumsum()
             )
+            # Time index for fast lookups later
+            if session_df_5m.index.name != "Datetime":
+                session_df_5m = session_df_5m.sort_values("Datetime")
+                session_df_5m = session_df_5m.set_index("Datetime", drop=False)
+            times_5m = session_df_5m.index.values
 
             # Scan only the configured first N minutes of 5-minute data for
             # breakouts. Default remains 90 if not present in CONFIG.
@@ -564,13 +570,53 @@ class BacktestEngine:
                 # No 1m data available for this day, skip
                 continue
 
+            # Ensure time index and cache arrays for fast lookups
+            if session_df_1m.index.name != "Datetime":
+                session_df_1m = session_df_1m.sort_values("Datetime")
+                session_df_1m = session_df_1m.set_index("Datetime", drop=False)
+            times_1m = session_df_1m.index.values
+            close_1m = session_df_1m["Close"].to_numpy(dtype=float, copy=False)
+            volma20_1m = session_df_1m.get(
+                "vol_ma_20", pd.Series(index=session_df_1m.index)
+            ).to_numpy(dtype=float, copy=False)
+            vwap_1m = session_df_1m.get("vwap", pd.Series(index=session_df_1m.index)).to_numpy(
+                dtype=float, copy=False
+            )
+
+            # Helper utilities
+            def _ts64(ts):
+                t = pd.to_datetime(ts)
+                return t.to_datetime64()
+
+            def first_index_after(times, ts):
+                return int(times.searchsorted(_ts64(ts), side="right"))
+
+            def lookup_col_at(df, ts, col, times, arr):
+                try:
+                    val = df.loc[ts, col]
+                    if isinstance(val, pd.Series):
+                        val = val.iloc[0]
+                    return float(val)
+                except Exception:
+                    try:
+                        pos = times.searchsorted(_ts64(ts))
+                        if 0 <= pos < len(times) and times[pos] == _ts64(ts):
+                            return float(arr[pos])
+                    except Exception:
+                        pass
+                return None
+
             if self.pipeline_level == 0:
                 # Level 0: Base pipeline - Delegate Stage 1-3 detection to shared pipeline
                 # (Ignition detection disabled at Level 0)
                 # Level 0 now uses level0_retest_filter for retest detection (body at/beyond OR)
+                df5_for_pipeline = scan_df_5m.copy()
+                df5_for_pipeline.index.name = None
+                df1_for_pipeline = session_df_1m.copy()
+                df1_for_pipeline.index.name = None
                 candidates = run_pipeline(
-                    session_df_5m=scan_df_5m,
-                    session_df_1m=session_df_1m,
+                    session_df_5m=df5_for_pipeline,
+                    session_df_1m=df1_for_pipeline,
                     breakout_window_minutes=market_open_minutes,
                     retest_lookahead_minutes=30,
                     pipeline_level=0,
@@ -584,8 +630,12 @@ class BacktestEngine:
                     try:
                         bt = pd.to_datetime(c.get("breakout_time"))
                         vwap5_val = (
-                            float(
-                                session_df_5m.loc[session_df_5m["Datetime"] == bt, "vwap"].iloc[0]
+                            lookup_col_at(
+                                session_df_5m,
+                                bt,
+                                "vwap",
+                                times_5m,
+                                session_df_5m["vwap"].to_numpy(),
                             )
                             if not session_df_5m.empty
                             else None
@@ -597,9 +647,7 @@ class BacktestEngine:
                     try:
                         rt = pd.to_datetime(c.get("retest_time"))
                         vwap1_val = (
-                            float(
-                                session_df_1m.loc[session_df_1m["Datetime"] == rt, "vwap"].iloc[0]
-                            )
+                            lookup_col_at(session_df_1m, rt, "vwap", times_1m, vwap_1m)
                             if not session_df_1m.empty
                             else None
                         )
@@ -678,9 +726,13 @@ class BacktestEngine:
             or_info = detect_opening_range(session_df_5m)
             or_range = float(or_info.get("high", 0.0)) - float(or_info.get("low", 0.0))
 
+            df5_for_pipeline = scan_df_5m.copy()
+            df5_for_pipeline.index.name = None
+            df1_for_pipeline = session_df_1m.copy()
+            df1_for_pipeline.index.name = None
             pipeline_candidates = run_pipeline(
-                session_df_5m=scan_df_5m,
-                session_df_1m=session_df_1m,
+                session_df_5m=df5_for_pipeline,
+                session_df_1m=df1_for_pipeline,
                 breakout_window_minutes=market_open_minutes,
                 retest_lookahead_minutes=30,
                 pipeline_level=self.pipeline_level,
@@ -699,20 +751,24 @@ class BacktestEngine:
                 # Attach VWAP snapshots to the OHLC dicts for trend grading
                 try:
                     if hasattr(breakout_candle, "__setitem__") and not session_df_5m.empty:
-                        vwap5_val = float(
-                            session_df_5m.loc[
-                                session_df_5m["Datetime"] == breakout_time, "vwap"
-                            ].iloc[0]
+                        vwap5_val = lookup_col_at(
+                            session_df_5m,
+                            breakout_time,
+                            "vwap",
+                            times_5m,
+                            session_df_5m["vwap"].to_numpy(),
                         )
                         breakout_candle["vwap"] = vwap5_val
                 except Exception:
                     pass
                 try:
                     if hasattr(retest_candle, "__setitem__") and not session_df_1m.empty:
-                        vwap1_val = float(
-                            session_df_1m.loc[
-                                session_df_1m["Datetime"] == retest_time, "vwap"
-                            ].iloc[0]
+                        vwap1_val = lookup_col_at(
+                            session_df_1m,
+                            retest_time,
+                            "vwap",
+                            times_1m,
+                            vwap_1m,
                         )
                         retest_candle["vwap"] = vwap1_val
                 except Exception:
@@ -733,25 +789,24 @@ class BacktestEngine:
                         "aplus",
                     }:
                         retest_close = float(retest_candle.get("Close", 0.0))
-                        after_retest = session_df_1m[session_df_1m["Datetime"] > retest_time]
-                        ignition_idx = None
                         breakout_up = direction == "long"
-                        for idx, row in after_retest.iterrows():
-                            close = float(row.get("Close", 0.0))
-                            if (breakout_up and close > retest_close) or (
-                                not breakout_up and close < retest_close
-                            ):
-                                ignition_idx = idx
-                                break
+                        start_idx = first_index_after(times_1m, retest_time)
+                        slice_closes = close_1m[start_idx:]
+                        cond = (
+                            slice_closes > retest_close
+                            if breakout_up
+                            else slice_closes < retest_close
+                        )
+                        ignition_idx = None
+                        if cond.size and cond.any():
+                            ignition_idx = int(start_idx + int(np.argmax(cond)))
                         if ignition_idx is None:
-                            # No confirmation -> skip (parity with Level 1)
                             continue
-                        ignition_time = after_retest.loc[ignition_idx, "Datetime"]
-                        ignition_bar = after_retest.loc[ignition_idx]
-                        next_bars = session_df_1m[session_df_1m["Datetime"] > ignition_time]
-                        if next_bars.empty:
+                        ignition_time = session_df_1m.iloc[ignition_idx]["Datetime"]
+                        ignition_bar = session_df_1m.iloc[ignition_idx]
+                        if ignition_idx + 1 >= len(session_df_1m):
                             continue
-                        entry_bar = next_bars.iloc[0]
+                        entry_bar = session_df_1m.iloc[ignition_idx + 1]
                         entry_time = entry_bar["Datetime"]
                         entry = float(entry_bar.get("Open"))
                     else:
@@ -778,26 +833,22 @@ class BacktestEngine:
                     # Level 1: Wait for first 1m candle after retest that closes above
                     # (long) or below (short) retest close, then enter on open of next candle
                     retest_close = float(retest_candle.get("Close", 0.0))
-                    after_retest = session_df_1m[session_df_1m["Datetime"] > retest_time]
                     ignition_idx = None
                     breakout_up = direction == "long"
-                    for idx, row in after_retest.iterrows():
-                        close = float(row.get("Close", 0.0))
-                        if (breakout_up and close > retest_close) or (
-                            not breakout_up and close < retest_close
-                        ):
-                            ignition_idx = idx
-                            break
+                    start_idx = first_index_after(times_1m, retest_time)
+                    slice_closes = close_1m[start_idx:]
+                    cond = (
+                        slice_closes > retest_close if breakout_up else slice_closes < retest_close
+                    )
+                    if cond.size and cond.any():
+                        ignition_idx = int(start_idx + int(np.argmax(cond)))
                     if ignition_idx is None:
                         continue  # No ignition found, skip
-                    # Get the next bar after ignition for entry
-                    ignition_time = after_retest.loc[ignition_idx, "Datetime"]
-                    # Capture ignition bar for Level 1 as well (unified analytics)
-                    ignition_bar = after_retest.loc[ignition_idx]
-                    next_bars = session_df_1m[session_df_1m["Datetime"] > ignition_time]
-                    if next_bars.empty:
+                    ignition_time = session_df_1m.iloc[ignition_idx]["Datetime"]
+                    ignition_bar = session_df_1m.iloc[ignition_idx]
+                    if ignition_idx + 1 >= len(session_df_1m):
                         continue
-                    entry_bar = next_bars.iloc[0]
+                    entry_bar = session_df_1m.iloc[ignition_idx + 1]
                     entry_time = entry_bar["Datetime"]
                     entry = float(entry_bar.get("Open"))
 
@@ -866,12 +917,12 @@ class BacktestEngine:
                     breakout_vol_ratio = 0.0
                 # Retest volume ratio vs 1m vol_ma_20
                 try:
-                    retest_ma = float(
-                        session_df_1m.loc[
-                            session_df_1m["Datetime"] == retest_time, "vol_ma_20"
-                        ].iloc[0]
+                    retest_ma = lookup_col_at(
+                        session_df_1m, retest_time, "vol_ma_20", times_1m, volma20_1m
                     )
-                    retest_vol_ratio = float(retest_candle["Volume"]) / max(retest_ma, 1e-9)
+                    retest_vol_ratio = float(retest_candle["Volume"]) / max(
+                        float(retest_ma or 0.0), 1e-9
+                    )
                 except Exception:
                     retest_ma = None
                     retest_vol_ratio = 0.0
@@ -939,17 +990,17 @@ class BacktestEngine:
                         ignition_body_pct = abs(ign_close - ign_open) / ign_range
                         # 1m ignition volume ratio vs vol_ma_20 at ignition time
                         try:
-                            ign_ma = float(
-                                session_df_1m.loc[
-                                    session_df_1m["Datetime"]
-                                    == (ign_source.get("Datetime") or ignition_time),
-                                    "vol_ma_20",
-                                ].iloc[0]
+                            ign_ma = lookup_col_at(
+                                session_df_1m,
+                                ign_source.get("Datetime") or ignition_time,
+                                "vol_ma_20",
+                                times_1m,
+                                volma20_1m,
                             )
                         except Exception:
                             ign_ma = None
                         ignition_vol_ratio = (
-                            float(ign_vol) / ign_ma if ign_ma and ign_ma > 0 else 0.0
+                            float(ign_vol) / float(ign_ma) if ign_ma and float(ign_ma) > 0 else 0.0
                         )
                         # Distance to target measured at ignition close vs target progression
                         if direction == "long":
