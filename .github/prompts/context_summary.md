@@ -1,5 +1,116 @@
 # Break & Retest Strategy - Context Summary
 
+## Latest Session Consolidated Summary (Up to Nov 11, 2025)
+
+### High-Level Timeline
+1. Refactored configuration & overrides (initial_capital, leverage, min_rr_ratio, removal of positional sizing CLI)
+2. Migrated risk model from notional sizing (`position_size_pct`) to dollar risk (`risk_pct_per_trade`)
+3. Centralized trade planning logic (`trade_planner.py`) + accompanying unit tests
+4. Corrected R/R sourcing (use signal rr_ratio or min_rr_ratio; stop recomputing from target math)
+5. Introduced forced session-close exits for trades still open at session end (outcome=`forced`, summary counts)
+6. Enhanced breakout grading: detailed pattern + volume scoring (`score_breakout_details`) and component exposure
+7. Added Level 2 gating utility (`gating_utils.py`) with component minima & test coverage
+8. Improved 1m data handling (session warming, 20-bar vol MA, VWAP, ignition/retest volume ratios vs vol_ma_20)
+9. Implemented LRU in `DataCache` to reduce disk churn
+10. Added analytics & mining scripts for breakout/gating differential and winner pattern mining
+11. Documentation updates: migration notes, strategy implementation sizing section, removal of legacy fields
+12. Table formatting & runtime reporting improvements (grade appended, forced closes displayed)
+
+### Key Changes & Rationale
+- **Risk Model Migration**: Dollar risk sizing ensures stop loss ≈ configured risk; prevents notional leverage from silently amplifying loss exposure.
+- **Centralized Planning (`plan_trade`)**: Single source for shares, stop, target, and risk metrics; eliminates drift between backtest paths and future live implementations.
+- **Accurate R/R Sourcing**: Maintains integrity of signal-defined reward expectations and aligns realized P&L multiples with planned risk.
+- **Forced Session-Close Exit**: Converts previously skipped stale trades into deterministic exits; improves statistical clarity and identifies anomalies (forced_closes metric).
+- **Breakout Scoring Granularity**: Pattern & volume components now surfaced for downstream analysis and gating calibration; supports targeted filtering beyond aggregate points.
+- **Level 2 Gating Utility**: Encapsulates threshold logic + optional component minima; testable in isolation to avoid regression risk inside backtest loop.
+- **Performance Enhancements**: Session-warmed 1m data + LRU caching reduce redundant file reads and enable consistent vol/vwap calculations without per-trade window loads.
+- **Volume Metrics Shift**: Both breakout (5m) and ignition/retest (1m) ratios computed versus 20-bar moving averages for more stable normalization.
+- **Effective vs Planned Risk Reporting**: Trade dict now includes `risk_amount` (effective) and `risk_amount_planned` to audit leverage caps and rounding impacts.
+
+### New / Modified Files
+- `trade_planner.py`: Dataclass & planner function for trade construction.
+- `test_trade_planner.py`: Unit tests (explicit stop, inferred stop, short, error cases).
+- `gating_utils.py`: Applies Level 2 thresholds + component minima.
+- `test_component_mins_gating.py`: Verifies gating behavior with and without component minima.
+- `grading/breakout_grader.py`: Refactored to expose `score_breakout_details` plus total points wrapper.
+- `backtest.py`: Extensive refactor (risk model, planner integration, forced closes, warmed 1m sessions, volume MA, LRU caching, runtime grade reporting).
+- Analysis scripts: `analysis/compare_breakout_filter_diff.py`, `analysis/miner_level1_winner_patterns.py`, plus generated mining reports (`level1_jan_may_mining.md`, `level1_mining_report.md`).
+- Config & docs: `config.json` additions (`risk_pct_per_trade`, `default_grade`), README migration notes, expanded section 5 in `STRATEGY_IMPLEMENTATION.md`.
+
+### Behavioral Adjustments
+- Trades now closed forcibly at last session bar if neither stop nor target reached; outcome flagged and aggregated.
+- Shares derived strictly from dollar risk / stop distance, capped by buying power & leverage.
+- Entry timestamps normalized to UTC-awareness; consistent timezone conversions for session slicing.
+- Volume ratios pivoted to MA-based comparisons (5m vol_ma_20 & 1m vol_ma_20) to reduce early-session skew.
+
+### Analytics & Research Tooling
+- Breakout filter differential script recalculates realistic pattern/volume points for filtered signals to attribute gating causes.
+- Winner pattern miner performs grid search across component thresholds, time windows, and expected win dollar filters to surface profitable parameter sets.
+
+### Documentation Enhancements
+- Migration Notes clarify deprecation of `position_size_pct` & adoption of risk-based planning.
+- Strategy Implementation section now documents sizing formula, centralized planner rationale, edge-case handling, and recomputation after tick rounding.
+- README updated for new runtime overrides (`--config-override risk_pct_per_trade=...`) and removal of direct positional sizing flag.
+
+### Testing & Quality Gates
+- Added planner & gating unit tests increasing coverage of new logic paths.
+- Pre-commit hooks run lint (ruff), formatting, and unit tests; commit passed after end-of-file fixer adjustments.
+- Pending targeted tests: forced session-close exit path validation (scenario with price staying between stop/target).
+
+### Pending / Suggested Next Steps
+1. Add dedicated test cases for forced close outcome and statistics reporting.
+2. Export forced close metrics into JSON & Markdown summaries for reproducible analytics beyond console.
+3. Implement dynamic RR uplift per grade level (Prompt 5: varying R/R by grade tiers A/A+/B) — not yet integrated.
+4. Reserve candle pattern gating for higher grades (Prompt request to limit certain patterns to A & A+) — requires grader rule adjustments.
+5. Relocate weekend cache miss logging from `backtest.py` to `stockdata_retriever.py` per Prompt 4.
+6. Introduce configuration flags for enabling/disabling forced close behavior (optional experimentation).
+7. Add test ensuring trend/context logic still awards points when sub-filters disabled (regression guard from earlier sessions).
+8. Surface component minima configuration in README & GRADING_USAGE for transparency.
+
+### Impact Summary
+- Risk consistency: P&L outcomes now map cleanly to R multiples.
+- Data integrity: Forced closure prevents silent data loss of open trades.
+- Extensibility: Planner & gating utilities modularize core logic for future live mode or optimization layers.
+- Observability: Detailed breakout component metrics & analytics scripts facilitate data-driven threshold tuning.
+
+---
+The above consolidates the evolution from initial risk & grading adjustments through planner centralization, gating refinement, and forced trade lifecycle completion.
+
+## Session: Backtest loop performance Tier 1.1 (Nov 11, 2025)
+
+### Objective
+- Improve backtest runtime by removing repeated per-signal DataFrame filtering and inner-row loops in `backtest.py` (Tier 1.1 from the perf plan). Maintain exact result parity.
+
+### Changes implemented
+- Time-index 5m/1m session DataFrames on `Datetime` and cache NumPy arrays for hot columns (1m: close, vol_ma_20, vwap; 5m: times array).
+- Add fast helpers:
+  - `first_index_after(times, ts)` using searchsorted to find the first bar after a timestamp.
+  - `lookup_col_at(df, ts, col, times, arr)` to get exact-time values without boolean scans.
+- Replace repeated equality scans with indexed/array lookups:
+  - VWAP at breakout (5m) and retest (1m) via `lookup_col_at`.
+  - vol_ma_20 at retest and ignition via `lookup_col_at`.
+- Vectorize ignition detection (Stage 4 trigger search) using array slices + `argmax` instead of iterating 1m rows.
+- Fix pipeline input ambiguity where `Datetime` was both index and column by passing copies with cleared index name to `run_pipeline`.
+
+### Results (AAPL, 2025-01-01 → 2025-03-31, Level 1)
+- Baseline: 32.05s; 585 trades; winners 237; win rate 40.5%; P&L $3019.98
+- After Tier 1.1: 22.57s; 585 trades; winners 237; win rate 40.5%; P&L $3019.98
+- Speedup: ~29.5% faster with identical outcomes.
+
+### Quality gates
+- Lint (ruff): PASS
+- Unit tests: PASS (156 passed, 3 skipped)
+- Pre-commit: PASS (format + lint + tests)
+
+### Git
+- Branch: `feature/backtestv2`
+- Commit: backtest: vectorize ignition and replace repeated equality scans with indexed lookups
+
+### Next steps
+1. Tier 1.2: Vectorize trade exit simulation over 1m arrays to reduce inner loops further.
+2. Hoist any remaining per-candidate calculations out of loops (precompute arrays once per session).
+3. Optional: add micro-benchmark harness to track day/symbol-level runtime deltas in CI.
+
 ## Session: Trend grader fix and A+/A gating restored (Nov 10, 2025)
 
 ### What we tackled
