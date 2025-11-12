@@ -175,16 +175,16 @@ def test_data_cache_save_and_load(temp_cache_dir, sample_ohlcv_data_5m):
 
 
 def test_backtest_engine_initialization():
-    """Test BacktestEngine initialization"""
-    engine = BacktestEngine(initial_capital=10000, position_size_pct=0.1)
+    """Test BacktestEngine initialization with new risk_pct_per_trade parameter"""
+    engine = BacktestEngine(initial_capital=10000, risk_pct_per_trade=0.01)
     assert engine.initial_capital == 10000
-    assert engine.position_size_pct == 0.1
+    assert abs(engine.risk_pct_per_trade - 0.01) < 1e-9
     assert engine.cash == 10000
 
 
 def test_backtest_with_signals(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
     """Test backtest execution with valid signals using multi-timeframe data"""
-    engine = BacktestEngine(initial_capital=10000, position_size_pct=0.1)
+    engine = BacktestEngine(initial_capital=10000, risk_pct_per_trade=0.01)
 
     result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
 
@@ -258,7 +258,7 @@ def test_cache_directory_organization(temp_cache_dir):
 def test_multitimeframe_breakout_detection(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
     """Test that breakout is detected on 5m and retest on 1m at Level 0 (base pipeline)"""
     # Level 0: Base pipeline (Stages 1-3 only, no ignition)
-    engine = BacktestEngine(initial_capital=10000, position_size_pct=0.1, pipeline_level=0)
+    engine = BacktestEngine(initial_capital=10000, risk_pct_per_trade=0.01, pipeline_level=0)
 
     # Run backtest
     result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
@@ -285,7 +285,7 @@ def test_multitimeframe_breakout_detection(sample_ohlcv_data_5m, sample_ohlcv_da
 
 def test_level_1_grading_analytics(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
     """Test that Level 1 applies grading (for analytics) without any quality filtering."""
-    engine = BacktestEngine(initial_capital=7500, position_size_pct=0.01, pipeline_level=1)
+    engine = BacktestEngine(initial_capital=7500, risk_pct_per_trade=0.01, pipeline_level=1)
 
     result = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
 
@@ -309,7 +309,7 @@ def test_level_1_grading_analytics(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
 
 
 def test_level_1_position_sizing_risk_based(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
-    """Test that Level 1 uses 0.5% risk-based position sizing"""
+    """Test that Level 1 uses 0.5% risk-based position sizing (default)"""
     initial_capital = 7500
     engine = BacktestEngine(initial_capital=initial_capital, pipeline_level=1)
 
@@ -367,21 +367,7 @@ def test_level_2_profile_shell_pass_through(sample_ohlcv_data_5m, sample_ohlcv_d
         assert sr.get("retest", {}).get("pass") is True
         assert sr.get("ignition", {}).get("pass") is True
 
-
-def test_level_2_retest_aplus_analytics_present(sample_ohlcv_data_5m, sample_ohlcv_data_1m):
-    """Verify A+ retest evaluation is present for analytics but never gates filtering.
-
-    Legacy FEATURE_GRADE_APLUS_FILTERING_ENABLE flag removed; ensure signals include
-    retest_aplus field and that both True/False values are allowed (no enforcement).
-    """
-    engine = BacktestEngine(initial_capital=7500, pipeline_level=2)
-    res = engine.run_backtest("TEST", sample_ohlcv_data_5m, sample_ohlcv_data_1m)
-
-    for sig in res.get("signals", []):
-        assert "retest_aplus" in sig
-        assert "retest_aplus_reason" in sig
-    # Filtering never applied; count after shell pass‑through equals pre-filter (debug prints show this)
-    # Cannot assert variety with synthetic data, but absence of gating verified by presence of all signals.
+    # Removed: A+ retest analytics were deprecated; rely on core retest grading and points only.
 
 
 def test_level_0_vs_level_1_differences(sample_ohlcv_data_5m, sample_ohlcv_data_1m):

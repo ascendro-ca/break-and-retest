@@ -88,16 +88,51 @@ Grades (mirror for short):
 Helper:
 - is_volume_surge(ign, ret, avg) := ign ≥ max(1.5×ret, 1.3×avg)
 
-## 5) Entry, stop, and targets
+## 5) Entry, stop, targets, and sizing
 
-- Entry (configurable):
-  - Default: on ignition break of the retest extreme intrabar; fallback to ignition close if not broken
-  - Aggressive option: on retest close if grade == A
-- Stop:
-  - Long: stop = retest_low − 0.05
-  - Short: stop = retest_high + 0.05
-- Target:
-  - target = entry ± 2 × (entry − stop)  # 2:1 R/R by default
+### Entry Logic
+- Default: intrabar break of the retest extreme on the ignition candle; fallback to ignition close if not broken.
+- Aggressive (future option): retest close if retest grade == A.
+
+### Stop Placement
+- Long: `stop = retest_low − 0.05`
+- Short: `stop = retest_high + 0.05`
+- Stop buffer (0.05) is constant for now; could be made ATR-relative later.
+
+### Target Calculation
+- `risk = abs(entry − stop)`
+- `target = entry ± rr_ratio * risk` where `rr_ratio` (a.k.a. `min_rr_ratio`) defaults to 2.0.
+- Tick rounding occurs after raw prices are computed.
+
+### Centralized Trade Planning (`trade_planner.py`)
+Sizing and price derivation are delegated to `plan_trade` to keep math consistent between backtest and (future) live components.
+
+Core sizing formula:
+```
+risk_per_trade = initial_capital * risk_pct_per_trade
+stop_dist = abs(entry - stop)
+shares_risk = floor(risk_per_trade / stop_dist)
+max_shares_bp = floor((initial_capital * leverage) / entry)
+shares = min(shares_risk, max_shares_bp)
+```
+Then:
+```
+target = entry ± rr_ratio * stop_dist
+max_loss = shares * stop_dist          # ≈ configured dollar risk (may be lower if buying power caps)
+max_win  = shares * rr_ratio * stop_dist
+```
+
+Reasons for centralization:
+- Eliminates drift between different code paths.
+- Facilitates auditing (planned vs effective risk tracked).
+- Simplifies experimentation with dynamic leverage, partial exits, or adaptive buffers.
+
+Edge cases handled:
+- Zero or negative stop distance → reject trade.
+- Buying power insufficient for at least 1 share at configured risk → skip trade.
+- If no stop provided (not typical here) and feature enabled, stop distance is inferred (`risk_per_trade / max_shares_bp`).
+
+All rounding to tick size happens last; distances are recomputed post-round to keep R calculations internally consistent.
 
 ## 6) VWAP alignment and breakout volume filters
 

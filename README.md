@@ -240,7 +240,7 @@ python backtest.py \
   --symbols AAPL MSFT NVDA AMZN \
   --start 2025-01-01 --end 2025-12-31 \
   --initial-capital 50000 \
-  --position-size 0.05 \
+  --config-override risk_pct_per_trade=0.01 \
   --level 2 \
   --output backtest_results/q1_2025_level2.json
 ```
@@ -249,7 +249,8 @@ python backtest.py \
 - `--symbols`: Space-separated ticker symbols
 - `--start` / `--end`: Date range (YYYY-MM-DD)
 - `--initial-capital`: Starting capital (default: 7500)
-- `--position-size`: Position size as % of capital (default: 0.1 = 10%)
+- Risk per trade (default via config): `risk_pct_per_trade` (fraction of capital; e.g., 0.005 = 0.5%).
+  - Override at runtime using `--config-override risk_pct_per_trade=VALUE`.
 - `--leverage`: Max notional leverage (default: 1.0 = no leverage)
 - `--level`: Pipeline level (0=candidates, 1=all trades, 2+=quality filtering)
 - `--output`: Save results to JSON file
@@ -428,7 +429,7 @@ pytest --cov=. --cov-report=html
 - **`test_functional.py`** — End-to-end functional tests
 
 ### Configuration
-- **`config.json`** — Default settings (capital, position size, tickers, etc.)
+- **`config.json`** — Default settings (capital, risk_pct_per_trade, leverage, tickers, etc.)
 - **`requirements.txt`** — Python dependencies
 - **`pytest.ini`** — Test configuration
 - **`Makefile`** — Common commands (test, clean, etc.)
@@ -436,6 +437,43 @@ pytest --cov=. --cov-report=html
 ## Technical Notes
 ```
 
+
+### Migration Notes
+
+#### Removal of `position_size_pct`
+Earlier versions sized positions using a `position_size_pct` argument (percent of capital converted directly to notional). This has been removed in favor of explicit dollar risk via `risk_pct_per_trade`.
+
+Why the change:
+- Risk uniformity: sizing by dollar risk (shares = floor(risk_dollars / stop_dist)) guarantees a loss ≈ configured risk when the stop is hit.
+- Leverage clarity: leverage now only caps maximum notional; it does not silently amplify risk.
+- Reporting alignment: displayed Risk now matches effective deployed risk; planned vs effective risk are tracked separately (`risk_amount_planned`, `risk_amount`).
+
+How to migrate:
+1. Remove any CLI uses of `--position-size` (no longer accepted).
+2. Add `risk_pct_per_trade` to `config.json` (already present in the default template) — e.g. 0.005 for 0.5%.
+3. Override at runtime (if needed) with: `--config-override risk_pct_per_trade=0.0075`.
+4. Ensure stops are defined (strategy auto-derives them from retest pattern + buffer). Shares are computed from stop distance.
+
+Backtests or scripts referencing `position_size_pct` should be updated to remove that field and rely solely on `risk_pct_per_trade`.
+
+#### Centralized Trade Planning (`trade_planner.py`)
+Trade entry, stop, target, and shares sizing are now centralized in `trade_planner.plan_trade` to avoid duplicated math across the backtest and any future live components.
+
+Core algorithm:
+```
+risk_per_trade = initial_capital * risk_pct_per_trade
+stop_dist = |entry - stop|
+shares_risk = floor(risk_per_trade / stop_dist)
+max_shares_bp = floor((initial_capital * leverage) / entry)
+shares = min(shares_risk, max_shares_bp)
+target = entry ± rr_ratio * stop_dist
+```
+If no explicit stop is provided (not typical in this strategy), the planner can infer a stop distance by fully deploying buying power to satisfy the dollar risk budget.
+
+Benefits:
+- Single source of truth for R/R math and tick rounding.
+- Ensures reported Risk (effective) matches potential P&L multiples (loss ≈ -Risk, win ≈ rr_ratio * Risk).
+- Simplifies future enhancements (partial scaling, dynamic tick sizes) without touching the backtest core.
 
 ### Data Provider
 - Uses Stockdata.org API for intraday minute-level data

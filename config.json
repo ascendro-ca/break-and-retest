@@ -20,18 +20,12 @@
   "display_timezone": "PST",
   "backtest_results_dir": "backtest_results",
   "min_rr_ratio": 2.0,
+  "risk_pct_per_trade": 0.01,
+  "default_grade": "c",
 
   "feature_cache_check_integrity": false,
   "feature_breakout_grader_enable": true,
   "feature_retest_grader_enable": true,
   "feature_ignition_grader_enable": true,
-  "feature_trend_grader_enable": true,
-  "profile_overrides": {
-    "c": {
-      "breakout": {
-        "min_body_pct": 0.0,
-        "min_volume_ratio": 0.0
-      }
-    }
-  }
+  "feature_trend_grader_enable": true
 }

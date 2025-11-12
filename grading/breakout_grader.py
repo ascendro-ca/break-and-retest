@@ -76,22 +76,21 @@ def grade_breakout(candle: Dict[str, float], vol_ratio: float, profile: Dict) ->
     return True, "ok"
 
 
-def score_breakout(
+def score_breakout_details(
     candle: Dict[str, float],
     vol_ratio: float,
     profile: Dict,
     direction: Optional[str] = None,
-) -> int:
-    """Return breakout points (0–30) using pattern + volume scoring.
+) -> Dict[str, object]:
+    """Return detailed breakout scoring components and total.
 
-    Parameters
-    ----------
-    candle : dict
-        Breakout 5m candle (expects Open/High/Low/Close/Volume)
-    vol_ratio : float
-        Breakout volume divided by rolling 5m average volume (10-bar MA upstream)
-    profile : dict
-        Unused currently (profiles are shells) but preserved for future threshold tuning.
+    Returns a dict including:
+      - total: int (0–30)
+      - pattern_pts: int (0–20)
+      - volume_pts: int (0–10)
+      - ctype: str (classified candle type)
+      - body_pct, upper_wick_pct, lower_wick_pct: floats
+      - candle_dir: str (bullish/bearish/neutral)
     """
     # Validate OHLC first
     try:
@@ -100,14 +99,41 @@ def score_breakout(
         lo = float(candle.get("Low"))
         c = float(candle.get("Close"))
     except Exception:
-        return 0
+        return {
+            "total": 0,
+            "pattern_pts": 0,
+            "volume_pts": 0,
+            "ctype": "invalid",
+            "body_pct": 0.0,
+            "upper_wick_pct": 0.0,
+            "lower_wick_pct": 0.0,
+            "candle_dir": "neutral",
+        }
 
     # Feature flag: if breakout grader disabled, return max points immediately
     if not CONFIG.get("feature_breakout_grader_enable", True):
-        return 30
+        return {
+            "total": 30,
+            "pattern_pts": 20,
+            "volume_pts": 10,
+            "ctype": "disabled",
+            "body_pct": 0.0,
+            "upper_wick_pct": 0.0,
+            "lower_wick_pct": 0.0,
+            "candle_dir": "neutral",
+        }
     rng = h - lo
     if rng <= 0:
-        return 0
+        return {
+            "total": 0,
+            "pattern_pts": 0,
+            "volume_pts": 0,
+            "ctype": "zero_range",
+            "body_pct": 0.0,
+            "upper_wick_pct": 0.0,
+            "lower_wick_pct": 0.0,
+            "candle_dir": "neutral",
+        }
 
     # Build a pandas Series for classifier (expects Series-like)
     ser = pd.Series({"Open": o, "High": h, "Low": lo, "Close": c})
@@ -202,4 +228,27 @@ def score_breakout(
         total = 0
     if total > 30:
         total = 30
-    return int(round(total))
+    return {
+        "total": int(round(total)),
+        "pattern_pts": int(pattern_pts),
+        "volume_pts": int(volume_pts),
+        "ctype": ctype,
+        "body_pct": float(body_pct),
+        "upper_wick_pct": float(upper_wick_pct),
+        "lower_wick_pct": float(lower_wick_pct),
+        "candle_dir": candle_dir,
+    }
+
+
+def score_breakout(
+    candle: Dict[str, float],
+    vol_ratio: float,
+    profile: Dict,
+    direction: Optional[str] = None,
+) -> int:
+    """Return breakout points (0–30) using pattern + volume scoring."""
+    details = score_breakout_details(candle, vol_ratio, profile, direction)
+    try:
+        return int(details.get("total", 0))
+    except Exception:
+        return 0

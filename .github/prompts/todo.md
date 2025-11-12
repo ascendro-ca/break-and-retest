@@ -44,7 +44,7 @@
 8. (REMOVED) **Grade specific filter toggling**
    - Deprecated. Grade-based filtering flags were removed; Level 2 uses name-only profiles for analytics only.
 
-9. **Backtest info loggin cleanup**
+9. (DONE) **Backtest info loggin cleanup**
    - With level 2 pipeline only log trades to console when console-only
      option enabled
 

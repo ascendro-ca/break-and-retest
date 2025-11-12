@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 import re
+import time  # Added for runtime measurement
+from collections import OrderedDict
 
 import pandas as pd
 # Note: yfinance provider removed; keep import out to avoid unused import lint
@@ -32,7 +34,7 @@ from grading.profile_loader import load_profile
 from grading.breakout_grader import grade_breakout as profile_grade_breakout
 from grading.retest_grader import grade_retest as profile_grade_retest
 from grading.ignition_grader import grade_ignition as profile_grade_ignition
-from grading.breakout_grader import score_breakout
+from grading.breakout_grader import score_breakout_details
 from grading.retest_grader import score_retest
 from grading.ignition_grader import score_ignition
 from grading.trend_grader import score_trend
@@ -41,7 +43,7 @@ from grading.trend_grader import score_trend
 from time_utils import get_display_timezone, get_timezone_label_for_date
 from trade_setup_pipeline import run_pipeline
 from stage_opening_range import detect_opening_range
-from candle_patterns import classify_candle_strength
+
 
 CONFIG = load_config()
 DEFAULT_TICKERS = CONFIG["tickers"]
@@ -56,113 +58,19 @@ RETEST_B_SOFT = CONFIG.get("retest_B_structure_soft", True)
 # Deprecated grade filtering feature flags (feature_grade_[c|b|a|aplus]_filtering_enable) and
 # points thresholds were removed as part of grading simplification. Profiles are now
 # name-only shells; all Level 2 signals pass through without gating. Retest A+ evaluation
-# retained strictly for analytics (non-filtering). Any attempt to access the legacy
-# FEATURE_GRADE_* variables will now raise an AttributeError if relied upon externally.
-
-
-def evaluate_retest_aplus(
-    retest_candle: Dict,
-    *,
-    level: float,
-    direction: str,
-    breakout_time,
-    retest_time,
-    breakout_volume: float,
-    retest_volume: float,
-) -> Dict[str, object]:
-    """Evaluate A+ retest criteria per docs/features/grade_a_plus_criteria.md.
-
-    Returns a dict: { 'passed': bool, 'reason': str }
-    """
-    try:
-        # Basic OHLC extraction
-        high_ = float(retest_candle.get("High"))
-        low_ = float(retest_candle.get("Low"))
-        close_ = float(retest_candle.get("Close"))
-    except Exception:
-        return {"passed": False, "reason": "invalid_retest_candle"}
-
-    rng = max(high_ - low_, 1e-9)
-
-    # 1) Timing: retest occurs within 1–5 minutes after breakout close
-    try:
-        bt = pd.to_datetime(breakout_time)
-        rt = pd.to_datetime(retest_time)
-        if getattr(bt, "tzinfo", None) is None:
-            bt = bt.tz_localize("UTC")
-        if getattr(rt, "tzinfo", None) is None:
-            rt = rt.tz_localize("UTC")
-        delta_min = abs((rt - bt).total_seconds()) / 60.0
-        if not (1.0 <= delta_min <= 5.0):
-            return {"passed": False, "reason": f"timing_outside:{delta_min:.1f}m"}
-    except Exception:
-        # If timestamps are missing, fail safe (spec requires timing)
-        return {"passed": False, "reason": "missing_timestamps"}
-
-    # 2) Interaction with level: tap/slight pierce within <= 15% of 1m range
-    interaction_ok = False
-    if direction == "long":
-        # Must reach near or through level (OR high) but not deep; measure distance
-        dist = max(0.0, level - low_)
-        interaction_ok = (level >= low_ - 1e-9) and (dist <= 0.15 * rng)
-        # Close should be above level (hold)
-        if close_ < level - 1e-9:
-            return {"passed": False, "reason": "close_wrong_side"}
-    else:
-        dist = max(0.0, high_ - level)
-        interaction_ok = (level <= high_ + 1e-9) and (dist <= 0.15 * rng)
-        if close_ > level + 1e-9:
-            return {"passed": False, "reason": "close_wrong_side"}
-
-    if not interaction_ok:
-        return {"passed": False, "reason": "no_clean_tap"}
-
-    # 3) Volume: retest volume light relative to breakout (<= 30%)
-    try:
-        if breakout_volume <= 0:
-            return {"passed": False, "reason": "no_breakout_volume"}
-        vol_ratio = retest_volume / breakout_volume
-        if vol_ratio > 0.30 + 1e-9:
-            return {"passed": False, "reason": f"heavy_retest_vol:{vol_ratio:.2f}"}
-    except Exception:
-        return {"passed": False, "reason": "volume_calc_error"}
-
-    # 4) First touch only: enforced upstream; assume single retest candle provided
-
-    # 5) Candle pattern checks via classifier (TA-Lib-powered features inside classify)
-    cls = classify_candle_strength(pd.Series(retest_candle))
-    ctype = str(cls.get("type", "unknown"))
-    # Accepted bullish for long: hammer, dragonfly_doji, bullish engulfing proxy via type checks,
-    # inside bar/ tight base is less strict, but we'll allow hammer/dragonfly/doji/inside variants.
-    if direction == "long":
-        allowed = {
-            "hammer",
-            "dragonfly_doji",
-            "normal_bullish",
-            "spinning_top_bullish",
-            "doji",
-        }
-    else:
-        allowed = {
-            "shooting_star",
-            "gravestone_doji",
-            "normal_bearish",
-            "spinning_top_bearish",
-            "doji",
-        }
-    if ctype not in allowed:
-        return {"passed": False, "reason": f"pattern:{ctype}"}
-
-    # Passed all checks
-    return {"passed": True, "reason": "ok"}
+# previously retained for analytics has been removed to eliminate duplication; rely on
+# retest grading and points instead.
 
 
 class DataCache:
     """Manages cached OHLCV data organized by symbol and date"""
 
-    def __init__(self, cache_dir: str = "cache"):
+    def __init__(self, cache_dir: str = "cache", max_mem_items: int = 256):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
+        # Simple in-memory LRU to avoid repeated disk reads for the same (symbol, date, interval)
+        self._mem: "OrderedDict[tuple, Optional[pd.DataFrame]]" = OrderedDict()
+        self._mem_max = int(max_mem_items)
 
     def clear_cache(self):
         """Clear all cached data"""
@@ -178,12 +86,28 @@ class DataCache:
         return get_cache_path(self.cache_dir, symbol, date, interval)
 
     def get_cached_data(self, symbol: str, date: str, interval: str) -> Optional[pd.DataFrame]:
-        """Load cached data if available"""
-        return load_cached_day(self.cache_dir, symbol, date, interval)
+        """Load cached data using on-disk cache with an in-memory LRU layer."""
+        key = (symbol, date, interval)
+        if key in self._mem:
+            # Move to end (recently used) and return
+            df = self._mem.pop(key)
+            self._mem[key] = df
+            return df
+        df = load_cached_day(self.cache_dir, symbol, date, interval)
+        # Insert into LRU and evict oldest if needed
+        self._mem[key] = df
+        if len(self._mem) > self._mem_max:
+            self._mem.popitem(last=False)
+        return df
 
     def cache_data(self, symbol: str, date: str, interval: str, df: pd.DataFrame):
         """Save data to cache"""
         save_day(self.cache_dir, symbol, date, interval, df)
+        # Update in-memory cache as well
+        key = (symbol, date, interval)
+        self._mem[key] = df
+        if len(self._mem) > self._mem_max:
+            self._mem.popitem(last=False)
 
     def download_data(
         self,
@@ -192,19 +116,10 @@ class DataCache:
         end_date: str,
         interval: str = "5m",
     ) -> pd.DataFrame:
-        """
-            Load OHLCV data for a symbol and date range from local cache only.
-        This tool no longer downloads from Yahoo Finance; populate cache via
-        the StockData.org fetcher (stockdata_retriever.py) before running.
+        """Load OHLCV data for a symbol and date range from local cache only.
 
-            Args:
-                symbol: Stock ticker symbol
-                start_date: Start date (YYYY-MM-DD)
-                end_date: End date (YYYY-MM-DD)
-                interval: Data interval (1m, 5m, 15m, 1h, 1d)
-
-            Returns:
-                DataFrame with OHLCV data
+        Cache must be pre-populated using the StockData.org retriever (stockdata_retriever.py).
+        No live downloads are performed here.
         """
         all_data = []
 
@@ -293,7 +208,7 @@ class BacktestEngine:
     def __init__(
         self,
         initial_capital: float = 10000,
-        position_size_pct: float = 0.1,
+        risk_pct_per_trade: Optional[float] = None,
         leverage: float = 1.0,
         max_positions: int = 3,
         scan_window_minutes: int = 180,
@@ -312,7 +227,7 @@ class BacktestEngine:
 
         Args:
             initial_capital: Starting capital
-            position_size_pct: Percentage of capital risked per trade (0.1 = 10%)
+            risk_pct_per_trade: Percentage of capital risked per trade (e.g. 0.005 = 0.5%).
             max_positions: Maximum number of concurrent positions
             scan_window_minutes: Rolling window for scanning (default: 180 = 3 hours)
             leverage: Max notional leverage (1.0 = no leverage).
@@ -325,7 +240,22 @@ class BacktestEngine:
             no_trades: If True, only identify candidates without executing trades (Level 1+ only)
         """
         self.initial_capital = initial_capital
-        self.position_size_pct = position_size_pct
+        # Determine effective risk percent per trade
+        provided_val = risk_pct_per_trade if risk_pct_per_trade is not None else 0.005
+
+        # Normalize and clamp input:
+        # - Accept fractional (e.g., 0.005 = 0.5%)
+        # - If user passes a value > 1, interpret as percent (e.g., 2 -> 2% = 0.02)
+        try:
+            _ps = float(provided_val)
+        except Exception:
+            _ps = 0.005
+        if _ps > 1.0:
+            _ps = _ps / 100.0
+        # Clamp to [0, 1]
+        _ps = max(0.0, min(_ps, 1.0))
+        # Canonical attribute
+        self.risk_pct_per_trade = _ps
         self.leverage = max(0.0, float(leverage))
         self.max_positions = max_positions
         self.scan_window_minutes = scan_window_minutes
@@ -352,59 +282,43 @@ class BacktestEngine:
         self.grade_profile = None
         # Removed points-based continuation grader; use profile ignition metrics only
         self.grader = None
+        # Cache configuration (set during run_backtest). A shared DataCache with in-memory LRU
+        # is created lazily in run_backtest so tests can override cache_dir per invocation.
+        self.cache_dir = "cache"
+        self.data_cache: Optional[DataCache] = None
 
     def _load_1m_window(
         self, symbol: str, center_time: pd.Timestamp, window_minutes: int = 90
     ) -> pd.DataFrame:
+        """Deprecated helper retained for backward compatibility; now delegates to warmed sessions.
+
+        We keep this method to avoid breaking external references, but the performance path
+        reuses the preloaded per‑day session data (with prior-day tail) rather than reloading
+        overlapping windows per trade. If needed (e.g., spanning multiple days), we still fall
+        back to the original multi-day load logic.
         """
-        Load 1-minute data for a window around a specific time (e.g., breakout).
-        Handles market close/open boundaries by loading multiple days if needed.
-
-        Args:
-            symbol: Stock ticker
-            center_time: The center time (e.g., breakout time)
-            window_minutes: Minutes to load before and after center_time
-
-        Returns:
-            DataFrame with 1-minute OHLCV data for the window
-        """
-        cache = DataCache(self.cache_dir)
-
-        # Calculate the date range we need (may span multiple days)
+        cache = self.data_cache or DataCache(self.cache_dir)
         start_time = center_time - timedelta(minutes=window_minutes)
         end_time = center_time + timedelta(minutes=window_minutes)
-
-        # Get unique dates we need to load
         current = start_time.date()
         end_date = end_time.date()
-        dates_needed = []
-
+        dates_needed: List[date] = []
         while current <= end_date:
-            # Skip weekends
             if current.weekday() < 5:
                 dates_needed.append(current)
             current += timedelta(days=1)
-
-        # Load all needed days
-        dfs = []
+        dfs: List[pd.DataFrame] = []
         for current_date in dates_needed:
             date_str = current_date.strftime("%Y-%m-%d")
             cached = cache.get_cached_data(symbol, date_str, "1m")
             if cached is not None and not cached.empty:
                 dfs.append(cached)
-
         if not dfs:
             return pd.DataFrame()
-
-        # Combine and filter to window
         df = pd.concat(dfs, ignore_index=True)
         df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
         df = df.sort_values("Datetime").reset_index(drop=True)
-
-        # Filter to the actual time window
-        df = df[(df["Datetime"] >= start_time) & (df["Datetime"] <= end_time)]
-
-        return df
+        return df[(df["Datetime"] >= start_time) & (df["Datetime"] <= end_time)]
 
     def _scan_continuous_data(
         self, symbol: str, df_5m: pd.DataFrame, cache_dir: str = "cache"
@@ -430,13 +344,85 @@ class BacktestEngine:
         """
         all_signals = []
         self.cache_dir = cache_dir  # Store for _load_1m_window
+        # Ensure a shared DataCache exists (with LRU) for this engine instance
+        if self.data_cache is None:
+            self.data_cache = DataCache(self.cache_dir)
 
-        # Calculate 10-bar volume MA on 5-minute data (for breakout volume ratio)
+        # Ensure 20-bar volume MA on 5-minute data (for breakout volume ratio)
         df_5m = df_5m.copy()
-        df_5m["vol_ma"] = df_5m["Volume"].rolling(window=10, min_periods=1).mean()
+        if "vol_ma_20" not in df_5m.columns:
+            df_5m["Volume"] = pd.to_numeric(df_5m["Volume"], errors="coerce")
+            df_5m["vol_ma_20"] = df_5m["Volume"].rolling(window=20, min_periods=20).mean()
         df_5m["Date"] = df_5m["Datetime"].dt.date
 
         trading_days = df_5m["Date"].unique()
+
+        def _get_or_preload_session_1m(day: date) -> pd.DataFrame:
+            """Load today's 1m session warmed with prior day's tail to compute vol_ma_20."""
+            key = (symbol, day)
+            if hasattr(self, "_session_1m_by_day") and key in self._session_1m_by_day:
+                return self._session_1m_by_day[key]
+            cache_local = self.data_cache or DataCache(self.cache_dir)
+            # Load today's session
+            day_str = day.strftime("%Y-%m-%d")
+            today_df = cache_local.get_cached_data(symbol, day_str, "1m")
+            if today_df is None or today_df.empty:
+                warmed = pd.DataFrame()
+                if hasattr(self, "_session_1m_by_day"):
+                    self._session_1m_by_day[key] = warmed
+                return warmed
+            df1 = today_df.copy()
+            df1["Datetime"] = pd.to_datetime(df1["Datetime"], errors="coerce")
+            if getattr(df1["Datetime"].dt, "tz", None) is None:
+                df1["Datetime"] = df1["Datetime"].dt.tz_localize("UTC")
+            # Restrict to regular session in UTC using ET anchors
+            try:
+                et_tz = ZoneInfo("America/New_York")
+            except Exception:
+                et_tz = None
+            if et_tz is not None and not df1.empty:
+                et_local = df1["Datetime"].dt.tz_convert(et_tz)
+                sess_date_et = et_local.iloc[0].date()
+                open_et = datetime.combine(sess_date_et, datetime.min.time()).replace(
+                    hour=9, minute=30, tzinfo=et_tz
+                )
+                close_et = datetime.combine(sess_date_et, datetime.min.time()).replace(
+                    hour=16, minute=0, tzinfo=et_tz
+                )
+                open_utc = open_et.astimezone(ZoneInfo("UTC"))
+                close_utc = close_et.astimezone(ZoneInfo("UTC"))
+                df1 = df1[(df1["Datetime"] >= open_utc) & (df1["Datetime"] < close_utc)].copy()
+
+            # Previous trading day tail for warm-up
+            prev = day - timedelta(days=1)
+            while prev.weekday() >= 5:
+                prev -= timedelta(days=1)
+            prev_str = prev.strftime("%Y-%m-%d")
+            prev_df = cache_local.get_cached_data(symbol, prev_str, "1m")
+            tail = None
+            if prev_df is not None and not prev_df.empty:
+                prev_df = prev_df.copy()
+                prev_df["Datetime"] = pd.to_datetime(prev_df["Datetime"], errors="coerce")
+                if getattr(prev_df["Datetime"].dt, "tz", None) is None:
+                    prev_df["Datetime"] = prev_df["Datetime"].dt.tz_localize("UTC")
+                tail = prev_df.sort_values("Datetime").tail(30)
+            if tail is not None and not tail.empty:
+                work = pd.concat([tail, df1], ignore_index=True)
+            else:
+                work = df1.copy()
+            # Compute warmed 1m vol_ma_20 and vwap
+            work["Volume"] = pd.to_numeric(work["Volume"], errors="coerce")
+            work["vol_ma_20"] = work["Volume"].rolling(window=20, min_periods=20).mean()
+            work["typical_price"] = (work["High"] + work["Low"] + work["Close"]) / 3
+            work["tp_volume"] = work["typical_price"] * work["Volume"]
+            work["vwap"] = work["tp_volume"].cumsum() / work["Volume"].cumsum()
+            if tail is not None and not tail.empty:
+                work = work.iloc[len(tail) :].copy()
+            work = work.sort_values("Datetime").reset_index(drop=True)
+            if not hasattr(self, "_session_1m_by_day"):
+                self._session_1m_by_day = {}
+            self._session_1m_by_day[key] = work
+            return work
 
         for day in trading_days:
             # Get 5-minute data for this day during regular market hours (09:30-16:00 ET).
@@ -455,19 +441,8 @@ class BacktestEngine:
 
             # Convert timestamps to ET for hour:minute comparisons (DST-safe)
             if et_tz is not None:
-                # Handle tz-naive: tests may pass ET-like naive timestamps.
-                # Localize as America/New_York to preserve 09:30–16:00 session window.
-                dt_series = day_df_5m["Datetime"]
-                try:
-                    if dt_series.dt.tz is None:
-                        # Interpret naive timestamps as America/New_York (market local time)
-                        dt_series = dt_series.dt.tz_localize(et_tz)
-                    else:
-                        dt_series = dt_series.dt.tz_convert(et_tz)
-                except Exception:
-                    # Fallback: leave as-is if any localization error
-                    pass
-                local_et = dt_series
+                # Timestamps are enforced tz-aware UTC; convert directly to ET for session slicing
+                local_et = day_df_5m["Datetime"].dt.tz_convert(et_tz)
                 session_df_5m = day_df_5m[
                     (local_et.dt.strftime("%H:%M") >= sess_start_str)
                     & (local_et.dt.strftime("%H:%M") < sess_end_str)
@@ -503,14 +478,8 @@ class BacktestEngine:
                 first_bar_et = None
                 if et_tz is not None:
                     fb = session_df_5m.iloc[0]["Datetime"]
-                    # If first bar is tz-naive treat it as local ET.
-                    # Tests often supply naive times.
-                    # Localize to America/New_York (not UTC) to avoid a 5h shift.
-                    if getattr(fb, "tzinfo", None) is None:
-                        fb = fb.tz_localize(et_tz)
-                    else:
-                        fb = fb.astimezone(et_tz)
-                    first_bar_et = fb
+                    # Convert to ET (tz-aware)
+                    first_bar_et = fb.astimezone(et_tz)
                 if first_bar_et is not None:
                     if first_bar_et.hour > 10 or (
                         first_bar_et.hour == 10 and first_bar_et.minute > 0
@@ -544,96 +513,41 @@ class BacktestEngine:
             # and still allow the pipeline to define OR from the first bar we pass.
             if et_tz is not None:
                 sess_date_et = first_bar_et.date() if first_bar_et else day
-                # 09:30 ET anchor in UTC
                 expected_open_et = datetime.combine(sess_date_et, datetime.min.time()).replace(
                     hour=9, minute=30, tzinfo=et_tz
                 )
                 expected_open_utc = expected_open_et.astimezone(ZoneInfo("UTC"))
                 end_time = expected_open_utc + timedelta(minutes=market_open_minutes)
-
-                # Ensure session_df_5m Datetime is tz-aware UTC for safe comparison.
-                dt_cmp = session_df_5m["Datetime"]
-                try:
-                    if getattr(dt_cmp.dt, "tz", None) is None:
-                        # Treat naive times as ET (already sliced by ET clock) then convert to UTC
-                        dt_cmp = dt_cmp.dt.tz_localize(et_tz).dt.tz_convert(ZoneInfo("UTC"))
-                    else:
-                        dt_cmp = dt_cmp.dt.tz_convert(ZoneInfo("UTC"))
-                    session_df_5m["Datetime"] = dt_cmp
-                except Exception:
-                    # Fallback: conversion failed; assume naive timestamps are UTC and localize
-                    if getattr(session_df_5m["Datetime"].dt, "tz", None) is None:
-                        session_df_5m["Datetime"] = session_df_5m["Datetime"].dt.tz_localize("UTC")
-
+                # Ensure session_df_5m Datetime is UTC-aware for comparison
+                session_df_5m["Datetime"] = session_df_5m["Datetime"].dt.tz_convert(ZoneInfo("UTC"))
                 scan_df_5m = session_df_5m[
                     (session_df_5m["Datetime"] >= expected_open_utc)
                     & (session_df_5m["Datetime"] < end_time)
                 ].copy()
-            else:
-                start_time = session_df_5m["Datetime"].iloc[0]
-                end_time = start_time + timedelta(minutes=market_open_minutes)
-                scan_df_5m = session_df_5m[
-                    (session_df_5m["Datetime"] >= start_time)
-                    & (session_df_5m["Datetime"] < end_time)
-                ].copy()
-
             if len(scan_df_5m) < 10:
                 continue
 
-            # Prepare 1m data for this day
-            # Prefer inline 1m (tests) else load on-demand from cache
-            session_start = session_df_5m["Datetime"].iloc[0]
+            # Prepare warmed 1m session
             if getattr(self, "_inline_df_1m", None) is not None:
+                # Inline 1m already UTC-aware; slice regular session (09:30-16:00 ET in UTC)
                 df1 = self._inline_df_1m.copy()  # type: ignore[attr-defined]
-                df1["Datetime"] = pd.to_datetime(df1["Datetime"], errors="coerce")
-                # Filter by calendar day and typical session hours
-                session_df_1m = df1[
-                    (df1["Datetime"].dt.date == day)
-                    & (df1["Datetime"].dt.strftime("%H:%M") >= "09:00")
-                    & (df1["Datetime"].dt.strftime("%H:%M") <= "16:00")
-                ].copy()
-            else:
-                # Load 1m data with a window from 30 min before open to end of session
-                session_df_1m = self._load_1m_window(
-                    symbol=symbol,
-                    center_time=session_start + timedelta(minutes=195),  # Mid-session
-                    window_minutes=240,  # Cover full session plus buffer
-                )
-
-            # Normalize 1m to the regular session window [09:30, 16:00) ET so that
-            # Stage 3 (retest) anchors market_open consistently at 09:30 when it
-            # reads session_df_1m.iloc[0]. This avoids early/late pre/post market bars
-            # shifting the 90-minute window.
-            if et_tz is not None and not session_df_1m.empty:
-                # Deterministic tz normalization:
-                # 1) Interpret tz-naive as America/New_York, then convert to UTC
-                # 2) If tz-aware, convert to UTC
-                dt_sr = pd.to_datetime(session_df_1m["Datetime"], errors="coerce")
-                if getattr(dt_sr.dt, "tz", None) is None:
-                    dt_sr_utc = dt_sr.dt.tz_localize(et_tz).dt.tz_convert(ZoneInfo("UTC"))
-                else:
-                    dt_sr_utc = dt_sr.dt.tz_convert(ZoneInfo("UTC"))
-                session_df_1m["Datetime"] = dt_sr_utc
-
-                # Build ET anchors from the same calendar session
-                et_local = dt_sr_utc.dt.tz_convert(et_tz)
-                sess_date_et = et_local.iloc[0].date()
-                expected_open_et = datetime.combine(sess_date_et, datetime.min.time()).replace(
+                et_tz = ZoneInfo("America/New_York")
+                open_et = datetime.combine(day, datetime.min.time()).replace(
                     hour=9, minute=30, tzinfo=et_tz
                 )
-                expected_close_et = datetime.combine(sess_date_et, datetime.min.time()).replace(
+                close_et = datetime.combine(day, datetime.min.time()).replace(
                     hour=16, minute=0, tzinfo=et_tz
                 )
-                open_utc = expected_open_et.astimezone(ZoneInfo("UTC"))
-                close_utc = expected_close_et.astimezone(ZoneInfo("UTC"))
-                session_df_1m = session_df_1m[
-                    (session_df_1m["Datetime"] >= open_utc)
-                    & (session_df_1m["Datetime"] < close_utc)
+                open_utc = open_et.astimezone(ZoneInfo("UTC"))
+                close_utc = close_et.astimezone(ZoneInfo("UTC"))
+                session_df_1m = df1[
+                    (df1["Datetime"] >= open_utc) & (df1["Datetime"] < close_utc)
                 ].copy()
-
-            # Compute 1m VWAP over the session for contextual checks
-            if not session_df_1m.empty:
-                session_df_1m = session_df_1m.copy()
+                session_df_1m = session_df_1m.sort_values("Datetime")
+                session_df_1m["Volume"] = pd.to_numeric(session_df_1m["Volume"], errors="coerce")
+                session_df_1m["vol_ma_20"] = (
+                    session_df_1m["Volume"].rolling(window=20, min_periods=20).mean()
+                )
                 session_df_1m["typical_price"] = (
                     session_df_1m["High"] + session_df_1m["Low"] + session_df_1m["Close"]
                 ) / 3
@@ -643,6 +557,8 @@ class BacktestEngine:
                 session_df_1m["vwap"] = (
                     session_df_1m["tp_volume"].cumsum() / session_df_1m["Volume"].cumsum()
                 )
+            else:
+                session_df_1m = _get_or_preload_session_1m(day)
 
             if session_df_1m.empty or len(session_df_1m) < 50:
                 # No 1m data available for this day, skip
@@ -886,10 +802,19 @@ class BacktestEngine:
                     entry = float(entry_bar.get("Open"))
 
                 # CRITICAL: Only enter trades within the configured first
-                # market_open_minutes window. Market opens at 09:30 ET; the
-                # window ends at 09:30 + market_open_minutes. This enforces
-                # identical temporal logic for all levels using the config.
-                if entry_time >= end_time:
+                # market_open_minutes window. Normalize to UTC-aware for comparison.
+                try:
+                    if getattr(entry_time, "tzinfo", None) is None and et_tz is not None:
+                        entry_time_cmp = entry_time.tz_localize(et_tz).tz_convert(ZoneInfo("UTC"))
+                    elif getattr(entry_time, "tzinfo", None) is not None:
+                        entry_time_cmp = entry_time.tz_convert(ZoneInfo("UTC"))
+                    else:
+                        entry_time_cmp = entry_time
+                    end_time_cmp = end_time
+                except Exception:
+                    entry_time_cmp = entry_time
+                    end_time_cmp = end_time
+                if entry_time_cmp >= end_time_cmp:
                     continue
 
                 breakout_up = direction == "long"
@@ -932,18 +857,23 @@ class BacktestEngine:
                     breakout_vol_ratio = float(breakout_candle["Volume"]) / max(
                         float(
                             session_df_5m.loc[
-                                session_df_5m["Datetime"] == breakout_time, "vol_ma"
+                                session_df_5m["Datetime"] == breakout_time, "vol_ma_20"
                             ].iloc[0]
                         ),
                         1e-9,
                     )
                 except Exception:
                     breakout_vol_ratio = 0.0
+                # Retest volume ratio vs 1m vol_ma_20
                 try:
-                    retest_vol_ratio = float(retest_candle["Volume"]) / max(
-                        float(breakout_candle["Volume"]), 1e-9
+                    retest_ma = float(
+                        session_df_1m.loc[
+                            session_df_1m["Datetime"] == retest_time, "vol_ma_20"
+                        ].iloc[0]
                     )
+                    retest_vol_ratio = float(retest_candle["Volume"]) / max(retest_ma, 1e-9)
                 except Exception:
+                    retest_ma = None
                     retest_vol_ratio = 0.0
 
                 signal = {
@@ -955,7 +885,7 @@ class BacktestEngine:
                     "risk": risk,
                     "level": level,
                     "datetime": entry_time,
-                    # Preserve retest timing for A+ evaluation
+                    # Preserve retest timing for grading
                     "retest_time": retest_time,
                     "breakout_time_5m": breakout_time,
                     "vol_breakout_5m": breakout_candle["Volume"],
@@ -1007,9 +937,19 @@ class BacktestEngine:
                         ign_close = float(ign_source.get("Close"))
                         ign_range = max(ign_high - ign_low, 1e-9)
                         ignition_body_pct = abs(ign_close - ign_open) / ign_range
-                        retest_vol_f = float(retest_candle.get("Volume", 0.0))
+                        # 1m ignition volume ratio vs vol_ma_20 at ignition time
+                        try:
+                            ign_ma = float(
+                                session_df_1m.loc[
+                                    session_df_1m["Datetime"]
+                                    == (ign_source.get("Datetime") or ignition_time),
+                                    "vol_ma_20",
+                                ].iloc[0]
+                            )
+                        except Exception:
+                            ign_ma = None
                         ignition_vol_ratio = (
-                            float(ign_vol) / retest_vol_f if retest_vol_f > 0 else 0.0
+                            float(ign_vol) / ign_ma if ign_ma and ign_ma > 0 else 0.0
                         )
                         # Distance to target measured at ignition close vs target progression
                         if direction == "long":
@@ -1066,8 +1006,49 @@ class BacktestEngine:
         else:
             selected_cache_dir = "cache"
 
+        # Normalize df_5m to UTC tz-aware; interpret tz-naive as ET then convert to UTC
+        try:
+            df_5m = df_5m.copy()
+            df_5m["Datetime"] = pd.to_datetime(df_5m["Datetime"], errors="coerce")
+            if getattr(df_5m["Datetime"].dt, "tz", None) is None:
+                et_tz = ZoneInfo("America/New_York")
+                df_5m["Datetime"] = (
+                    df_5m["Datetime"].dt.tz_localize(et_tz).dt.tz_convert(ZoneInfo("UTC"))
+                )
+            else:
+                df_5m["Datetime"] = df_5m["Datetime"].dt.tz_convert(ZoneInfo("UTC"))
+        except Exception:
+            pass
+
+        # Normalize inline 1m to UTC tz-aware if provided; interpret tz-naive as ET
+        if inline_1m is not None:
+            try:
+                inline_1m = inline_1m.copy()
+                inline_1m["Datetime"] = pd.to_datetime(inline_1m["Datetime"], errors="coerce")
+                if getattr(inline_1m["Datetime"].dt, "tz", None) is None:
+                    et_tz = ZoneInfo("America/New_York")
+                    inline_1m["Datetime"] = (
+                        inline_1m["Datetime"].dt.tz_localize(et_tz).dt.tz_convert(ZoneInfo("UTC"))
+                    )
+                else:
+                    inline_1m["Datetime"] = inline_1m["Datetime"].dt.tz_convert(ZoneInfo("UTC"))
+            except Exception:
+                pass
+
+        # Guards: enforce tz-aware (UTC) after normalization
+        try:
+            if getattr(df_5m["Datetime"].dt, "tz", None) is None:
+                raise ValueError("df_5m.Datetime must be tz-aware (UTC)")
+            if inline_1m is not None and getattr(inline_1m["Datetime"].dt, "tz", None) is None:
+                raise ValueError("inline 1m Datetime must be tz-aware (UTC)")
+        except Exception:
+            pass
+
         # Stash inline 1m for the scan (used when provided by tests)
         self._inline_df_1m = inline_1m
+        # Initialize shared DataCache (once) for performance improvements 1 & 2
+        if self.data_cache is None:
+            self.data_cache = DataCache(selected_cache_dir)
 
         # Get signals using multi-timeframe scanning approach with on-demand 1m loading
         signals = self._scan_continuous_data(symbol, df_5m, selected_cache_dir)
@@ -1180,28 +1161,19 @@ class BacktestEngine:
                 self.grade_profile_name or "c", "C"
             )
             sig["rr_ratio"] = rr_ratio
-            # Retain retest_aplus analytics for compatibility
-            aplus_eval = evaluate_retest_aplus(
-                sig.get("retest_candle", {}),
-                level=float(sig.get("level", 0.0)),
-                direction=str(sig.get("direction", "long")),
-                breakout_time=sig.get("breakout_time_5m"),
-                retest_time=sig.get("retest_time"),
-                breakout_volume=float(sig.get("vol_breakout_5m", 0.0)),
-                retest_volume=float(sig.get("vol_retest_1m", 0.0)),
-            )
-            sig["retest_aplus"] = bool(aplus_eval.get("passed", False))
-            sig["retest_aplus_reason"] = aplus_eval.get("reason", "")
+            # A+ retest legacy analytics removed; rely on core retest grading & points.
             # --------------------------------------------------
             # Points-based scoring (stub) – no filtering applied
             # --------------------------------------------------
+            breakout_details = {}
             try:
-                breakout_pts = score_breakout(
+                breakout_details = score_breakout_details(
                     sig.get("breakout_candle", {}),
                     sig.get("breakout_vol_ratio", 0.0),
                     prof,
                     direction=str(sig.get("direction", None)),
                 )
+                breakout_pts = int(breakout_details.get("total", 0))
             except Exception:
                 breakout_pts = 0
             try:
@@ -1252,6 +1224,12 @@ class BacktestEngine:
                 "trend": trend_pts,
                 "total": total_points,
                 "letter": points_letter,
+                "breakout_pattern_pts": breakout_details.get("pattern_pts"),
+                "breakout_volume_pts": breakout_details.get("volume_pts"),
+                "breakout_ctype": breakout_details.get("ctype"),
+                "breakout_body_pct": breakout_details.get("body_pct"),
+                "breakout_upper_wick_pct": breakout_details.get("upper_wick_pct"),
+                "breakout_lower_wick_pct": breakout_details.get("lower_wick_pct"),
             }
             return sig
 
@@ -1286,26 +1264,12 @@ class BacktestEngine:
             # Points-based gating always runs at Level 2. Disabled component filters
             # award their max points (legacy behavior), so we keep the denominator
             # at the full maximum (100) to preserve parity when everything is disabled.
-            full_max = 100.0  # 30 + 30 + 30 + 10
-            grade_min_pct = {"c": 0.56, "b": 0.70, "a": 0.86, "aplus": 0.95}
-            min_pct = grade_min_pct.get(profile_name, 0.56)
-            min_points = min_pct * full_max
+            # Delegate gating (total threshold + optional component mins) to utility for reuse
+            from gating_utils import apply_level2_gating  # local import to avoid circulars
 
-            def _total_points(sig: Dict) -> float:
-                pts = sig.get("points", {})
-                return (
-                    float(pts.get("breakout", 0.0))
-                    + float(pts.get("retest", 0.0))
-                    + float(pts.get("ignition", 0.0))
-                    + float(pts.get("trend", 0.0))
-                )
-
-            before = len(graded_signals)
-            graded_signals = [s for s in graded_signals if _total_points(s) >= min_points]
-            after = len(graded_signals)
-            # Lint-safe split over two prints
-            print(f"Level 2 gating grade={profile_name} threshold>={min_points:.2f}/100")
-            print(f"signals {before}->{after}")
+            graded_signals, gating_stats = apply_level2_gating(
+                profile_name, self.grade_profile, graded_signals, verbose=True
+            )
 
         trades = []
 
@@ -1316,52 +1280,82 @@ class BacktestEngine:
             target_price = sig["target"]
             direction = sig["direction"]
             entry_datetime = pd.to_datetime(sig["datetime"])
+            # Ensure entry_datetime is UTC-aware for downstream comparisons
+            try:
+                if getattr(entry_datetime, "tzinfo", None) is None:
+                    entry_datetime = entry_datetime.tz_localize(
+                        ZoneInfo("America/New_York")
+                    ).tz_convert(ZoneInfo("UTC"))
+                else:
+                    entry_datetime = entry_datetime.tz_convert(ZoneInfo("UTC"))
+            except Exception:
+                pass
 
-            # Calculate position size: risk 0.5% of initial capital per trade
-            # shares = (initial_capital * 0.005) / abs(entry - stop)
-            risk_per_trade = self.initial_capital * 0.005  # Fixed 0.5% risk
-            risk_per_share = abs(entry_price - stop_price)
-            shares = int(risk_per_trade / risk_per_share) if risk_per_share > 0 else 0
+            # Use centralized trade planner for stop/target/shares sizing
+            from trade_planner import plan_trade
 
+            eff_leverage = max(1.0, min(float(DEFAULT_LEVERAGE), 3.0))
+            # Use configured/signal rr ratio directly (min_rr_ratio drives target distance).
+            rr_ratio_source = sig.get("rr_ratio")
+            if rr_ratio_source is None:
+                rr_ratio_source = getattr(self, "min_rr_ratio", 2.0)
+            try:
+                rr_ratio_source = float(rr_ratio_source)
+            except Exception:
+                rr_ratio_source = getattr(self, "min_rr_ratio", 2.0)
+            if rr_ratio_source <= 0:
+                rr_ratio_source = getattr(self, "min_rr_ratio", 2.0)
+
+            try:
+                tp = plan_trade(
+                    side=direction,
+                    entry=entry_price,
+                    initial_capital=float(self.initial_capital),
+                    risk_pct=float(self.risk_pct_per_trade),
+                    rr_ratio=rr_ratio_source,
+                    leverage=eff_leverage,
+                    stop_price=stop_price,
+                    tick_size=0.01,
+                )
+            except ValueError:
+                # Skip trades that cannot be sized (e.g., zero distance or
+                # insufficient buying power)
+                continue
+
+            # Override stop/target/shares with planned values (may differ by tick rounding)
+            stop_price = tp.stop
+            target_price = tp.target
+            shares = tp.shares
+            risk_per_share = tp.stop_dist
+            risk_per_trade = tp.risk_per_trade
             if shares == 0:
                 continue
 
-            # Load 1m data for this trade: prefer inline 1m (tests) else cache window
+            # Reuse warmed per-day 1m session instead of per-trade window loads
             if getattr(self, "_inline_df_1m", None) is not None:
-                # Use provided inline 1m data and filter to bars after entry
-                future_bars = self._inline_df_1m.copy()
-                future_bars["Datetime"] = pd.to_datetime(future_bars["Datetime"], errors="coerce")
-                # Normalize to UTC to match entry_datetime tz-awareness
-                try:
-                    et_tz = ZoneInfo("America/New_York")
-                except Exception:
-                    et_tz = None
-                dt_sr = future_bars["Datetime"]
-                try:
-                    if getattr(dt_sr.dt, "tz", None) is None and et_tz is not None:
-                        future_bars["Datetime"] = dt_sr.dt.tz_localize(et_tz).dt.tz_convert(
-                            ZoneInfo("UTC")
-                        )
-                    elif getattr(dt_sr.dt, "tz", None) is not None:
-                        future_bars["Datetime"] = dt_sr.dt.tz_convert(ZoneInfo("UTC"))
-                except Exception:
-                    # Fallback: if localization fails, interpret as UTC-naive then localize
-                    if getattr(future_bars["Datetime"].dt, "tz", None) is None:
-                        future_bars["Datetime"] = future_bars["Datetime"].dt.tz_localize("UTC")
-                future_bars = future_bars[future_bars["Datetime"] > entry_datetime].copy()
-                future_bars = future_bars.sort_values("Datetime")
+                session_source = self._inline_df_1m
             else:
-                # Fallback to cached window around the entry time
-                future_bars = self._load_1m_window(
-                    symbol=symbol,
-                    center_time=entry_datetime + timedelta(minutes=195),  # Mid-day from entry
-                    window_minutes=200,  # Cover rest of session plus next day if needed
-                )
-
-                # Filter to bars after entry
-                if not future_bars.empty:
-                    future_bars = future_bars[future_bars["Datetime"] > entry_datetime].copy()
-                    future_bars = future_bars.sort_values("Datetime")
+                # Derive day key from entry time (UTC → ET for session anchor) and pull warmed data
+                et_tz = ZoneInfo("America/New_York")
+                entry_et = entry_datetime.tz_convert(et_tz)
+                day_key = entry_et.date()
+                # _session_1m_by_day populated earlier via _get_or_preload_session_1m
+                session_source = None
+                if hasattr(self, "_session_1m_by_day"):
+                    session_source = self._session_1m_by_day.get((symbol, day_key))
+                if session_source is None or (
+                    isinstance(session_source, pd.DataFrame) and session_source.empty
+                ):
+                    # Fallback to legacy window loader (cross-day or missing warm data)
+                    session_source = self._load_1m_window(
+                        symbol=symbol,
+                        center_time=entry_datetime + timedelta(minutes=195),
+                        window_minutes=200,
+                    )
+            future_bars = pd.DataFrame()
+            if session_source is not None and not session_source.empty:
+                future_bars = session_source[session_source["Datetime"] > entry_datetime].copy()
+                future_bars = future_bars.sort_values("Datetime")
 
             if future_bars.empty:
                 # No data after signal - skip this trade
@@ -1471,16 +1465,25 @@ class BacktestEngine:
                         exit_time = bar["Datetime"]
                         outcome = "win"
                         break
-
-            # If neither stop nor target was hit, skip this trade
+            # If neither stop nor target was hit, force exit at session close (last bar close)
             if exit_price is None:
-                continue
+                try:
+                    last_bar = future_bars.iloc[-1]
+                    exit_price = float(last_bar.get("Close"))
+                    exit_time = last_bar.get("Datetime")
+                    outcome = "forced"
+                except Exception:
+                    continue
 
-            # Calculate P&L
+            # Calculate P&L (treat forced close as normal exit at last close)
             if direction == "long":
                 pnl = (exit_price - entry_price) * shares
             else:  # short
                 pnl = (entry_price - exit_price) * shares
+
+            # Effective risk actually deployed (can be less than configured risk_per_trade
+            # if notional leverage cap reduced position size)
+            effective_risk_amount = shares * risk_per_share
 
             # Build trade dict with all available information
             trade_dict = {
@@ -1494,7 +1497,13 @@ class BacktestEngine:
                 "shares": shares,
                 "pnl": pnl,
                 "outcome": outcome,
-                "risk_amount": risk_per_trade,  # Dollar amount risked per position
+                "forced_close": outcome == "forced",
+                # Report the effective dollar risk deployed for this trade
+                # (shares * per-share risk). This aligns the displayed Risk with
+                # realized P&L multiples (loss ≈ -Risk, win ≈ RR * Risk).
+                "risk_amount": effective_risk_amount,
+                # Also include the configured/planned risk for auditing
+                "risk_amount_planned": risk_per_trade,
                 # Continuation diagnostics (post-entry informational only)
                 **{k: v for k, v in continuation_diag.items() if v is not None},
             }
@@ -1530,8 +1539,9 @@ class BacktestEngine:
 
         # Calculate statistics
         total_trades = len(trades)
-        winning_trades = sum(1 for t in trades if t["outcome"] == "win")
-        losing_trades = total_trades - winning_trades
+        winning_trades = sum(1 for t in trades if t.get("outcome") == "win")
+        losing_trades = sum(1 for t in trades if t.get("outcome") == "loss")
+        forced_closes = sum(1 for t in trades if t.get("outcome") == "forced")
         total_pnl = sum(t["pnl"] for t in trades)
         win_rate = winning_trades / total_trades if total_trades > 0 else 0
 
@@ -1540,6 +1550,7 @@ class BacktestEngine:
             "total_trades": total_trades,
             "winning_trades": winning_trades,
             "losing_trades": losing_trades,
+            "forced_closes": forced_closes,
             "total_pnl": total_pnl,
             "win_rate": win_rate,
             "signals": graded_signals,
@@ -1575,12 +1586,15 @@ def format_results(results: List[Dict]) -> str:
     total_winners = 0
     total_pnl = 0
     total_candidates = 0
+    total_forced = 0
 
     for res in results:
         output.append(f"\n{res['symbol']}:")
         output.append(f"  Total Trades: {res['total_trades']}")
         output.append(f"  Winners: {res['winning_trades']}")
         output.append(f"  Losers: {res['losing_trades']}")
+        if res.get("forced_closes"):
+            output.append(f"  Forced closes: {res['forced_closes']}")
         output.append(f"  Win Rate: {res['win_rate']:.1%}")
         output.append(f"  Total P&L: ${res['total_pnl']:.2f}")
         if "candidate_count" in res:
@@ -1594,6 +1608,7 @@ def format_results(results: List[Dict]) -> str:
                 total_candidates += int(res["candidate_count"])
             except Exception:
                 pass
+        total_forced += res.get("forced_closes", 0)
 
     output.append("\n" + "-" * 60)
     output.append("OVERALL:")
@@ -1604,6 +1619,8 @@ def format_results(results: List[Dict]) -> str:
         if total_trades > 0
         else "  Overall Win Rate: N/A"
     )
+    if total_forced:
+        output.append(f"  Forced closes: {total_forced}")
     output.append(f"  Total P&L: ${total_pnl:.2f}")
     if total_candidates > 0:
         output.append(f"  Candidates: {total_candidates}")
@@ -1892,12 +1909,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     parser.add_argument("--start", required=False, default=None, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", required=False, default=None, help="End date (YYYY-MM-DD)")
 
-    parser.add_argument(
-        "--position-size",
-        type=float,
-        default=0.1,
-        help="Risk per trade as %% of capital (default: 0.1)",
-    )
+    # Removed CLI control for risk percent; use config.json (overridable via --config-override)
     parser.add_argument(
         "--leverage",
         type=float,
@@ -1973,10 +1985,10 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     parser.add_argument(
         "--grade",
         choices=["aplus", "a", "b", "c"],
-        default="c",
+        default=None,
         help=(
             "Grade profile to apply at Level 2 filtering. One profile active at a time. "
-            "Defaults to 'c'."
+            "If omitted, defaults to the value of default_grade in config.json (e.g., 'c')."
         ),
     )
     parser.add_argument(
@@ -1994,6 +2006,11 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
 
     args = parser.parse_args()
 
+    # ------------------------------------------------------------------
+    # Runtime timer start (wall-clock) – minimal performance visibility
+    # ------------------------------------------------------------------
+    overall_t0 = time.perf_counter()
+
     # Apply config overrides from command line via utility function
     apply_config_overrides(CONFIG, args.config_override or [])
 
@@ -2004,6 +2021,10 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
     runtime_results_dir = CONFIG.get("backtest_results_dir", DEFAULT_RESULTS_DIR)
     runtime_retest_vol_gate = CONFIG.get("retest_volume_gate_ratio", RETEST_VOL_GATE)
     min_rr_ratio = CONFIG.get("min_rr_ratio", 2.0)
+    default_grade_cfg = str(CONFIG.get("default_grade", "c")).lower()
+    if default_grade_cfg not in {"aplus", "a", "b", "c"}:
+        default_grade_cfg = "c"
+    risk_pct_cfg = float(CONFIG.get("risk_pct_per_trade", 0.005))
 
     # If leverage wasn't explicitly provided, allow config override to drive it
     if "--leverage" not in sys.argv and "leverage" in CONFIG:
@@ -2052,7 +2073,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
 
     engine = BacktestEngine(
         initial_capital=effective_initial_capital,
-        position_size_pct=args.position_size,
+        risk_pct_per_trade=risk_pct_cfg,
         leverage=args.leverage,
         display_tzinfo=display_tz,
         tz_label=tz_label,
@@ -2064,11 +2085,12 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         console_only=args.console_only,
     )
     # Load grade profile if provided and Level 2
-    if pipeline_level == 2 and args.grade:
+    if pipeline_level == 2:
+        effective_grade = args.grade if args.grade else default_grade_cfg
         try:
-            engine.grade_profile_name = args.grade
-            engine.grade_profile = load_profile(args.grade)
-            print(f"Loaded grade profile: {args.grade}")
+            engine.grade_profile_name = effective_grade
+            engine.grade_profile = load_profile(effective_grade)
+            print(f"Loaded grade profile: {effective_grade}")
         except Exception as e:
             print(f"Failed to load grade profile '{args.grade}': {e}")
             engine.grade_profile_name = None
@@ -2197,6 +2219,27 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         with open(md_path, "w") as f:
             f.write(md_summary + "\n")
         print(f"Summary saved to {md_path}")
+
+    # ------------------------------------------------------------------
+    # Runtime timer end + report
+    # ------------------------------------------------------------------
+    elapsed_sec = time.perf_counter() - overall_t0
+    # Human-friendly formatting
+    if elapsed_sec < 120:
+        elapsed_str = f"{elapsed_sec:.2f}s"
+    else:
+        elapsed_str = f"{elapsed_sec/60.0:.2f}m"
+    try:
+        symbol_count = len(symbols)
+    except Exception:
+        symbol_count = 0
+    grade_suffix = ""
+    if pipeline_level == 2 and getattr(engine, "grade_profile_name", None):
+        grade_suffix = f', Grade "{engine.grade_profile_name}"'
+    print(
+        f"Runtime: {elapsed_str} for {symbol_count} symbol(s) "
+        f"({start_date} -> {end_date}), Level {pipeline_level}{grade_suffix}"
+    )
 
 
 if __name__ == "__main__":
