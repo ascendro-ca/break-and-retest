@@ -93,6 +93,71 @@ def level0_retest_filter(m1: pd.Series, direction: str, level: float) -> bool:
         return False
 
 
+def _wick_touches_or_pierces(
+    m1: pd.Series,
+    direction: str,
+    level: float,
+    tolerance_bps: float = 0.0,
+    mode: str = "either",
+    pierce_max_bps: Optional[float] = None,
+) -> bool:
+    """
+    Check whether the wick of the 1m candle touches or pierces the OR level.
+
+    Definition:
+    - Long retest (OR High): lower wick must reach the level (touch) or dip below (pierce)
+      Touch: abs(Low - level) <= tolerance_price
+      Pierce: Low < level - tolerance_price
+    - Short retest (OR Low): upper wick must reach the level (touch) or poke above (pierce)
+      Touch: abs(High - level) <= tolerance_price
+      Pierce: High > level + tolerance_price
+
+    Args:
+        m1: 1-minute candle (expects Low/High fields)
+        direction: 'long' or 'short'
+        level: OR level being retested
+        tolerance_bps: Basis points tolerance around the level for touch detection.
+                        Example: 1.0 bps = 0.01% of level. Default 0.0 (no tolerance).
+
+    Returns:
+        True if wick satisfies the configured mode (touch-only, pierce-only, either) with
+        optional maximum pierce depth cap (in bps) when mode permits pierce.
+    """
+    low = float(m1.get("Low", 0.0))
+    high = float(m1.get("High", 0.0))
+    tol_price = float(level) * float(tolerance_bps) / 10000.0
+
+    def _within_pierce_cap(is_long: bool) -> bool:
+        if pierce_max_bps is None:
+            return True
+        # Compute pierce depth in bps relative to level
+        if is_long:
+            depth = max(0.0, (level - low) / level) * 10000.0
+        else:
+            depth = max(0.0, (high - level) / level) * 10000.0
+        return depth <= float(pierce_max_bps)
+
+    if direction == "long":
+        touch = abs(low - level) <= tol_price
+        pierce = low < (level - tol_price) and _within_pierce_cap(True)
+        if mode == "touch-only":
+            return bool(touch)
+        elif mode == "pierce-only":
+            return bool(pierce)
+        else:  # either
+            return bool(touch or pierce)
+    elif direction == "short":
+        touch = abs(high - level) <= tol_price
+        pierce = high > (level + tol_price) and _within_pierce_cap(False)
+        if mode == "touch-only":
+            return bool(touch)
+        elif mode == "pierce-only":
+            return bool(pierce)
+        else:  # either
+            return bool(touch or pierce)
+    return False
+
+
 def detect_retest(
     session_df_1m: pd.DataFrame,
     breakout_time: pd.Timestamp,
@@ -101,6 +166,10 @@ def detect_retest(
     retest_lookahead_minutes: int = 30,  # Deprecated but kept for backward compatibility
     retest_filter: Optional[Callable[[pd.Series, str, float], bool]] = None,
     enable_vwap_check: bool = True,
+    retest_require_wick_contact: bool = False,
+    wick_tolerance_bps: float = 10.0,
+    wick_contact_mode: str = "either",
+    wick_pierce_max_bps: Optional[float] = None,
 ) -> Optional[Dict]:
     """
     Detect retest after a breakout.
@@ -112,8 +181,15 @@ def detect_retest(
         level: The OR level being tested
         retest_lookahead_minutes: DEPRECATED - No longer used. Retest window is now
                                   determined by 90 minutes from market open.
-        retest_filter: Optional custom filter; if None, uses base_retest_filter
-        enable_vwap_check: If True, enforce VWAP alignment in base filter (default: True)
+    retest_filter: Optional custom filter; if None, falls back to strict Level 0 parity
+            (body at/beyond level in trade direction).
+    enable_vwap_check: If True, enforce VWAP alignment in base filter (default: True)
+    retest_require_wick_contact: If True, additionally require that the retest candle's wick
+                     either touches or pierces the OR level (directional).
+    wick_tolerance_bps: Basis points tolerance to consider a "touch" near the level.
+                Example: 1.0 = 0.01%. Default 0.0 (no tolerance).
+    wick_contact_mode: One of {"either", "touch-only", "pierce-only"}. Default: "either".
+    wick_pierce_max_bps: If set and mode allows pierce, cap the maximum pierce depth (bps).
 
     Returns:
         Dict with keys: time, candle if retest found, else None
@@ -205,6 +281,16 @@ def detect_retest(
 
     for _, m1 in window_1m.iterrows():
         if filter_fn(m1, direction, level):
+            # Optional additional rule: require wick to either touch or pierce the OR level
+            if retest_require_wick_contact and not _wick_touches_or_pierces(
+                m1,
+                direction,
+                level,
+                tolerance_bps=wick_tolerance_bps,
+                mode=str(wick_contact_mode or "either").lower(),
+                pierce_max_bps=wick_pierce_max_bps,
+            ):
+                continue
             return {"time": m1["Datetime"], "candle": m1}
 
     return None

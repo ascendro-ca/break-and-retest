@@ -222,6 +222,8 @@ class BacktestEngine:
         grading_system: str = "points",
         min_rr_ratio: float = 2.0,
         console_only: bool = False,
+        # New: optional minimum total score gating for Level 1
+        min_score_threshold: Optional[int] = None,
     ):
         """
         Initialize backtest engine
@@ -272,6 +274,10 @@ class BacktestEngine:
         self.min_rr_ratio = min_rr_ratio
         # Control console verbosity at Level 2: suppress trade-level detail unless --console-only
         self.console_only = console_only
+        # Optional score threshold gating (applied at Level 1 only)
+        self.min_score_threshold = (
+            int(min_score_threshold) if min_score_threshold is not None else None
+        )
 
         # Pipeline level determines filtering strictness and trade behavior
         # Level 0: Candidates only (no trades ever)
@@ -504,6 +510,18 @@ class BacktestEngine:
             session_df_5m["vwap"] = (
                 session_df_5m["tp_volume"].cumsum() / session_df_5m["Volume"].cumsum()
             )
+            # Add 5m ATR(14) for normalization
+            try:
+                pc = session_df_5m["Close"].shift(1)
+                tr = (session_df_5m["High"] - session_df_5m["Low"]).abs().to_frame("tr1")
+                tr["tr2"] = (session_df_5m["High"] - pc).abs()
+                tr["tr3"] = (session_df_5m["Low"] - pc).abs()
+                session_df_5m["tr"] = tr.max(axis=1)
+                session_df_5m["atr14"] = (
+                    session_df_5m["tr"].rolling(window=14, min_periods=14).mean()
+                )
+            except Exception:
+                session_df_5m["atr14"] = None
             # Time index for fast lookups later
             if session_df_5m.index.name != "Datetime":
                 session_df_5m = session_df_5m.sort_values("Datetime")
@@ -563,6 +581,17 @@ class BacktestEngine:
                 session_df_1m["vwap"] = (
                     session_df_1m["tp_volume"].cumsum() / session_df_1m["Volume"].cumsum()
                 )
+                # Add 1m EMAs for ignition alignment checks
+                try:
+                    session_df_1m["ema9"] = (
+                        session_df_1m["Close"].ewm(span=9, adjust=False, min_periods=9).mean()
+                    )
+                    session_df_1m["ema20"] = (
+                        session_df_1m["Close"].ewm(span=20, adjust=False, min_periods=20).mean()
+                    )
+                except Exception:
+                    session_df_1m["ema9"] = None
+                    session_df_1m["ema20"] = None
             else:
                 session_df_1m = _get_or_preload_session_1m(day)
 
@@ -621,6 +650,19 @@ class BacktestEngine:
                     retest_lookahead_minutes=30,
                     pipeline_level=0,
                     enable_vwap_check=False,  # VWAP check disabled for Level 0
+                    retest_require_wick_contact=bool(
+                        CONFIG.get(
+                            "retest_require_wick_contact",
+                            CONFIG.get("request_retest_wick_contact", True),
+                        )
+                    ),
+                    wick_tolerance_bps=float(CONFIG.get("retest_wick_touch_tolerance_bps", 0.0)),
+                    wick_contact_mode=str(CONFIG.get("retest_wick_contact_mode", "either")).lower(),
+                    wick_pierce_max_bps=(
+                        float(CONFIG.get("retest_wick_pierce_max_bps"))
+                        if CONFIG.get("retest_wick_pierce_max_bps") is not None
+                        else None
+                    ),
                 )
 
                 for c in candidates:
@@ -738,6 +780,19 @@ class BacktestEngine:
                 pipeline_level=self.pipeline_level,
                 # VWAP check disabled for all levels (0/1/2+) for now
                 enable_vwap_check=False,
+                retest_require_wick_contact=bool(
+                    CONFIG.get(
+                        "retest_require_wick_contact",
+                        CONFIG.get("request_retest_wick_contact", True),
+                    )
+                ),
+                wick_tolerance_bps=float(CONFIG.get("retest_wick_touch_tolerance_bps", 0.0)),
+                wick_contact_mode=str(CONFIG.get("retest_wick_contact_mode", "either")).lower(),
+                wick_pierce_max_bps=(
+                    float(CONFIG.get("retest_wick_pierce_max_bps"))
+                    if CONFIG.get("retest_wick_pierce_max_bps") is not None
+                    else None
+                ),
             )
 
             for cand in pipeline_candidates:
@@ -869,22 +924,53 @@ class BacktestEngine:
                     continue
 
                 breakout_up = direction == "long"
-                # Stop below/above retest candle with a 0.5% buffer of the breakout distance
+                # Scarface Trades Stop-Loss Rules (Break & Re-test):
+                # - LONG: stop below the retest candle's low AND below the OR high,
+                #   with wick tolerance.
+                # - SHORT: stop above the retest candle's high AND above the OR low,
+                #   with wick tolerance.
+                # Wick tolerance is configured in bps; defaults to
+                # retest_wick_touch_tolerance_bps when a dedicated stop tolerance is
+                # not provided.
+                try:
+                    or_high_val = float(or_info.get("high", 0.0))
+                    or_low_val = float(or_info.get("low", 0.0))
+                except Exception:
+                    or_high_val = or_low_val = 0.0
+
+                # Determine wick tolerance in dollars (bps of level if available,
+                # else OR bound, else entry)
+                tol_bps = 0.0
+                try:
+                    tol_bps = float(
+                        CONFIG.get(
+                            "retest_stop_wick_tolerance_bps",
+                            CONFIG.get("retest_wick_touch_tolerance_bps", 10),
+                        )
+                    )
+                except Exception:
+                    tol_bps = 10.0  # 10 bps default (0.10%)
+                try:
+                    level_px = float(level) if level is not None else None
+                except Exception:
+                    level_px = None
+                tol_base = (
+                    level_px
+                    if level_px is not None and level_px > 0
+                    else (or_high_val if breakout_up else or_low_val) or entry
+                )
+                wick_tol = abs(tol_base) * (tol_bps / 10000.0)
+
                 if breakout_up:
-                    breakout_distance = abs(entry - float(retest_candle.get("Low", entry)))
-                    buffer = 0.005 * breakout_distance  # 0.5% of breakout distance
-                    stop = float(retest_candle.get("Low", entry)) - buffer
+                    rt_low = float(retest_candle.get("Low", entry))
+                    # Enforce both conditions with tolerance: below retest low AND below OR high
+                    stop = min(rt_low, or_high_val) - wick_tol
                 else:
-                    breakout_distance = abs(entry - float(retest_candle.get("High", entry)))
-                    buffer = 0.005 * breakout_distance  # 0.5% of breakout distance
-                    stop = float(retest_candle.get("High", entry)) + buffer
-                # Ensure stop is not more than 0.5% of entry price away
-                # (cap risk per share at 0.5% of entry)
-                max_stop_distance = 0.005 * abs(entry)
-                if breakout_up:
-                    stop = max(stop, entry - max_stop_distance)
-                else:
-                    stop = min(stop, entry + max_stop_distance)
+                    rt_high = float(retest_candle.get("High", entry))
+                    # Enforce both conditions with tolerance: above retest high AND above OR low
+                    stop = max(rt_high, or_low_val) + wick_tol
+
+                # Compute risk; if zero or invalid, skip this signal
                 risk = abs(entry - stop)
                 if risk == 0 or not pd.notna(risk):
                     continue
@@ -927,6 +1013,163 @@ class BacktestEngine:
                     retest_ma = None
                     retest_vol_ratio = 0.0
 
+                # Pre-entry feature engineering helpers
+                def _minutes_since_open(ts):
+                    try:
+                        return float(
+                            (pd.to_datetime(ts) - expected_open_utc).total_seconds() / 60.0
+                        )
+                    except Exception:
+                        return None
+
+                def _lookup_1m_col(ts, col):
+                    try:
+                        return lookup_col_at(
+                            session_df_1m, ts, col, times_1m, session_df_1m[col].to_numpy()
+                        )
+                    except Exception:
+                        return None
+
+                def _lookup_5m_col(ts, col):
+                    try:
+                        return lookup_col_at(
+                            session_df_5m, ts, col, times_5m, session_df_5m[col].to_numpy()
+                        )
+                    except Exception:
+                        return None
+
+                # Opening range bounds
+                or_high = float(or_info.get("high", 0.0))
+                or_low = float(or_info.get("low", 0.0))
+
+                # Breakout OR-relative distance
+                try:
+                    bo_close = float(breakout_candle.get("Close"))
+                except Exception:
+                    bo_close = None
+                breakout_or_dist_pct = None
+                try:
+                    if or_range and bo_close is not None and or_range > 0:
+                        if direction == "long":
+                            breakout_or_dist_pct = (bo_close - or_high) / or_range
+                        else:
+                            breakout_or_dist_pct = (or_low - bo_close) / or_range
+                except Exception:
+                    breakout_or_dist_pct = None
+
+                # Retest touch distance and wick penetration
+                level_px = float(level or 0.0) if level is not None else None
+                try:
+                    rt_close = float(retest_candle.get("Close"))
+                    rt_high = float(retest_candle.get("High"))
+                    rt_low = float(retest_candle.get("Low"))
+                    rt_range = max(rt_high - rt_low, 1e-9)
+                except Exception:
+                    rt_close = rt_high = rt_low = rt_range = None
+                retest_touch_abs = None
+                retest_touch_pct_or = None
+                retest_wick_penetration_pct = None
+                try:
+                    if level_px is not None and rt_close is not None:
+                        retest_touch_abs = abs(rt_close - level_px)
+                        if or_range and or_range > 0:
+                            retest_touch_pct_or = retest_touch_abs / or_range
+                    if level_px is not None and rt_range is not None and rt_range > 0:
+                        if direction == "long":
+                            pen = max(0.0, level_px - rt_low)
+                        else:
+                            pen = max(0.0, rt_high - level_px)
+                        retest_wick_penetration_pct = pen / rt_range
+                except Exception:
+                    pass
+
+                # Touch attempts before ignition
+                # (count 1m bars between retest and ignition that cross the level)
+                retest_attempts = None
+                try:
+                    if (
+                        level_px is not None
+                        and retest_time is not None
+                        and ignition_time is not None
+                    ):
+                        mask = (session_df_1m["Datetime"] > retest_time) & (
+                            session_df_1m["Datetime"] <= ignition_time
+                        )
+                        seg = session_df_1m.loc[mask, ["High", "Low"]]
+                        if not seg.empty:
+                            cross = (seg["Low"] <= level_px) & (seg["High"] >= level_px)
+                            retest_attempts = int(cross.sum())
+                except Exception:
+                    pass
+
+                # Time since open
+                minutes_since_open_retest = _minutes_since_open(retest_time)
+                minutes_since_open_ignition = _minutes_since_open(ignition_time)
+
+                # VWAP diffs
+                breakout_vwap = (
+                    breakout_candle.get("vwap") if hasattr(breakout_candle, "get") else None
+                )
+                retest_vwap = retest_candle.get("vwap") if hasattr(retest_candle, "get") else None
+                breakout_vwap_diff = None
+                retest_vwap_diff = None
+                try:
+                    if bo_close is not None and breakout_vwap is not None:
+                        breakout_vwap_diff = float(bo_close) - float(breakout_vwap)
+                    if rt_close is not None and retest_vwap is not None:
+                        retest_vwap_diff = float(rt_close) - float(retest_vwap)
+                except Exception:
+                    pass
+
+                # 1m EMA alignment at ignition
+                ignition_ema9 = _lookup_1m_col(ignition_time, "ema9")
+                ignition_ema20 = _lookup_1m_col(ignition_time, "ema20")
+                ignition_ema9_gt_ema20 = None
+                try:
+                    if ignition_ema9 is not None and ignition_ema20 is not None:
+                        ignition_ema9_gt_ema20 = bool(float(ignition_ema9) >= float(ignition_ema20))
+                except Exception:
+                    pass
+
+                # 5m ATR at breakout
+                atr14_5m = _lookup_5m_col(breakout_time, "atr14")
+
+                # Dollar volumes
+                breakout_dollar_vol = None
+                retest_dollar_vol = None
+                try:
+                    if bo_close is not None:
+                        breakout_dollar_vol = float(bo_close) * float(
+                            (
+                                breakout_candle.get("Volume")
+                                if hasattr(breakout_candle, "get")
+                                else 0.0
+                            )
+                        )
+                    if rt_close is not None:
+                        retest_dollar_vol = float(rt_close) * float(
+                            (retest_candle.get("Volume") if hasattr(retest_candle, "get") else 0.0)
+                        )
+                except Exception:
+                    pass
+
+                # Consolidation between breakout and retest
+                consolidation_minutes = None
+                consolidation_bars_1m = None
+                try:
+                    if breakout_time is not None and retest_time is not None:
+                        delta_min = (
+                            pd.to_datetime(retest_time) - pd.to_datetime(breakout_time)
+                        ).total_seconds() / 60.0
+                        consolidation_minutes = float(delta_min)
+                        # count 1m bars strictly between
+                        msk = (session_df_1m["Datetime"] > breakout_time) & (
+                            session_df_1m["Datetime"] <= retest_time
+                        )
+                        consolidation_bars_1m = int(msk.sum())
+                except Exception:
+                    pass
+
                 signal = {
                     "ticker": symbol,
                     "direction": direction,
@@ -950,6 +1193,26 @@ class BacktestEngine:
                     "retest_vol_ratio": retest_vol_ratio,
                     # Opening Range (for body% of OR in Grade C checks)
                     "or_range": or_range,
+                    # New pre-entry metrics for analysis
+                    "preentry": {
+                        "breakout_or_dist_pct": breakout_or_dist_pct,
+                        "retest_touch_distance_abs": retest_touch_abs,
+                        "retest_touch_distance_pct_or": retest_touch_pct_or,
+                        "retest_wick_penetration_pct": retest_wick_penetration_pct,
+                        "retest_touch_attempts": retest_attempts,
+                        "minutes_since_open_retest": minutes_since_open_retest,
+                        "minutes_since_open_ignition": minutes_since_open_ignition,
+                        "breakout_vwap_diff": breakout_vwap_diff,
+                        "retest_vwap_diff": retest_vwap_diff,
+                        "ignition_ema9": ignition_ema9,
+                        "ignition_ema20": ignition_ema20,
+                        "ignition_ema9_gt_ema20": ignition_ema9_gt_ema20,
+                        "atr14_5m": atr14_5m,
+                        "breakout_dollar_vol": breakout_dollar_vol,
+                        "retest_dollar_vol": retest_dollar_vol,
+                        "consolidation_minutes": consolidation_minutes,
+                        "consolidation_bars_1m": consolidation_bars_1m,
+                    },
                 }
 
                 # Unified ignition analytics (Level 1 & 2): attach ignition info if we have a bar
@@ -1286,6 +1549,24 @@ class BacktestEngine:
 
         graded_signals = [attach_basic_grades(dict(sig)) for sig in signals]
 
+        # Level 1: If a minimum score is provided, filter out signals below the threshold
+        if self.pipeline_level == 1 and self.min_score_threshold is not None:
+            try:
+                before = len(graded_signals)
+                graded_signals = [
+                    s
+                    for s in graded_signals
+                    if ((s.get("points") or {}).get("total") or -1) >= self.min_score_threshold
+                ]
+                after = len(graded_signals)
+                if before != after and self.console_only:
+                    print(
+                        f"[Level 1] min-score gating: kept {after}/{before} signals with total>="
+                        f"{self.min_score_threshold}"
+                    )
+            except Exception:
+                pass
+
         # Legacy rejection counters removed (no longer used)
 
         # Level 2: Apply selected grade profile and enforce total points threshold per --grade
@@ -1559,6 +1840,22 @@ class BacktestEngine:
                 **{k: v for k, v in continuation_diag.items() if v is not None},
             }
 
+            # Attach points-based grading to each trade for downstream analysis
+            # This includes: letter grade, total score, and per-component scores
+            pts = sig.get("points") or {}
+            if isinstance(pts, dict) and pts:
+                # Preserve full points block
+                trade_dict["points"] = dict(pts)
+                # Convenience top-level fields
+                trade_dict["grade_letter"] = pts.get("letter")
+                trade_dict["score_total"] = pts.get("total")
+                trade_dict["component_scores"] = {
+                    "breakout": pts.get("breakout"),
+                    "retest": pts.get("retest"),
+                    "ignition": pts.get("ignition"),
+                    "trend": pts.get("trend"),
+                }
+
             # Add grading information if available (Level 2+)
             if "component_grades" in sig:
                 trade_dict["breakout_grade"] = sig["component_grades"].get("breakout")
@@ -1748,9 +2045,12 @@ def generate_markdown_trade_summary(
     lines.append(f"_Timezone: {tz_label}_\n")
     lines.append(
         f"| Date ({tz_label}) | Entry Time | Exit Time | Time in trade (min) | "
-        "Symbol | Dir | Entry | Stop | Target | Exit | Outcome | Risk | R/R | P&L | Shares |"
+        "Symbol | Dir | Entry | Stop | Target | Exit | Outcome | Risk | R/R | "
+        "P&L | Shares | Grade | Score | CompPts |"
     )
-    lines.append("|---|---|---|---:|---|---:|---:|---:|---:|---:|---|---:|---:|---:|")
+    lines.append(
+        "|---|---|---|---:|---|---:|---:|---:|---:|---:|---|---:|---:|---:|" "---:|---:|---:"
+    )
 
     total = 0
     winners = 0
@@ -1798,6 +2098,31 @@ def generate_markdown_trade_summary(
             except Exception:
                 return str(x)
 
+        # Grade/score fields pulled from points when available
+        pts = tr.get("points") or {}
+        grade_letter = pts.get("letter") if isinstance(pts, dict) else None
+        if not grade_letter:
+            grade_letter = tr.get("overall_grade", "")
+        score_total = pts.get("total") if isinstance(pts, dict) else ""
+        try:
+            score_total = str(int(score_total)) if score_total is not None else ""
+        except Exception:
+            score_total = f(score_total)
+        comp_pts = ""
+        if isinstance(pts, dict) and pts:
+            bo = pts.get("breakout")
+            rt = pts.get("retest")
+            ig = pts.get("ignition")
+            trd = pts.get("trend")
+
+            def to_i(x):
+                try:
+                    return str(int(x))
+                except Exception:
+                    return ""
+
+            comp_pts = "/".join([to_i(bo), to_i(rt), to_i(ig), to_i(trd)])
+
         lines.append(
             "| "
             + " | ".join(
@@ -1817,6 +2142,9 @@ def generate_markdown_trade_summary(
                     f(tr.get("rr_ratio", "")),
                     f(tr.get("pnl")),
                     str(tr.get("shares", "")),
+                    str(grade_letter or ""),
+                    score_total,
+                    comp_pts,
                 ]
             )
             + " |"
@@ -2034,6 +2362,15 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         help="Grading system (profile-based: breakout/retest/ignition thresholds)",
     )
     parser.add_argument(
+        "--min-score",
+        type=int,
+        default=None,
+        help=(
+            "Level 1 only: require total score (points.total) >= this threshold to enter trades. "
+            "Ignored for other levels."
+        ),
+    )
+    parser.add_argument(
         "--grade",
         choices=["aplus", "a", "b", "c"],
         default=None,
@@ -2134,6 +2471,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         grading_system=args.grading_system,
         min_rr_ratio=min_rr_ratio,
         console_only=args.console_only,
+        min_score_threshold=args.min_score,
     )
     # Load grade profile if provided and Level 2
     if pipeline_level == 2:

@@ -73,6 +73,10 @@ class TradeSetupPipeline:
         retest_filter: Optional[Callable[[pd.Series, str, float], bool]] = None,
         ignition_filter: Optional[Callable[[pd.Series, str, float, float], bool]] = None,
         enable_vwap_check: bool = True,
+        retest_require_wick_contact: bool = True,
+        wick_tolerance_bps: float = 0.0,
+        wick_contact_mode: str = "either",
+        wick_pierce_max_bps: Optional[float] = None,
     ) -> None:
         """
         Initialize the pipeline.
@@ -95,6 +99,12 @@ class TradeSetupPipeline:
         self.retest_filter = retest_filter
         self.ignition_filter = ignition_filter
         self.enable_vwap_check = enable_vwap_check
+
+        # Stage 3 additional requirement: wick must touch or pierce OR
+        self.retest_require_wick_contact = bool(retest_require_wick_contact)
+        self.wick_tolerance_bps = float(wick_tolerance_bps)
+        self.wick_contact_mode = str(wick_contact_mode or "either").lower()
+        self.wick_pierce_max_bps = wick_pierce_max_bps
 
     def run(self, session_df_5m: pd.DataFrame, session_df_1m: pd.DataFrame) -> List[Dict]:
         """
@@ -155,6 +165,10 @@ class TradeSetupPipeline:
                 retest_lookahead_minutes=self.retest_lookahead_minutes,
                 retest_filter=self.retest_filter,
                 enable_vwap_check=self.enable_vwap_check,
+                retest_require_wick_contact=self.retest_require_wick_contact,
+                wick_tolerance_bps=self.wick_tolerance_bps,
+                wick_contact_mode=self.wick_contact_mode,
+                wick_pierce_max_bps=self.wick_pierce_max_bps,
             )
 
             if retest_result is None:
@@ -223,6 +237,10 @@ def run_pipeline(
     ignition_lookahead_minutes: int = 30,
     pipeline_level: int = 0,
     enable_vwap_check: bool = True,
+    retest_require_wick_contact: bool = True,
+    wick_tolerance_bps: float = 0.0,
+    wick_contact_mode: str = "either",
+    wick_pierce_max_bps: Optional[float] = None,
 ) -> List[Dict]:
     """
     Convenience function to run the pipeline with default settings.
@@ -258,5 +276,9 @@ def run_pipeline(
         pipeline_level=pipeline_level,
         retest_filter=retest_filter,
         enable_vwap_check=enable_vwap_check,
+        retest_require_wick_contact=retest_require_wick_contact,
+        wick_tolerance_bps=wick_tolerance_bps,
+        wick_contact_mode=wick_contact_mode,
+        wick_pierce_max_bps=wick_pierce_max_bps,
     )
     return pipeline.run(session_df_5m, session_df_1m)
