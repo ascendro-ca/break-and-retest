@@ -1,5 +1,96 @@
 # Break & Retest Strategy - Context Summary
 
+## Latest Session Summary (Nov 13, 2025)
+
+### Focus
+Data integrity (duplicate trades), operational constraint enforcement, and simplification of the backtest engine by making the single-position-per-symbol rule unconditional.
+
+### Key Outcomes
+1. Quantified duplicate trade inflation: ungated run (Jan 1–15) produced 114 rows with 42 duplicates (36.8% duplicate ratio).
+2. Implemented per-symbol overlap gating inside `BacktestEngine` (initially optional via `--limit-one-per-symbol`).
+3. Post-gating results for same window: 53 trades, 0 duplicates (100% suppression), win rate improved to 37.7% (from 35.1% ungated), average P&L per trade increased (efficiency gain despite reduced count).
+4. Added script `analysis/duplicate_entry_analysis.py` to parse saved console outputs and compute duplicate statistics + top duplicate hotspots.
+5. Removed the `--limit-one-per-symbol` CLI flag; gating now always enforced (simpler invariant: never more than one concurrently open trade per symbol).
+6. Updated `README.md` documenting the enforced constraint and removed option.
+7. Backtest smoke test after refactor confirmed parity with earlier gated results (53 trades, identical metrics).
+
+### Rationale
+Duplicate emissions (multiple trades sharing identical symbol + entry timestamp) inflated trade counts and distorted performance metrics. Operationally, executing simultaneous identical trades on the same symbol is unrealistic; enforcing a single open position per symbol aligns simulated behavior with plausible execution and cleans analytics without relying on post-hoc dedup.
+
+### New / Modified Files
+- `backtest.py`: Removed constructor parameter and CLI argument for `limit_one_trade_per_symbol`; overlap gating logic always active.
+- `analysis/duplicate_entry_analysis.py`: New utility for duplicate key analysis (date, entry time, symbol).
+- `README.md`: Added note describing the permanent one-position-per-symbol constraint.
+
+### Metrics Comparison (Jan 1–15, Level 1, 5 symbols)
+| Mode      | Trades | Wins | Win Rate | Total P&L | Duplicates | Avg P&L/Trade |
+|-----------|-------:|-----:|---------:|----------:|-----------:|--------------:|
+| Ungated   | 114    | 40   | 35.1%    | $318.06   | 42 (36.8%) | $2.79         |
+| Gated     | 53     | 20   | 37.7%    | $226.06   | 0 (0.0%)   | $4.26         |
+
+### Duplicate Hotspots (Ungated Sample)
+- AAPL 2025-01-14 07:42 (7 trades)
+- AMZN 2025-01-02 07:26 (5 trades)
+- NVDA 2025-01-08 07:39 (5 trades)
+- TSLA 2025-01-10 07:27 (5 trades)
+
+### Root-Cause Investigation Plan (Upstream)
+1. Instrument Stage modules (`stage_breakout.py`, `stage_retest.py`, `stage_ignition.py`) to emit a breakout UUID and candidate lineage.
+2. Log candidate expansion paths converging to identical (symbol, entry_time) before trade planning.
+3. Identify whether duplication arises from multiple grading/profile passes or repeated pipeline branching.
+4. Consolidate upstream: retain earliest or highest-score candidate per key prior to trade planning.
+5. Maintain a diagnostic warning when >2 candidate variants map to the same minute for a symbol (even with gating) to prevent silent upstream inflation.
+
+### Daily Reset Assessment
+Current sessions close all trades intraday; intervals end naturally at exits. No explicit day-boundary reset required. If multi-day holds are introduced later, add reset logic at session open.
+
+### Adjacent Improvements (Potential Next Steps)
+- Upstream consolidation of duplicate candidate emissions (pre-trade).
+- Instrumentation / logging mode (`--diagnose-duplicates`) to capture lineage without affecting execution.
+- Unit test for overlap gating (ensure a second trade with overlapping interval is skipped).
+- Optional warning counter surfaced in JSON results (duplicates suppressed: N).
+
+### Impact Summary
+Permanent gating simplified configuration, eliminated inflated trade artifacts, raised per-trade efficiency, and established a cleaner baseline for future upstream remediation.
+
+
+## Session: Scarface stop-loss, wick-contact visuals, and 1m charts (Nov 12, 2025)
+
+### What we did in this thread
+- Visualized touch-only backtest results and sampled trades
+  - Located touch-only run with tolerance 10 bps:
+    - backtest_results/level1_ALL_20250101_20250531_profile_2025-11-12T200832-0800.json
+  - Generated charts for 2 random winners and 2 random losers; saved HTML and PNG snapshots under logs/.
+
+- Implemented Scarface stop-loss rules in `backtest.py`
+  - Long: stop placed below BOTH the retest candle’s low and the Opening Range high, minus a wick tolerance.
+  - Short: stop placed above BOTH the retest candle’s high and the Opening Range low, plus a wick tolerance.
+  - Wick tolerance (bps) reads `stop_wick_tolerance_bps` when present; otherwise falls back to `retest_wick_touch_tolerance_bps` (default 10 bps). This replaces the previous “0.5% of breakout distance with a 0.5% of entry cap” logic and removes the tight cap.
+
+- Created targeted visualizations for a later run (Level 1)
+  - Source: backtest_results/level1_ALL_20250101_20250531_profile_2025-11-12T211652-0800.json
+  - Selected 2 long winners, 2 short winners, 1 long loser, 1 short loser; produced both 5m and 1m versions.
+  - Note: The visualizer supports `--interval 1m` to render 1-minute candles; 1m charts and PNG snapshots were saved alongside 5m ones.
+
+- Added/cleaned helper analysis utilities (linted)
+  - analysis/wick_contact_diagnostics.py — classify touch vs pierce composition of signals.
+  - analysis/pick_random_trades.py — simple random sampler for trades by outcome.
+  - analysis/show_trade_details.py — print trade fields for specific datetimes.
+  - validate_backtest_pairs.py — checks JSON/Markdown “no trades” consistency.
+
+### Quality gates
+- Lint: PASS (ruff)
+- Tests: PASS (172 passed, 3 skipped)
+
+### Git
+- Branch: feature/backtestv2
+- Commit: a0108e4 — Implements Scarface stop-loss, adds diagnostics/utilities, updates visuals usage notes; green lint/tests.
+- Pushed to origin/feature/backtestv2
+
+### Notes and follow-ups
+- Consider adding `stop_wick_tolerance_bps` to `config.json` explicitly; current default uses `retest_wick_touch_tolerance_bps` (10 bps).
+- 1m visualizations can be made the default if desired by adjusting the default `--interval` in `visualize_trade_results.py`.
+
 ## Latest Session Consolidated Summary (Up to Nov 11, 2025)
 
 ### High-Level Timeline

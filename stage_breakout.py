@@ -96,6 +96,8 @@ def detect_breakouts(
     breakout_filter: Optional[
         Callable[[pd.Series, pd.Series, float, float], Optional[Tuple[str, float]]]
     ] = None,
+    enable_vwap_check: bool = False,
+    **_extras,
 ) -> List[Dict]:
     """
     Detect breakout candles within the breakout window.
@@ -136,6 +138,19 @@ def detect_breakouts(
         verdict = filter_fn(row, prev, or_high, or_low)
         if verdict is not None:
             direction, level = verdict
+            # Optional VWAP gating for breakout: candle must close on correct side of VWAP
+            if enable_vwap_check:
+                try:
+                    vwap_val = float(row.get("vwap"))
+                    close_val = float(row.get("Close"))
+                    if direction == "long" and close_val < vwap_val:
+                        continue
+                    if direction == "short" and close_val > vwap_val:
+                        continue
+                except Exception:
+                    # If VWAP missing or invalid and VWAP checking enabled, reject
+                    continue
+
             breakouts.append(
                 {
                     "direction": direction,

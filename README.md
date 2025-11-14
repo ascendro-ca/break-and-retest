@@ -15,6 +15,19 @@ Behavior:
 - Legacy keys remain supported; if both new and old are present the new ones take precedence.
 
 Update any custom scripts or overrides to use the new key names going forward.
+
+### VWAP alignment settings
+
+VWAP alignment can be enabled per stage; the legacy `enable_vwap_check` setting has been removed.
+
+- `enable_vwap_breakout_check` (bool, default: false)
+  - If true, Stage 2 (5m breakout) requires the breakout candle close to be on the correct side of 5m VWAP.
+- `enable_vwap_retest_check` (bool, default: false)
+  - If true, Stage 3 (1m retest) requires the retest candle close to be on the correct side of 1m VWAP.
+
+Notes:
+- Ignition (Stage 4) no longer gates on VWAP. The parameter name `enable_vwap_check` may still appear in internal function signatures for compatibility, but it does not map to any config key and is not used to gate entries.
+- VWAP on 1m is computed as a session-only cumulative (prior-day warm-up data is excluded before VWAP is calculated).
 # Break & Re-Test Strategy
 
 A comprehensive trading system for detecting and trading Opening Range breakouts with retest confirmations on intraday timeframes.
@@ -255,6 +268,9 @@ python backtest.py \
 - `--level`: Pipeline level (0=candidates, 1=all trades, 2+=quality filtering)
 - `--output`: Save results to JSON file
 - `--force-refresh`: Clear cache before run
+
+Single-position constraint:
+- The engine now ALWAYS enforces at most one concurrently open trade per symbol. Former `--limit-one-per-symbol` flag was removed for simplicity and to align with realistic execution constraints. Overlapping signals for the same symbol while a trade is open are ignored; a new trade may only begin after the prior trade exits (stop, target, or forced close). This reduces duplicate stacking and keeps position sizing consistent with intended risk budgeting.
 
 **Level 2 Filtering**: At `--level 2`, signals are filtered by breakout quality and risk/reward only; retest/context/continuation grades are informational. Ignition is required for entry timing.
 

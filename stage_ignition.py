@@ -131,16 +131,19 @@ def base_ignition_filter(
     enable_vwap_check: bool = True,
 ) -> bool:
     """
-    Base ignition criteria with optional VWAP alignment.
+    Base ignition criteria.
 
-    VWAP alignment validates institutional flow alignment closer to actual entry timing.
+    Note: VWAP alignment is no longer enforced at ignition. The
+    `enable_vwap_check` parameter is ignored and retained only for
+    call-site compatibility.
 
     Args:
         m1: 1-minute candle
         direction: 'long' or 'short'
         retest_high: High of the retest candle
         retest_low: Low of the retest candle
-        enable_vwap_check: If True, enforce VWAP alignment (default: True)
+        enable_vwap_check: Ignored. Retained for compatibility; VWAP is not
+            enforced at ignition.
 
     Returns:
         True if the candle qualifies as ignition
@@ -156,22 +159,8 @@ def base_ignition_filter(
     if not basic_check:
         return False
 
-    # VWAP alignment with 0.05% buffer (optional)
-    if enable_vwap_check:
-        c = float(m1.get("Close", 0.0))
-        vwap_val = float(m1.get("vwap", float("nan")))
-
-        if not pd.isna(vwap_val):
-            vwap_buffer = abs(vwap_val) * 0.0005  # 0.05% = 0.0005
-
-            if direction == "long":
-                vwap_aligned = c >= (vwap_val - vwap_buffer)
-            else:  # short
-                vwap_aligned = c <= (vwap_val + vwap_buffer)
-
-            return vwap_aligned
-
-    # If VWAP check is disabled or VWAP not available, return True (basic check already passed)
+    # VWAP alignment intentionally disabled for ignition stage as per spec change.
+    # Only the range breakout relative to retest is enforced here.
     return True
 
 
@@ -194,7 +183,8 @@ def detect_ignition(
         direction: 'long' or 'short'
         ignition_lookahead_minutes: Minutes after retest to search for ignition
         ignition_filter: Optional custom filter; if None, uses base_ignition_filter
-        enable_vwap_check: If True, enforce VWAP alignment in base filter (default: True)
+        enable_vwap_check: Ignored. Retained for compatibility; VWAP is not
+            enforced at ignition.
 
     Returns:
         Dict with keys: time, candle if ignition found, else None

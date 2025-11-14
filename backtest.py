@@ -224,6 +224,8 @@ class BacktestEngine:
         console_only: bool = False,
         # New: optional minimum total score gating for Level 1
         min_score_threshold: Optional[int] = None,
+        # New: optional minimum retest score gating for Level 1
+        min_retest_score_threshold: Optional[int] = None,
     ):
         """
         Initialize backtest engine
@@ -278,6 +280,12 @@ class BacktestEngine:
         self.min_score_threshold = (
             int(min_score_threshold) if min_score_threshold is not None else None
         )
+        # Optional retest-only score gating (Level 1 only). If provided, preferred over total.
+        self.min_retest_score_threshold = (
+            int(min_retest_score_threshold) if min_retest_score_threshold is not None else None
+        )
+        # Enforce single concurrently open trade per symbol (always on; option removed)
+        self._symbol_open_intervals: Dict[str, List[tuple]] = {}
 
         # Pipeline level determines filtering strictness and trade behavior
         # Level 0: Candidates only (no trades ever)
@@ -417,14 +425,18 @@ class BacktestEngine:
                 work = pd.concat([tail, df1], ignore_index=True)
             else:
                 work = df1.copy()
-            # Compute warmed 1m vol_ma_20 and vwap
+            # Compute warmed 1m vol_ma_20 (allow warm-up across prior-day tail)
             work["Volume"] = pd.to_numeric(work["Volume"], errors="coerce")
             work["vol_ma_20"] = work["Volume"].rolling(window=20, min_periods=20).mean()
             work["typical_price"] = (work["High"] + work["Low"] + work["Close"]) / 3
             work["tp_volume"] = work["typical_price"] * work["Volume"]
-            work["vwap"] = work["tp_volume"].cumsum() / work["Volume"].cumsum()
+            # IMPORTANT: VWAP must be a session-only cumulative measure.
+            # If we warmed with a prior-day tail, drop it FIRST, then compute VWAP
+            # so that the cumulative starts at the session open (no contamination).
             if tail is not None and not tail.empty:
                 work = work.iloc[len(tail) :].copy()
+            # Now compute session VWAP from scratch (no prior-day contribution)
+            work["vwap"] = work["tp_volume"].cumsum() / work["Volume"].cumsum()
             work = work.sort_values("Datetime").reset_index(drop=True)
             if not hasattr(self, "_session_1m_by_day"):
                 self._session_1m_by_day = {}
@@ -643,13 +655,18 @@ class BacktestEngine:
                 df5_for_pipeline.index.name = None
                 df1_for_pipeline = session_df_1m.copy()
                 df1_for_pipeline.index.name = None
+                # Control VWAP alignment via config (default False preserves current behavior)
+                breakout_vwap_check = bool(CONFIG.get("enable_vwap_breakout_check", False))
+                retest_vwap_check = bool(CONFIG.get("enable_vwap_retest_check", False))
                 candidates = run_pipeline(
                     session_df_5m=df5_for_pipeline,
                     session_df_1m=df1_for_pipeline,
                     breakout_window_minutes=market_open_minutes,
                     retest_lookahead_minutes=30,
                     pipeline_level=0,
-                    enable_vwap_check=False,  # VWAP check disabled for Level 0
+                    enable_vwap_check=(breakout_vwap_check or retest_vwap_check),
+                    enable_vwap_breakout_check=breakout_vwap_check,
+                    enable_vwap_retest_check=retest_vwap_check,
                     retest_require_wick_contact=bool(
                         CONFIG.get(
                             "retest_require_wick_contact",
@@ -772,14 +789,18 @@ class BacktestEngine:
             df5_for_pipeline.index.name = None
             df1_for_pipeline = session_df_1m.copy()
             df1_for_pipeline.index.name = None
+            # Control VWAP alignment via config (default False preserves current behavior)
+            breakout_vwap_check = bool(CONFIG.get("enable_vwap_breakout_check", False))
+            retest_vwap_check = bool(CONFIG.get("enable_vwap_retest_check", False))
             pipeline_candidates = run_pipeline(
                 session_df_5m=df5_for_pipeline,
                 session_df_1m=df1_for_pipeline,
                 breakout_window_minutes=market_open_minutes,
                 retest_lookahead_minutes=30,
                 pipeline_level=self.pipeline_level,
-                # VWAP check disabled for all levels (0/1/2+) for now
-                enable_vwap_check=False,
+                enable_vwap_check=(breakout_vwap_check or retest_vwap_check),
+                enable_vwap_breakout_check=breakout_vwap_check,
+                enable_vwap_retest_check=retest_vwap_check,
                 retest_require_wick_contact=bool(
                     CONFIG.get(
                         "retest_require_wick_contact",
@@ -1549,23 +1570,37 @@ class BacktestEngine:
 
         graded_signals = [attach_basic_grades(dict(sig)) for sig in signals]
 
-        # Level 1: If a minimum score is provided, filter out signals below the threshold
-        if self.pipeline_level == 1 and self.min_score_threshold is not None:
-            try:
-                before = len(graded_signals)
-                graded_signals = [
-                    s
-                    for s in graded_signals
-                    if ((s.get("points") or {}).get("total") or -1) >= self.min_score_threshold
-                ]
-                after = len(graded_signals)
-                if before != after and self.console_only:
-                    print(
-                        f"[Level 1] min-score gating: kept {after}/{before} signals with total>="
-                        f"{self.min_score_threshold}"
-                    )
-            except Exception:
-                pass
+        # Level 1 gating: prefer retest-only threshold when provided; else fall back to total.
+        if self.pipeline_level == 1:
+            if self.min_retest_score_threshold is not None:
+                try:
+                    before = len(graded_signals)
+                    graded_signals = [
+                        s
+                        for s in graded_signals
+                        if ((s.get("points") or {}).get("retest") or -1)
+                        >= self.min_retest_score_threshold
+                    ]
+                    after = len(graded_signals)
+                    if before != after and self.console_only:
+                        print(f"[Level 1] min-retest-score gating: kept {after}/{before} signals")
+                        print(f"  retest >= {self.min_retest_score_threshold}")
+                except Exception:
+                    pass
+            elif self.min_score_threshold is not None:
+                try:
+                    before = len(graded_signals)
+                    graded_signals = [
+                        s
+                        for s in graded_signals
+                        if ((s.get("points") or {}).get("total") or -1) >= self.min_score_threshold
+                    ]
+                    after = len(graded_signals)
+                    if before != after and self.console_only:
+                        print(f"[Level 1] min-score gating: kept {after}/{before} signals")
+                        print(f"  total >= {self.min_score_threshold}")
+                except Exception:
+                    pass
 
         # Legacy rejection counters removed (no longer used)
 
@@ -1605,6 +1640,11 @@ class BacktestEngine:
 
         trades = []
 
+        # Prepare interval list for overlap gating (always enforced)
+        if symbol not in self._symbol_open_intervals:
+            self._symbol_open_intervals[symbol] = []
+        open_intervals = self._symbol_open_intervals[symbol]
+
         for sig in graded_signals:
             # Track real price movement after signal
             entry_price = sig["entry"]
@@ -1622,6 +1662,18 @@ class BacktestEngine:
                     entry_datetime = entry_datetime.tz_convert(ZoneInfo("UTC"))
             except Exception:
                 pass
+
+            # Overlap gating: skip if entry time lies within an existing open interval
+            skip_overlap = False
+            for prev_entry, prev_exit in open_intervals:
+                try:
+                    if prev_entry <= entry_datetime < prev_exit:
+                        skip_overlap = True
+                        break
+                except Exception:
+                    continue
+            if skip_overlap:
+                continue
 
             # Use centralized trade planner for stop/target/shares sizing
             from trade_planner import plan_trade
@@ -1871,6 +1923,15 @@ class BacktestEngine:
                     trade_dict["retest_desc"] = sig["component_descriptions"].get("retest")
 
             trades.append(trade_dict)
+
+            # Record interval for gating (only after full exit is known; always enforced)
+            try:
+                exit_ts = pd.to_datetime(trade_dict.get("exit_time"))
+                if getattr(exit_ts, "tzinfo", None) is None:
+                    exit_ts = exit_ts.tz_localize(ZoneInfo("UTC"))
+            except Exception:
+                exit_ts = entry_datetime
+            open_intervals.append((entry_datetime, exit_ts))
 
             # Generate and print grading report (Level 2+ only)
             # Print per-trade grading block only for Level 2 when console-only is active
@@ -2371,6 +2432,15 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         ),
     )
     parser.add_argument(
+        "--min-retest-score",
+        type=int,
+        default=None,
+        help=(
+            "Level 1 only: require retest score (points.retest) >= this threshold to enter trades. "
+            "If provided along with --min-score, this takes precedence. Ignored for other levels."
+        ),
+    )
+    parser.add_argument(
         "--grade",
         choices=["aplus", "a", "b", "c"],
         default=None,
@@ -2388,6 +2458,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
             "Level 0 always runs in no-trades mode."
         ),
     )
+    # Single-position-per-symbol rule always enforced (former flag removed).
 
     # Add config override support via utility function
     add_config_override_argument(parser)
@@ -2472,6 +2543,7 @@ Default tickers from config.json: {', '.join(DEFAULT_TICKERS)}
         min_rr_ratio=min_rr_ratio,
         console_only=args.console_only,
         min_score_threshold=args.min_score,
+        min_retest_score_threshold=args.min_retest_score,
     )
     # Load grade profile if provided and Level 2
     if pipeline_level == 2:

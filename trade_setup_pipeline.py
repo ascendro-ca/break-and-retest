@@ -73,6 +73,9 @@ class TradeSetupPipeline:
         retest_filter: Optional[Callable[[pd.Series, str, float], bool]] = None,
         ignition_filter: Optional[Callable[[pd.Series, str, float, float], bool]] = None,
         enable_vwap_check: bool = True,
+        # New: separate VWAP flags per stage (default False via run_pipeline wrapper)
+        enable_vwap_breakout_check: bool = False,
+        enable_vwap_retest_check: bool = False,
         retest_require_wick_contact: bool = True,
         wick_tolerance_bps: float = 0.0,
         wick_contact_mode: str = "either",
@@ -89,7 +92,9 @@ class TradeSetupPipeline:
             breakout_filter: Optional custom Stage 2 filter
             retest_filter: Optional custom Stage 3 filter
             ignition_filter: Optional custom Stage 4 filter
-            enable_vwap_check: If True, enforce VWAP alignment at ignition stage (default: True)
+            enable_vwap_check: Deprecated. Ignition no longer enforces VWAP; kept for
+                internal API compatibility. Use per-stage flags
+                `enable_vwap_breakout_check` and `enable_vwap_retest_check` instead.
         """
         self.breakout_window_minutes = int(breakout_window_minutes)
         self.retest_lookahead_minutes = int(retest_lookahead_minutes)
@@ -99,6 +104,8 @@ class TradeSetupPipeline:
         self.retest_filter = retest_filter
         self.ignition_filter = ignition_filter
         self.enable_vwap_check = enable_vwap_check
+        self.enable_vwap_breakout_check = bool(enable_vwap_breakout_check)
+        self.enable_vwap_retest_check = bool(enable_vwap_retest_check)
 
         # Stage 3 additional requirement: wick must touch or pierce OR
         self.retest_require_wick_contact = bool(retest_require_wick_contact)
@@ -147,6 +154,7 @@ class TradeSetupPipeline:
             or_low=or_low,
             breakout_window_minutes=self.breakout_window_minutes,
             breakout_filter=self.breakout_filter,
+            enable_vwap_check=self.enable_vwap_breakout_check,
         )
 
         if not breakouts:
@@ -237,10 +245,13 @@ def run_pipeline(
     ignition_lookahead_minutes: int = 30,
     pipeline_level: int = 0,
     enable_vwap_check: bool = True,
+    enable_vwap_breakout_check: bool = False,
+    enable_vwap_retest_check: bool = False,
     retest_require_wick_contact: bool = True,
     wick_tolerance_bps: float = 0.0,
     wick_contact_mode: str = "either",
     wick_pierce_max_bps: Optional[float] = None,
+    **_extras,
 ) -> List[Dict]:
     """
     Convenience function to run the pipeline with default settings.
@@ -257,18 +268,38 @@ def run_pipeline(
                        Level 0: Candidates only (Stages 1-3, no trades)
                        Level 1: Trade execution with base criteria (Stages 1-3, no ignition)
                        Level 2+: Enhanced filtering, may include Stage 4 (Ignition)
-        enable_vwap_check: If True, enforce VWAP alignment at ignition stage (default: True)
+        enable_vwap_check: Deprecated. Ignition no longer enforces VWAP; kept for internal
+            API compatibility. Use `enable_vwap_breakout_check` and `enable_vwap_retest_check`.
 
     Returns:
         List of candidates that passed all required stages
     """
+
     # Use the strict Level 0 retest filter for both Level 0 (candidates)
     # and Level 1 (trades with base criteria). Level 2+ may add further
     # quality filters but Stage 3 detection remains consistent.
     # Unify retest criteria: Level 2+ now also uses the strict Level 0 retest filter.
     # This removes the previous Level 2 reliance on base_retest_filter (VWAP + close-only).
     # Rationale: enforce parity across levels and rebuild L2-specific refinements later.
-    retest_filter = level0_retest_filter  # applied for all levels
+    # Choose retest filter based on VWAP setting
+    def _vwap_parity_retest_filter(m1, direction: str, level: float) -> bool:
+        """Strict parity (body at/beyond level) plus VWAP side check (no buffer)."""
+        o = float(m1.get("Open", 0.0))
+        c = float(m1.get("Close", 0.0))
+        vwap = m1.get("vwap")
+        try:
+            vwap = float(vwap)
+        except Exception:
+            return False
+        if direction == "long":
+            return (o >= level and c >= level) and (c >= vwap)
+        elif direction == "short":
+            return (o <= level and c <= level) and (c <= vwap)
+        return False
+
+    retest_filter = _vwap_parity_retest_filter if enable_vwap_retest_check else level0_retest_filter
+    # Accept and ignore any future keyword extensions via **_extras to keep
+    # backtest code forward-compatible with pipeline evolution without failing.
     pipeline = TradeSetupPipeline(
         breakout_window_minutes=breakout_window_minutes,
         retest_lookahead_minutes=retest_lookahead_minutes,
@@ -276,6 +307,8 @@ def run_pipeline(
         pipeline_level=pipeline_level,
         retest_filter=retest_filter,
         enable_vwap_check=enable_vwap_check,
+        enable_vwap_breakout_check=enable_vwap_breakout_check,
+        enable_vwap_retest_check=enable_vwap_retest_check,
         retest_require_wick_contact=retest_require_wick_contact,
         wick_tolerance_bps=wick_tolerance_bps,
         wick_contact_mode=wick_contact_mode,

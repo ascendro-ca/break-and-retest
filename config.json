@@ -29,6 +29,9 @@
   "feature_ignition_grader_enable": true,
   "feature_trend_grader_enable": true,
 
+  "enable_vwap_breakout_check": false,
+  "enable_vwap_retest_check": false,
+
   "retest_require_wick_contact": true,
   "retest_wick_contact_mode": "touch-only",
   "retest_wick_touch_tolerance_bps": 10.0,

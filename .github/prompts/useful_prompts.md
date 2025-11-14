@@ -164,3 +164,24 @@ In the 100-point system (see GRADING_SYSTEMS.md and GRADING_USAGE.md), “C” o
 For the Level 2 pre-entry gate in that system: each of Breakout, Retest, Ignition is out of 30 points, and a component counts as “C-or-better” if it scores ≥ 16.8/30 (56%).
 The current code in your branch is using the Scarface Rules grader (signal_grader.py) for the Level 2 quality filter; the above C criteria are the ones actually applied.
 Want me to print a compact cheat sheet into GRADING_USAGE.md so this stays in sync with the code?
+
+## Other prompts to run
+Compare these backtest results to find out why using VWAP check on breakout and re-test candles has worse results than not applying the check:
+
+With both VWAP checks:
+- Total trades: 1072
+- Winners: 358
+- Win rate: 33.4%
+- Total P&L: $-333.77
+Results saved to backtest_results/level1_ALL_20250101_20250331_profile_2025-11-13T154905-0800.json
+Summary saved to backtest_results/level1_ALL_20250101_20250331_profile_2025-11-13T154905-0800_summary.md
+Runtime: 3.30m for 8 symbol(s) (2025-01-01 -> 2025-03-31), Level 1
+
+With only re-test VWAP checks:
+- Total trades: 1121
+- Winners: 376
+- Win rate: 33.5%
+- Total P&L: $-123.72
+Results saved to backtest_results/level1_ALL_20250101_20250331_profile_2025-11-13T155642-0800.json
+Summary saved to backtest_results/level1_ALL_20250101_20250331_profile_2025-11-13T155642-0800_summary.md
+Runtime: 2.85m for 8 symbol(s) (2025-01-01 -> 2025-03-31), Level 1

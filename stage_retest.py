@@ -93,6 +93,29 @@ def level0_retest_filter(m1: pd.Series, direction: str, level: float) -> bool:
         return False
 
 
+def level0_vwap_retest_filter(m1: pd.Series, direction: str, level: float) -> bool:
+    """Level 0 parity retest filter with VWAP side check.
+
+    Requirements:
+    - Body must be at/beyond the OR level in trade direction (strict parity)
+    - Close must be on the correct side of 1m VWAP (no buffer)
+    """
+    o = float(m1.get("Open", 0.0))
+    c = float(m1.get("Close", 0.0))
+    vwap = m1.get("vwap")
+    try:
+        vwap = float(vwap)
+    except Exception:
+        return False
+
+    if direction == "long":
+        return (o >= level and c >= level) and (c >= vwap)
+    elif direction == "short":
+        return (o <= level and c <= level) and (c <= vwap)
+    else:
+        return False
+
+
 def _wick_touches_or_pierces(
     m1: pd.Series,
     direction: str,
