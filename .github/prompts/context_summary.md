@@ -1,5 +1,45 @@
 # Break & Retest Strategy - Context Summary
 
+## Latest Session Summary (Nov 15, 2025)
+
+### Focus
+End-to-end data integrity and 5m accuracy, hardening the “single-position-per-symbol” constraint, and QA on a key backtest result (duplicate detection and grade distributions).
+
+### Key outcomes
+1. Permanently enforced single-position-per-symbol in the backtest engine; removed the obsolete CLI flag and hard-gated overlap in code.
+2. Fixed 5m resampling timezone defect by tracking provenance and standardizing UTC storage; clarified that 5m bars are derived from 1m via pandas resample (5-minute, label=right, closed=right).
+3. Built and ran integrity audits (schema, cadence/gaps, OHLC sanity, duplicates/order, and cross-interval 1m↔5m alignment) and executed ET-aware repairs:
+   - Split multi-day files by ET session where needed.
+   - Filled 1m intra-session gaps with zero-volume bars and forward-filled OHLC.
+   - Regenerated 5m from repaired 1m files across the cache.
+4. Purged and partially refreshed the minute cache with day-by-day 1m fetches (API quota aware); then regenerated 5m globally from available 1m.
+5. Backtest QA on the specified results file: confirmed 0 duplicate trades using robust keys (symbol, datetime, direction); computed and saved grade distributions.
+
+### Integrity snapshot (representative)
+- Before targeted SPOT repair: checked ≈ 3,290 files, errors = 179, warnings = 232.
+- After SPOT 1m gap-fill + 5m regeneration: checked ≈ 3,290 files, errors = 7, warnings = 172.
+
+### Notable code and utilities
+- backtest.py: overlap gating always-on (single-position-per-symbol).
+- trade_setup_pipeline.py and stage_*: kwargs-tolerant interfaces; localized VWAP parity retest filter.
+- stockdata_retriever.py: provenance-aware tz handling; ET session splitting; day-by-day minute fetch; 5m regenerated from 1m when present.
+- cache_utils.py: canonical load/save; per-day integrity + cross-interval checks; coverage summaries.
+- Repair scripts: ET session splitter, 1m gap filler, 5m-from-1m regenerator.
+
+### Artifacts saved
+- Backtest grade distribution (Level 1, ALL, 2024-12-31 → 2025-10-31):
+  - `backtest_results/grade_distribution_level1_ALL_20241231_20251031_20251114_171020.md`
+  - `backtest_results/grade_distribution_level1_ALL_20241231_20251031_20251114_171020.csv`
+- Dedupe analysis: confirmed 0 duplicate groups by (symbol, datetime, direction); summary included alongside the run’s markdown outputs.
+
+### What remains
+- Resume the 1m day-by-day refresh for remaining symbols/dates when API quota resets; standardize 5m from 1m post-refresh and re-run integrity.
+- Optionally target residual warnings (e.g., META/AAPL) via limited gap-fill or selective re-fetch, then regenerate 5m.
+- Add an automatic duplicate-trade assertion in the backtester to fail fast on any future regression.
+
+### Impact
+The cache is substantially repaired with UTC-correct 5m bars, cross-interval parity, and far fewer integrity issues. The backtest engine operates under a clear invariant (one position per symbol), and the analyzed results show no duplicates with clear grading distributions for downstream study.
+
 ## Latest Session Summary (Nov 13, 2025)
 
 ### Focus

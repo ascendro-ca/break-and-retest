@@ -88,8 +88,9 @@ def _days_per_call(requested_interval: str) -> int:
     # Normalize to canonical labels
     req = requested_interval.lower()
     if req in {"1min", "minute", "m", "min"}:
-        # Minute data: max 7 days
-        return 7
+        # Minute data: fetch strictly one day per call to avoid pagination/truncation
+        # and prevent accidental multi-day contamination of per-day cache files.
+        return 1
     if req in {"hour", "1h", "60min", "h"}:
         # Hourly data: max 180 days
         return 180
@@ -358,27 +359,42 @@ def fetch_timeseries(
         last_call_ts.append(time.time())
 
         # If 5min requested, resample; otherwise use as-is
+        # Track provenance so we don't double-apply timezone conversions when saving.
         if cache_interval == "5m":
             use_values = _resample_minute_to_five(minute_values)
+            use_values_from_resample = True
         else:
             use_values = minute_values
+            use_values_from_resample = False
 
         # Save split per day for the requested cache interval
         if use_values:
             df = pd.DataFrame(use_values)
             if not df.empty:
-                # IMPORTANT: stockdata.org returns timestamps with 'Z' but they're actually ET
+                # Normalize timestamps to UTC for storage.
+                # Rules:
+                # - Resampled 5m values are already in correct UTC; do NOT re-interpret as ET.
+                # - Raw API minute/hour values may be tz-aware ('Z') but actually represent ET;
+                #   in that case, drop tz, localize to America/New_York, then convert to UTC.
                 df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
                 try:
-                    # If UTC-aware (from 'Z'), strip it and reinterpret as America/New_York
-                    if getattr(df["datetime"].dt, "tz", None) is not None:
-                        df["datetime"] = df["datetime"].dt.tz_localize(None)
-
-                    # Localize as America/New_York (actual API timezone)
-                    df["datetime"] = df["datetime"].dt.tz_localize("America/New_York")
-
-                    # Convert to UTC for storage
-                    df["datetime"] = df["datetime"].dt.tz_convert("UTC")
+                    tzinfo_present = getattr(df["datetime"].dt, "tz", None) is not None
+                    if use_values_from_resample:
+                        # Keep as UTC if tz-aware; if naive, assume already UTC and localize.
+                        if tzinfo_present:
+                            df["datetime"] = df["datetime"].dt.tz_convert("UTC")
+                        else:
+                            df["datetime"] = df["datetime"].dt.tz_localize("UTC")
+                    else:
+                        # Raw API path: treat tz-aware stamps as mislabeled ET ('Z');
+                        # re-interpret in America/New_York then convert to UTC.
+                        if tzinfo_present:
+                            df["datetime"] = df["datetime"].dt.tz_localize(None)
+                            df["datetime"] = df["datetime"].dt.tz_localize("America/New_York")
+                            df["datetime"] = df["datetime"].dt.tz_convert("UTC")
+                        else:
+                            df["datetime"] = df["datetime"].dt.tz_localize("America/New_York")
+                            df["datetime"] = df["datetime"].dt.tz_convert("UTC")
                 except Exception:
                     pass
                 # Use UTC date for grouping per-day files
@@ -572,9 +588,12 @@ def main():
                     continue
                 if df is None or df.empty or "Datetime" not in df.columns:
                     continue
-                df["_date"] = pd.to_datetime(df["Datetime"], errors="coerce").dt.strftime(
-                    "%Y-%m-%d"
-                )
+                # Determine date by America/New_York session date, not raw UTC date
+                dtser = pd.to_datetime(df["Datetime"], errors="coerce")
+                if getattr(dtser.dt, "tz", None) is None:
+                    dtser = dtser.dt.tz_localize("UTC")
+                dtser = dtser.dt.tz_convert("America/New_York")
+                df["_date"] = dtser.dt.strftime("%Y-%m-%d")
                 unique_dates = df["_date"].dropna().unique().tolist()
                 if len(unique_dates) <= 1:
                     continue

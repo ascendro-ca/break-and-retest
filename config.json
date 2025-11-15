@@ -6,8 +6,7 @@
     "MSFT",
     "NVDA",
     "TSLA",
-    "SPOT",
-    "UBER"
+    "SPOT"
   ],
   "initial_capital": 7500,
   "leverage": 2.0,
@@ -29,7 +28,7 @@
   "feature_ignition_grader_enable": true,
   "feature_trend_grader_enable": true,
 
-  "enable_vwap_breakout_check": false,
+  "enable_vwap_breakout_check": true,
   "enable_vwap_retest_check": false,
 
   "retest_require_wick_contact": true,
